@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Pyrogram sessions
+*.session
+*.session-journal
+sessions/
+
+# Databases
+*.db
+
+# Logs
+*.log
+
+# Virtualenv
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Env files
+.env
+.env.*
+
+# Media (если не статика)
+media/*
+!media/static/
+!media/static/img/
+!media/static/img/default.png
+
+# System
+.DS_Store
+Thumbs.db
+
+broadcaster/*

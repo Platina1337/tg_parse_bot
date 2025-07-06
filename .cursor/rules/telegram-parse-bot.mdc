@@ -1,0 +1,29 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+Rule Type: Auto Attached
+
+This rule defines the architecture and structure for a Telegram bot that parses messages from other channels and posts them to a target channel.
+
+Architecture:
+- The project uses a microservice architecture.
+- The Telegram bot is built with @pyrogram to interact with users.
+- Parsing logic is delegated to a userbot, running in a separate microservice (in @parser/).
+- Communication between bot and parser is via REST API using @FastAPI.
+- Future support for task queuing using @Redis + @Celery is planned.
+
+Responsibilities:
+- @bot/ handles bot commands, user input, scheduling tasks, sending results.
+- @parser/ handles parsing via Pyrogram userbot, and returns parsed data to the bot.
+- @shared/ contains reusable logic, pydantic schemas, and config values (e.g., @shared/schemas.py, @bot/config.py).
+
+Notes:
+- The Bot API cannot read messages in channels unless it’s an admin.
+- To overcome this, the userbot parses messages using its own session.
+- Store the session in a secure location (e.g., @sessions/user.session).
+
+Tags:
+@telegram-parse-bot
+

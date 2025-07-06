@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  parser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.docker
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./media:/app/media
+      - ./parser/sessions:/app/parser/sessions
+      - ./parser/parser.db:/app/parser/parser.db
+    restart: always
+
+  bot:
+    build:
+      context: .
+      dockerfile: bot/Dockerfile
+    env_file:
+      - .env.docker
+    environment:
+      - ENV_FILE=.env.docker
+    depends_on:
+      - parser
+    volumes:
+      - ./media:/app/media
+      - ./bot/sessions:/app/sessions
+    restart: always 

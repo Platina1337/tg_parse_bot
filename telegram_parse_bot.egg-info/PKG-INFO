@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: telegram-parse-bot
+Version: 0.1
+Requires-Dist: fastapi
+Requires-Dist: uvicorn
+Requires-Dist: pyrogram
+Requires-Dist: tgcrypto
+Requires-Dist: pydantic
+Requires-Dist: pydantic-settings
+Requires-Dist: python-dotenv
+Requires-Dist: sqlalchemy
+Requires-Dist: aiosqlite
+Dynamic: requires-dist
