@@ -99,7 +99,7 @@ async def start_forwarding_api(user_id: int) -> bool:
         target_channel = user_states[user_id]['forward_target_channel']
         forward_settings = user_states[user_id]['forward_settings']
         # Останавливаем старую пересылку, если она есть
-        await stop_forwarding_api(user_id)
+        # await stop_forwarding_api(user_id)
         payload = {
             'user_id': user_id,
             'source_channel_id': channel_id,

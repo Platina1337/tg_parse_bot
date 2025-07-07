@@ -939,7 +939,7 @@ async def text_handler(client: Client, message: Message):
             # Запрашиваем ввод лимита
             current_limit = user_states[user_id]['forward_settings'].get('max_posts')
             sent = await message.reply(
-                f"Текущий лимит: {current_limit or 'Без лимита'}\\n\\nВведите новый лимит постов (или '0' для снятия лимита):",
+                f"Текущий лимит: {current_limit or 'Без лимита'}\n\nВведите новый лимит постов (или '0' для снятия лимита):",
                 reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🔙 Назад")]], resize_keyboard=True)
             )
             if sent is not None:

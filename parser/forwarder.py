@@ -82,6 +82,7 @@ class TelegramForwarder:
         self._parse_forward_tasks = {}  # task_id -> task_info
         self._task_counter = 0  # Счетчик для генерации уникальных task_id
         self._monitoring_targets: Dict[Tuple[int, str], str] = {}  # (channel_id, target_channel_id) -> target_channel
+        self._handlers = {}  # (source_channel, target_channel) -> handler
     
     async def start(self):
         """Запуск форвардера (только если используется отдельный userbot)"""
@@ -121,44 +122,52 @@ class TelegramForwarder:
         logger.info("Forwarder stopped successfully")
     
     async def start_forwarding(self, source_channel: str, target_channel: str, config: dict, callback: Optional[Callable] = None):
-        """Запуск пересылки сообщений из одного канала в другой"""
+        """Запуск пересылки сообщений из одного канала в другой (множественные мониторинги поддерживаются)"""
         try:
-            # Если пересылка уже активна — останавливаем старую, чтобы пересоздать handler с новым config
-            # Получаем информацию о канале ДО использования channel_id
             if str(source_channel).startswith("-100"):
                 channel = await self.userbot.get_chat(int(source_channel))
             else:
                 channel = await self.userbot.get_chat(source_channel)
             channel_id = channel.id
-            logger.info(f"[FORWARDER][DEBUG] channel_id определён: {channel_id}")
+            key = (channel_id, str(target_channel))
+            # --- Остановить все мониторинги, у которых target_channel не совпадает с новым ---
+            for (src_id, tgt_id) in list(self._monitoring_tasks.keys()):
+                if tgt_id != str(target_channel):
+                    await self.stop_forwarding(src_id, tgt_id)
+            # Если уже есть monitoring для этой пары, не создаём новый
+            if key in self._monitoring_tasks:
+                logger.info(f"[FORWARDER] Monitoring для {channel_id} -> {target_channel} уже существует, не создаём новый")
+                return
             channel_name = channel.username or str(channel_id)
             channel_title = getattr(channel, "title", None)
             logger.info(f"[FORWARDER] 📺 Получен объект канала: {channel_title} (@{channel_name}, ID: {channel_id})")
-            if channel_id in self._forwarding_active and self._forwarding_active[channel_id]:
-                await self.stop_forwarding(channel_id)
-            
             logger.info(f"[FORWARDER] 🔄 ЗАПУСК МОНИТОРИНГА (НЕ ПАРСИНГА!)")
             logger.info(f"[FORWARDER] Источник: {source_channel} -> Цель: {target_channel}")
             logger.info(f"[FORWARDER] Конфигурация: {config}")
-            
-            # Запускаем userbot если не запущен
             if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
                 logger.info(f"[FORWARDER] Userbot не запущен, запускаем...")
                 await self.userbot.start()
                 logger.info(f"[FORWARDER] Userbot успешно запущен")
-            
-            # Кэшируем информацию о канале
             self._channel_cache = {
                 'id': channel_id,
                 'name': channel_name,
                 'title': channel_title
             }
-            
-            # --- ВАЖНО: сбрасываем буферы и таймауты для канала ---
             self._media_group_buffers[channel_id] = {}
             self._media_group_timeouts[channel_id] = {}
-            # --- Сохраняем актуальные настройки для канала ---
             self._forwarding_settings[channel_id] = config.copy()
+            self._forwarding_active[channel_id] = True
+            if channel_id not in self._counters:
+                self._counters[channel_id] = {
+                    'hashtag_paid_counter': 0,
+                    'select_paid_counter': 0,
+                    'media_group_paid_counter': 0,
+                    'media_group_hashtag_paid_counter': 0
+                }
+            self._monitoring_targets[key] = target_channel
+            self._monitoring_tasks[key] = asyncio.create_task(self._monitoring_loop())
+            # --- Обновить handler для source_channel ---
+            self._update_source_handler(channel_id)
             
             # Настройки пересылки
             hide_sender = config.get("hide_sender", True)
@@ -434,6 +443,9 @@ class TelegramForwarder:
             self._monitoring_tasks[key] = asyncio.create_task(self._monitoring_loop())
             logger.info(f"[FORWARDER] Запущен мониторинг канала {channel_name} -> {target_channel}")
             
+            # После создания handler:
+            self._handlers[key] = handle_new_message
+            
         except Exception as e:
             logger.error(f"[FORWARDER] Ошибка при запуске пересылки: {e}")
             raise
@@ -706,7 +718,7 @@ class TelegramForwarder:
     async def stop_forwarding(self, channel_id: int, target_channel_id: str = None):
         """
         Остановить пересылку/мониторинг для канала и цели (если указана).
-        TODO: если будет поддержка нескольких мониторингов с разными целями для одного канала — доработать.
+        Если target_channel_id не указан — останавливаем все мониторинги для source-канала.
         """
         try:
             if target_channel_id is not None:
@@ -716,32 +728,21 @@ class TelegramForwarder:
                     del self._monitoring_tasks[key]
                 if key in self._monitoring_targets:
                     del self._monitoring_targets[key]
+                # --- Обновить handler для source_channel ---
+                self._update_source_handler(channel_id)
                 logger.info(f"[FORWARDER] Остановлен мониторинг для пары {channel_id} -> {target_channel_id}")
-                # Не трогаем остальные мониторинги для этого канала
-                return
-            # Если не указан target_channel_id — останавливаем все мониторинги для канала
-            keys_to_remove = [k for k in self._monitoring_tasks if k[0] == channel_id]
-            for key in keys_to_remove:
-                self._monitoring_tasks[key].cancel()
-                del self._monitoring_tasks[key]
-                if key in self._monitoring_targets:
-                    del self._monitoring_targets[key]
-            self._forwarding_active[channel_id] = False
-            if channel_id in self._forwarding_settings:
-                del self._forwarding_settings[channel_id]
-            if channel_id in self._media_group_timeouts:
-                for task in self._media_group_timeouts[channel_id].values():
-                    task.cancel()
-                del self._media_group_timeouts[channel_id]
-            if channel_id in self._media_group_buffers:
-                del self._media_group_buffers[channel_id]
-            self._processed_groups.clear()
-            if channel_id in self._active_handlers:
-                del self._active_handlers[channel_id]
-            logger.info(f"[FORWARDER] Остановлены все мониторинги для канала {channel_id}")
+            else:
+                to_remove = [k for k in self._monitoring_tasks if k[0] == channel_id]
+                for key in to_remove:
+                    self._monitoring_tasks[key].cancel()
+                    del self._monitoring_tasks[key]
+                    if key in self._monitoring_targets:
+                        del self._monitoring_targets[key]
+                # --- Обновить handler для source_channel ---
+                self._update_source_handler(channel_id)
+                logger.info(f"[FORWARDER] Остановлены все мониторинги для канала {channel_id}")
         except Exception as e:
-            logger.error(f"[FORWARDER] Ошибка при остановке пересылки для канала {channel_id}: {e}")
-            logger.error(f"[FORWARDER] Полная ошибка: {traceback.format_exc()}")
+            logger.error(f"[FORWARDER][stop_forwarding] Ошибка: {e}")
     
     async def clear_cache(self, channel_id: int = None):
         """Очистка кэша для канала (вызывается после очистки истории)"""
@@ -1734,4 +1735,110 @@ class TelegramForwarder:
                 "error": task_info["error"]
             })
         return result
+
+    def _update_source_handler(self, channel_id):
+        # Удалить старый handler, если есть
+        if channel_id in self._handlers:
+            self.userbot.remove_handler(self._handlers[channel_id])
+            del self._handlers[channel_id]
+        # Найти все target_channel для этого source_channel
+        targets = [tgt_id for (src_id, tgt_id) in self._monitoring_tasks.keys() if src_id == channel_id]
+        if not targets:
+            return  # Нет активных мониторингов — handler не нужен
+        @self.userbot.on_message(filters.chat(channel_id))
+        async def handle_new_message(client, message):
+            logger.info(f"[FORWARDER][HANDLER] Вызван handler для channel_id={channel_id}, message_id={getattr(message, 'id', None)}")
+            # --- Медиагруппы ---
+            if getattr(message, 'media_group_id', None):
+                group_id = str(message.media_group_id)
+                if group_id not in self.media_groups:
+                    self.media_groups[group_id] = []
+                self.media_groups[group_id].append(message)
+                logger.info(f"[DEBUG] Добавлено сообщение {message.id} в медиагруппу {group_id}, теперь файлов: {len(self.media_groups[group_id])}")
+                if group_id not in self.media_group_timeouts:
+                    async def send_group_later():
+                        await asyncio.sleep(2.5)
+                        group_messages = self.media_groups.get(group_id, [])
+                        logger.info(f"[DEBUG] Перед отправкой медиагруппы {group_id}: {len(group_messages)} файлов")
+                        # --- Определяем платность медиагруппы ОДИН РАЗ ---
+                        config = self._forwarding_settings.get(channel_id, {})
+                        paid_content_mode = config.get('paid_content_mode', 'off')
+                        paid_content_every = config.get('paid_content_every', 1)
+                        paid_content_stars = config.get('paid_content_stars', 0)
+                        group_is_paid = False
+                        if paid_content_mode == "select":
+                            counters = self._counters[channel_id]
+                            counters['media_group_paid_counter'] += 1
+                            every = paid_content_every
+                            try:
+                                every = int(every)
+                            except Exception:
+                                every = 1
+                            if every > 0 and (counters['media_group_paid_counter'] % every == 0):
+                                group_is_paid = True
+                        # --- Отправка медиагруппы во все target_channel ---
+                        for (src_id2, tgt_id2), task2 in self._monitoring_tasks.items():
+                            if src_id2 == channel_id:
+                                try:
+                                    await self.forward_media_group(
+                                        channel_id,
+                                        group_id,
+                                        tgt_id2,
+                                        config.get('text_mode', 'hashtags_only'),
+                                        config.get('footer_text', ''),
+                                        config.get('forward_mode', 'copy'),
+                                        config.get('hide_sender', True),
+                                        config.get('max_posts', 0),
+                                        None,
+                                        paid_content_stars if group_is_paid else 0,
+                                        group_messages
+                                    )
+                                    logger.info(f"[FORWARDER][HANDLER] Медиагруппа {group_id} успешно переслана в {tgt_id2}")
+                                except Exception as e:
+                                    logger.error(f"[FORWARDER][HANDLER] Ошибка при пересылке медиагруппы {group_id} в {tgt_id2}: {e}")
+                        self.media_groups.pop(group_id, None)
+                        self.media_group_timeouts.pop(group_id, None)
+                    self.media_group_timeouts[group_id] = asyncio.create_task(send_group_later())
+                return  # Не обрабатывать как одиночное сообщение
+            # --- Одиночные сообщения ---
+            for (src_id, tgt_id), task in self._monitoring_tasks.items():
+                if src_id == channel_id:
+                    config = self._forwarding_settings.get(channel_id, {})
+                    hide_sender = config.get("hide_sender", True)
+                    add_footer = config.get("footer_text", "")
+                    max_posts = config.get("max_posts", 0)
+                    forward_mode = config.get("forward_mode", "copy")
+                    parse_mode = config.get("parse_mode", "all")
+                    hashtag_filter = config.get("hashtag_filter", "")
+                    text_mode = config.get("text_mode", "hashtags_only")
+                    delay_seconds = config.get("delay_seconds", 0)
+                    paid_content_stars = config.get("paid_content_stars", 0)
+                    # --- Одиночные paid_content_mode == 'select' ---
+                    is_paid = False
+                    if config.get('paid_content_mode') == 'select':
+                        counters = self._counters[channel_id]
+                        if 'single_paid_counter' not in counters:
+                            counters['single_paid_counter'] = 0
+                        counters['single_paid_counter'] += 1
+                        every = config.get('paid_content_every', 1)
+                        try:
+                            every = int(every)
+                        except Exception:
+                            every = 1
+                        if every > 0 and (counters['single_paid_counter'] % every == 0):
+                            is_paid = True
+                    try:
+                        await self._forward_single_message(
+                            message,
+                            tgt_id,
+                            hide_sender,
+                            add_footer,
+                            forward_mode,
+                            text_mode,
+                            paid_content_stars if is_paid else 0
+                        )
+                        logger.info(f"[FORWARDER][HANDLER] Успешно переслано сообщение {getattr(message, 'id', None)} в {tgt_id}")
+                    except Exception as e:
+                        logger.error(f"[FORWARDER][HANDLER] Ошибка при пересылке в {tgt_id}: {e}")
+        self._handlers[channel_id] = handle_new_message
 

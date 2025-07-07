@@ -727,10 +727,19 @@ async def get_user_channels(user_id: int):
 
 @app.post("/user/channels/{user_id}")
 async def add_user_channel(user_id: int, request: ChannelRequest):
-    """Добавить канал в историю пользователя"""
+    """Добавить канал в историю пользователя (только если канал существует)"""
     try:
-        await db.add_user_channel(user_id, request.channel_id, request.channel_title)
+        forwarder = get_or_create_forwarder()
+        try:
+            chat = await forwarder.userbot.get_chat(request.channel_id)
+            channel_title = getattr(chat, 'title', None) or request.channel_title
+        except Exception as e:
+            logger.warning(f"[API][add_user_channel] Не удалось получить канал {request.channel_id}: {e}")
+            raise HTTPException(status_code=400, detail="Канал не найден или недоступен")
+        await db.add_user_channel(user_id, str(chat.id), channel_title)
         return {"status": "success"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error adding user channel: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -767,10 +776,19 @@ async def get_user_target_channels(user_id: int):
 
 @app.post("/user/target-channels/{user_id}")
 async def add_user_target_channel(user_id: int, request: TargetChannelRequest):
-    """Добавить целевой канал в историю пользователя"""
+    """Добавить целевой канал в историю пользователя (только если канал существует)"""
     try:
-        await db.add_user_target_channel(user_id, request.channel_id, request.channel_title)
+        forwarder = get_or_create_forwarder()
+        try:
+            chat = await forwarder.userbot.get_chat(request.channel_id)
+            channel_title = getattr(chat, 'title', None) or request.channel_title
+        except Exception as e:
+            logger.warning(f"[API][add_user_target_channel] Не удалось получить канал {request.channel_id}: {e}")
+            raise HTTPException(status_code=400, detail="Канал не найден или недоступен")
+        await db.add_user_target_channel(user_id, str(chat.id), channel_title)
         return {"status": "success"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error adding user target channel: {e}")
         raise HTTPException(status_code=500, detail=str(e))
