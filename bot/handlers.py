@@ -21,9 +21,9 @@ from bot.states import (
     get_main_keyboard, get_channel_history_keyboard, get_target_channel_history_keyboard,
     get_forwarding_keyboard, get_forwarding_settings_keyboard, get_parse_mode_keyboard, get_text_mode_keyboard,
     get_direction_keyboard, get_media_filter_keyboard, get_range_mode_keyboard,
-    get_monitor_settings_keyboard, get_monitoring_stop_keyboard,
-    posting_stats, start_forwarding_parsing_api, get_forwarding_history_stats_api, 
-    clear_forwarding_history_api, get_channel_info, get_target_channel_info
+    get_monitor_settings_keyboard, posting_stats, start_forwarding_parsing_api, get_forwarding_history_stats_api, 
+    clear_forwarding_history_api, get_channel_info, get_target_channel_info,
+    get_stop_last_task_inline_keyboard, get_forwarding_inline_keyboard
 )
 from bot.config import config
 from bot.core import (
@@ -35,6 +35,7 @@ from bot.core import (
 )
 from bot.api_client import api_client
 from bot.states import format_forwarding_config
+import html
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -141,7 +142,9 @@ async def text_handler(client: Client, message: Message):
             else:
                 user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_MAIN_MENU}
             return
-
+        elif text in ["📊 Статус задач"]:
+            await monitorings_command(client, message)
+            return
         elif text in ["Пересылка ⭐", "⭐ Пересылка"]:
             kb = await get_channel_history_keyboard(user_id)
             sent = await message.reply(
@@ -172,11 +175,6 @@ async def text_handler(client: Client, message: Message):
     # --- FSM: Пересылка ---
     if state == FSM_FORWARD_CHANNEL:
         print(f"[FSM][DEBUG] FSM_FORWARD_CHANNEL | text='{text}'")
-        if text == "Ввести другой канал":
-            sent = await message.reply("Пожалуйста, введите ссылку или ID канала:", reply_markup=ReplyKeyboardRemove())
-            if sent is not None:
-                user_states[user_id]["last_msg_id"] = sent.id
-            return
         if text == "Назад":
             await show_main_menu(client, message, "Выберите действие:")
             return
@@ -191,9 +189,31 @@ async def text_handler(client: Client, message: Message):
         else:
             # --- Новый вариант: нормализация ---
             channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
-            user_states[user_id]["forward_channel_id"] = channel_id
+            # Попробуем получить numeric id, если возможно
+            real_id = None
+            try:
+                real_id = int(channel_id)
+            except (ValueError, TypeError):
+                # channel_id не приводится к int, пробуем получить через get_channel_stats
+                stats = await api_client.get_channel_stats(channel_id)
+                real_id = stats.get("channel_id")
+                try:
+                    real_id = int(real_id)
+                except (ValueError, TypeError):
+                    # Попробуем получить id из stats['id'] (pyrogram)
+                    real_id = stats.get("id")
+                    try:
+                        real_id = int(real_id)
+                    except (ValueError, TypeError):
+                        real_id = None
+            if real_id is None:
+                sent = await message.reply("❌ Не удалось определить ID канала. Введите корректный username или ID.", reply_markup=ReplyKeyboardRemove())
+                if sent is not None:
+                    user_states[user_id]["last_msg_id"] = sent.id
+                return
+            user_states[user_id]["forward_channel_id"] = real_id
             user_states[user_id]["forward_channel_title"] = channel_title
-            await api_client.add_user_channel(user_id, channel_id, channel_title)
+            await api_client.add_user_channel(user_id, str(real_id), channel_title)
         # --- ДОБАВЛЕНО: media_filter по умолчанию ---
         if "forward_settings" not in user_states[user_id]:
             user_states[user_id]["forward_settings"] = {}
@@ -210,11 +230,6 @@ async def text_handler(client: Client, message: Message):
     # --- FSM: Выбор целевого канала для пересылки ---
     if state == FSM_FORWARD_TARGET:
         print(f"[FSM][DEBUG] FSM_FORWARD_TARGET | text='{text}'")
-        if text == "Ввести другой канал":
-            sent = await message.reply("Пожалуйста, введите ссылку или ID целевого канала:", reply_markup=ReplyKeyboardRemove())
-            if sent is not None:
-                user_states[user_id]["last_msg_id"] = sent.id
-            return
         if text == "Назад":
             kb = await get_channel_history_keyboard(user_id)
             sent = await message.reply("Выберите канал для пересылки:", reply_markup=kb or ReplyKeyboardRemove())
@@ -230,30 +245,28 @@ async def text_handler(client: Client, message: Message):
             user_states[user_id]["forward_target_title"] = channel_title
             await api_client.update_user_target_channel_last_used(user_id, channel_id)
         else:
-            # --- Новый вариант: нормализация ---
             channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
             user_states[user_id]["forward_target_channel"] = channel_id
             user_states[user_id]["forward_target_title"] = channel_title
             await api_client.add_user_target_channel(user_id, channel_id, channel_title)
-        
-        # Инициализируем настройки пересылки по умолчанию
         user_states[user_id]['forward_settings'] = {
-            'parse_mode': 'all',  # all или hashtags
+            'parse_mode': 'all',
             'hashtag_filter': None,
-            'delay_seconds': 1,  # по умолчанию 1 секунда
-            'footer_text': '@TESAMSH',  # по умолчанию приписка
-            'text_mode': 'hashtags_only',  # remove, as_is, hashtags_only
+            'delay_seconds': 1,
+            'footer_text': '@TESAMSH',
+            'text_mode': 'hashtags_only',
             'max_posts': None,
             'hide_sender': True
         }
-        
         # Показываем статистику канала и меню управления пересылкой
         try:
             stats = await api_client.get_channel_stats(str(user_states[user_id]['forward_channel_id']))
             stat_text = format_channel_stats(stats)
+            channel_id = user_states[user_id]['forward_channel_id']
+            target_channel = user_states[user_id].get('forward_target_channel')
             sent_stat = await message.reply(
                 f"📊 Статистика канала {user_states[user_id]['forward_channel_title']}:\n\n{stat_text}\n\nВыберите действие:",
-                reply_markup=get_forwarding_keyboard()
+                reply_markup=get_forwarding_inline_keyboard(channel_id, target_channel)
             )
             if sent_stat is not None:
                 user_states[user_id]["last_msg_id"] = sent_stat.id
@@ -263,17 +276,23 @@ async def text_handler(client: Client, message: Message):
             sent = await message.reply(f"Ошибка при получении статистики: {e}", reply_markup=get_main_keyboard())
             user_states[user_id]["state"] = FSM_MAIN_MENU
             return
+        # Сразу после этого — обычная клавиатура:
+        await message.reply(
+            "Выберите действие с помощью кнопок ниже.",
+            reply_markup=get_forwarding_keyboard(channel_id, target_channel)
+        )
+        # Устанавливаю обычную клавиатуру для чата:
+        await client.send_message(
+            message.chat.id,
+            " ",
+            reply_markup=get_forwarding_keyboard(channel_id, target_channel)
+        )
 
     # --- FSM: Мониторинг ---
     if state == FSM_AWAIT_MONITOR_CHANNEL:
         print(f"[FSM][DEBUG] FSM_AWAIT_MONITOR_CHANNEL | text='{text}'")
         if text == "Назад":
             await show_main_menu(client, message, "Выберите действие:")
-            return
-        if text == "Ввести другой канал":
-            sent = await message.reply("Пожалуйста, введите ссылку или ID канала:", reply_markup=ReplyKeyboardRemove())
-            if sent is not None:
-                user_states[user_id]["last_msg_id"] = sent.id
             return
         match = re.match(r"(.+) \(ID: (-?\d+)\)", text)
         if match:
@@ -306,11 +325,6 @@ async def text_handler(client: Client, message: Message):
                 user_states[user_id]["last_msg_id"] = sent.id
             user_states[user_id]["state"] = FSM_AWAIT_MONITOR_CHANNEL
             return
-        if text == "Ввести другой канал":
-            sent = await message.reply("Пожалуйста, введите ссылку или ID целевого канала:", reply_markup=ReplyKeyboardRemove())
-            if sent is not None:
-                user_states[user_id]["last_msg_id"] = sent.id
-            return
         match = re.match(r"(.+) \(ID: (-?\d+)\)", text)
         if match:
             channel_title = match.group(1)
@@ -329,7 +343,6 @@ async def text_handler(client: Client, message: Message):
         try:
             stats = await api_client.get_channel_stats(str(user_states[user_id]['monitor_channel_id']))
             stat_text = get_monitor_stat_text(stats, user_states[user_id].get('monitor_settings', {}))
-            sent_stat = await message.reply(stat_text, reply_markup=ReplyKeyboardRemove())
             kb = ReplyKeyboardMarkup(
                 keyboard=[
                     [KeyboardButton("🟢 Запустить мониторинг")],
@@ -340,14 +353,10 @@ async def text_handler(client: Client, message: Message):
                 ],
                 resize_keyboard=True
             )
-            sent2 = await message.reply("Управление мониторингом:", reply_markup=kb)
-            try:
-                last_msg_id = user_states.get(user_id, {}).get("last_msg_id")
-                if last_msg_id:
-                    await client.delete_messages(message.chat.id, last_msg_id)
-            except Exception:
-                pass
-            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_AWAIT_MONITOR_STATUS, "last_msg_id": sent2.id, "stat_msg_id": sent_stat.id}
+            sent_stat = await message.reply(f"{stat_text}\n\nВыберите действие:", reply_markup=kb)
+            if sent_stat is not None:
+                user_states[user_id]["last_msg_id"] = sent_stat.id
+            user_states[user_id]["state"] = FSM_AWAIT_MONITOR_STATUS
             return
         except Exception as e:
             sent = await message.reply(f"Ошибка при получении статистики: {e}", reply_markup=get_main_keyboard())
@@ -970,9 +979,36 @@ async def text_handler(client: Client, message: Message):
                     user_states[user_id]['last_msg_id'] = sent.id
             return
         elif text == "🔙 Назад":
-            # Возвращаемся в главное меню пересылки
-            await show_forwarding_menu(client, message, user_id)
-            return
+            # Новый возврат: зависит от текущего состояния
+            state = user_states[user_id].get("state")
+            if state == FSM_FORWARD_SETTINGS:
+                # После статистики — возвращаем к выбору целевого канала
+                kb = await get_target_channel_history_keyboard(user_id)
+                await safe_edit_callback_message(
+                    callback_query,
+                    "Выберите целевой канал для пересылки:",
+                    reply_markup=kb or ReplyKeyboardRemove()
+                )
+                user_states[user_id]["state"] = FSM_FORWARD_TARGET
+                return
+            elif state == FSM_FORWARD_MONITORING or state == FSM_FORWARD_RUNNING:
+                # После запуска пересылки/мониторинга — возвращаем к статистике
+                stats = await api_client.get_channel_stats(str(user_states[user_id]['forward_channel_id']))
+                stat_text = format_channel_stats(stats)
+                channel_id = user_states[user_id]['forward_channel_id']
+                target_channel = user_states[user_id].get('forward_target_channel')
+                await safe_edit_callback_message(
+                    callback_query,
+                    f"📊 Статистика канала {user_states[user_id]['forward_channel_title']}:\n\n{stat_text}\n\nВыберите действие:",
+                    reply_markup=get_forwarding_inline_keyboard(channel_id, target_channel)
+                )
+                user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
+                return
+            else:
+                # По умолчанию — главное меню
+                await show_main_menu(client, callback_query.message, "Выберите действие:")
+                user_states[user_id]["state"] = FSM_MAIN_MENU
+                return
         else:
             # Если нет подсостояния, показываем главное меню
             await show_main_menu(client, message, "Пожалуйста, выберите действие из меню:")
@@ -1010,15 +1046,15 @@ async def show_forwarding_menu(client, message, user_id: int):
     channel_info = await get_channel_info(str(channel_id))
     if target_channel:
         target_info = await get_target_channel_info(target_channel)
-        target_display = target_info.get('title', str(target_channel))
+        target_display = target_info.get('channel_title', str(target_channel))
     else:
         target_display = 'Не выбран'
-    channel_display = channel_info.get('title', f"Канал {channel_id}")
+    channel_display = channel_info.get('channel_title', f"Канал {channel_id}")
     menu_text = f"📺 Канал: {channel_display}\n"
     menu_text += f"🎯 Целевой канал: {target_display}\n\n"
     sent = await message.reply(
         menu_text,
-        reply_markup=get_forwarding_keyboard()
+        reply_markup=get_forwarding_inline_keyboard(channel_id, target_channel)
     )
     if sent is not None:
         user_states[user_id]['last_msg_id'] = sent.id
@@ -1439,10 +1475,36 @@ async def forwarding_callback_handler(client, callback_query):
         return
     
     if data == "forward_back":
-        # Возвращаемся в главное меню, чтобы пользователь мог сразу выбрать новую пересылку
-        await show_main_menu(client, callback_query.message, "Выберите действие:")
-        user_states[user_id]["state"] = FSM_MAIN_MENU
-        return
+        # Новый возврат: зависит от текущего состояния
+        state = user_states[user_id].get("state")
+        if state == FSM_FORWARD_SETTINGS:
+            # После статистики — возвращаем к выбору целевого канала
+            kb = await get_target_channel_history_keyboard(user_id)
+            await safe_edit_callback_message(
+                callback_query,
+                "Выберите целевой канал для пересылки:",
+                reply_markup=kb or ReplyKeyboardRemove()
+            )
+            user_states[user_id]["state"] = FSM_FORWARD_TARGET
+            return
+        elif state == FSM_FORWARD_MONITORING or state == FSM_FORWARD_RUNNING:
+            # После запуска пересылки/мониторинга — возвращаем к статистике
+            stats = await api_client.get_channel_stats(str(user_states[user_id]['forward_channel_id']))
+            stat_text = format_channel_stats(stats)
+            channel_id = user_states[user_id]['forward_channel_id']
+            target_channel = user_states[user_id].get('forward_target_channel')
+            await safe_edit_callback_message(
+                callback_query,
+                f"📊 Статистика канала {user_states[user_id]['forward_channel_title']}:\n\n{stat_text}\n\nВыберите действие:",
+                reply_markup=get_forwarding_inline_keyboard(channel_id, target_channel)
+            )
+            user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
+            return
+        else:
+            # По умолчанию — главное меню
+            await show_main_menu(client, callback_query.message, "Выберите действие:")
+            user_states[user_id]["state"] = FSM_MAIN_MENU
+            return
     
     # --- Новые обработчики настроек ---
     if data == "forward_direction":
@@ -1872,19 +1934,25 @@ async def forwarding_callback_handler(client, callback_query):
         return
     
     if data == "forward_parse_and_forward":
-        # Запускаем парсинг и пересылку
+        # Запускаем парсинг и пересылку в фоновом режиме
         try:
-            success = await start_forwarding_parsing_api(user_id)
-            if success:
+            result = await start_forwarding_parsing_api(user_id)
+            if result.get("success"):
+                task_id = result.get("task_id", "")
+                message_text = result.get("message", "✅ Парсинг и пересылка запущены в фоновом режиме!")
+                if task_id:
+                    message_text += f"\n\n🆔 ID задачи: {task_id[:20]}..."
+                    await safe_edit_callback_message(callback_query, message_text, reply_markup=get_stop_last_task_inline_keyboard(task_id))
+                else:
+                    await safe_edit_callback_message(callback_query, message_text)
                 try:
-                    await callback_query.answer("✅ Парсинг и пересылка запущены!")
+                    await callback_query.answer("✅ Задача запущена!")
                 except Exception:
-                    # Если callback query устарел, просто логируем
                     pass
-                await show_forwarding_menu(client, callback_query.message, user_id)
             else:
+                error_msg = result.get("error", "Неизвестная ошибка")
                 try:
-                    await callback_query.answer("❌ Ошибка запуска парсинга и пересылки", show_alert=True)
+                    await callback_query.answer(f"❌ Ошибка: {error_msg}", show_alert=True)
                 except Exception:
                     pass
         except Exception as e:
@@ -1932,7 +2000,7 @@ async def forwarding_callback_handler(client, callback_query):
         await show_forwarding_settings(client, callback_query.message, user_id)
         return
 
-    elif callback_data == "start_forwarding":
+    elif data == "start_forwarding":
         # Начинаем пересылку
         user_id = callback_query.from_user.id
         channel_id = user_states[user_id]['forward_channel_id']
@@ -1956,6 +2024,10 @@ async def forwarding_callback_handler(client, callback_query):
         else:
             await callback_query.answer("❌ Ошибка запуска пересылки!", show_alert=True)
 
+    if data == "check_tasks_status":
+        await check_tasks_status_callback(client, callback_query)
+        return
+
 async def start_forwarding(user_id: int, channel_id: int, target_channel: int) -> bool:
     """Запуск пересылки через API"""
     try:
@@ -1969,6 +2041,11 @@ async def start_forwarding(user_id: int, channel_id: int, target_channel: int) -
                 }
             )
         print(f"[DEBUG] start_forwarding response: {resp.status_code} - {resp.text}")
+        # Явно добавляем целевой канал в историю
+        try:
+            await api_client.add_user_target_channel(user_id, str(target_channel), str(target_channel))
+        except Exception as e:
+            print(f"[DEBUG] Не удалось добавить целевой канал в историю: {e}")
         return resp.status_code == 200
     except Exception as e:
         print(f"[ERROR] Ошибка запуска пересылки: {e}")
@@ -2006,3 +2083,285 @@ async def resolve_channel(api_client, channel_input):
         return str(channel_id), channel_title, channel_username
     except Exception as e:
         return str(channel_input), str(channel_input), None
+
+def format_channel(cfg, channel_id_key="channel_id", title_key="channel_title", username_key="username"):
+    channel_id = cfg.get(channel_id_key) or cfg.get("source_channel") or cfg.get("target_channel")
+    title = cfg.get(title_key) or ""
+    username = cfg.get(username_key) or ""
+    if title and username:
+        return f"{title} (@{username})\n      ID: {channel_id}"
+    elif title:
+        return f"{title}\n      ID: {channel_id}"
+    elif username:
+        return f"@{username}\n      ID: {channel_id}"
+    else:
+        return f"ID: {channel_id}"
+
+async def get_channel_info_map(user_id):
+    """Возвращает dict: channel_id -> {'title': ..., 'username': ...} для user_channels и user_target_channels"""
+    user_channels = await api_client.get_user_channels(user_id)
+    target_channels = await api_client.get_user_target_channels(user_id)
+    info = {}
+    for ch in user_channels:
+        info[str(ch.get('id'))] = {'title': ch.get('title'), 'username': ch.get('username')}
+    for ch in target_channels:
+        info[str(ch.get('id'))] = {'title': ch.get('title'), 'username': ch.get('username')}
+    return info
+
+def format_channel_display(channel_id, info_map):
+    if channel_id is None:
+        return "—"
+    ch = info_map.get(str(channel_id))
+    if ch:
+        title = ch.get('title') or ''
+        username = ch.get('username') or ''
+        if title and username:
+            return f"{title} (@{username}) [ID: {channel_id}]"
+        elif title:
+            return f"{title} [ID: {channel_id}]"
+        elif username:
+            return f"@{username} [ID: {channel_id}]"
+    return f"ID: {channel_id}"
+
+async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings, tasks, updated=False):
+    info_map = await get_channel_info_map(user_id)
+    def safe(val):
+        if val is None or val == "N/A":
+            return "—"
+        return html.escape(str(val))
+    msg = "<b>📊 Статус задач и мониторингов:</b>\n\n"
+    if updated:
+        now = datetime.now().strftime("%H:%M:%S")
+        msg += f"<i>🔄 Список обновлен: {now}</i>\n\n"
+    buttons = []
+    # Мониторинги
+    if monitorings:
+        msg += "<b>📡 Мониторинги:</b>\n"
+        for idx, m in enumerate(monitorings, 1):
+            cfg = m.get("config", {})
+            channel_id = m.get("channel_id")
+            target_channel_id = m.get("target_channel")
+            channel_info = format_channel_display(channel_id, info_map)
+            # Fallback: если нет в истории — всё равно показываем id
+            if target_channel_id is not None:
+                target_info = format_channel_display(target_channel_id, info_map)
+            else:
+                target_info = "—"
+            active = m.get("active", False)
+            task_running = m.get("task_running", False)
+            status = "🟢 Активен" if active and task_running else "🔴 Остановлен"
+            msg += f"{idx}. <b>Канал:</b> {safe(channel_info)}\n"
+            msg += f"   <b>Статус:</b> {status}\n"
+            msg += f"   <b>Цель:</b> {safe(target_info)}\n"
+            msg += f"   <b>Режим:</b> {safe(cfg.get('parse_mode'))}\n"
+            msg += f"   <b>Хэштег:</b> {safe(cfg.get('hashtag_filter'))}\n"
+            msg += f"   <b>Лимит:</b> {safe(cfg.get('max_posts'))}\n"
+            msg += f"   <b>Платные:</b> {safe(cfg.get('paid_content_stars'))}⭐\n\n"
+            # Кнопка остановки мониторинга если есть оба id (даже если нет в истории)
+            if active and task_running and channel_id is not None and target_channel_id is not None:
+                buttons.append([InlineKeyboardButton(f"⏹️ Остановить мониторинг {idx}", callback_data=f"stop_monitoring:{channel_id}:{target_channel_id}")])
+    # Задачи парсинг+пересылки
+    if tasks:
+        msg += "<b>🚀 Задачи парсинг+пересылки:</b>\n"
+        for idx, task in enumerate(tasks, 1):
+            task_id = task.get("task_id")
+            source_id = task.get("source_channel")
+            target_id = task.get("target_channel")
+            source = format_channel_display(source_id, info_map)
+            target = format_channel_display(target_id, info_map)
+            status = task.get("status", "unknown")
+            started_at = safe(task.get("started_at"))
+            completed_at = safe(task.get("completed_at"))
+            error = safe(task.get("error"))
+            status_emoji = {
+                "running": "🟢",
+                "completed": "✅",
+                "stopped": "⏹️",
+                "error": "❌"
+            }.get(status, "❓")
+            msg += f"<b>{idx}. Задача {safe(task_id)[:15]}...</b>\n"
+            msg += f"   📤 <b>Источник:</b> {safe(source)}\n"
+            msg += f"   📥 <b>Цель:</b> {safe(target)}\n"
+            msg += f"   {status_emoji} <b>Статус:</b> {status}\n"
+            msg += f"   🕐 <b>Запущена:</b> {started_at}\n"
+            if completed_at and completed_at != "—":
+                msg += f"   ✅ <b>Завершена:</b> {completed_at}\n"
+            if error and error != "—":
+                msg += f"   ❌ <b>Ошибка:</b> {error[:50]}...\n"
+            msg += "\n"
+            if status == "running" and task_id:
+                buttons.append([InlineKeyboardButton(f"⏹️ Остановить задачу {idx}", callback_data=f"stop_task:{task_id}")])
+    # Кнопка остановить все
+    if (monitorings and any(m.get("active") and m.get("task_running") and m.get("channel_id") is not None and m.get("target_channel") is not None for m in monitorings)) or (tasks and any(t.get("status") == "running" and t.get("task_id") for t in tasks)):
+        buttons.append([InlineKeyboardButton("⏹️ Остановить все", callback_data="stop_all_tasks")])
+    # Кнопки управления
+    buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="check_tasks_status")])
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="forward_back")])
+    keyboard = InlineKeyboardMarkup(buttons)
+    return msg, keyboard
+
+async def send_or_edit_status_message(message=None, callback_query=None):
+    # Получаем user_id
+    user_id = None
+    if callback_query:
+        user_id = callback_query.from_user.id
+    elif message:
+        user_id = message.from_user.id
+    monitoring_data = await api_client.get_monitoring_status()
+    monitorings = monitoring_data.get("monitorings", [])
+    logger.info(f"[STATUS_UNIFIED] Получено monitorings: {monitorings}")
+    tasks_data = await api_client.get_all_tasks()
+    tasks = tasks_data.get("tasks", [])
+    logger.info(f"[STATUS_UNIFIED] Получено tasks: {tasks}")
+    updated = bool(callback_query)
+    if not monitorings and not tasks:
+        text = "📊 Нет активных задач и мониторингов."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Назад", callback_data="forward_back")]
+        ])
+        if callback_query:
+            try:
+                await callback_query.edit_message_text(text, reply_markup=keyboard)
+            except MessageNotModified:
+                pass
+        elif message:
+            await message.reply(text, reply_markup=keyboard)
+        return
+    msg, keyboard = await build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings, tasks, updated=updated)
+    logger.info(f"[STATUS_UNIFIED] Итоговое сообщение: {msg}")
+    try:
+        if callback_query:
+            await callback_query.edit_message_text(msg, reply_markup=keyboard, parse_mode="HTML")
+        elif message:
+            await message.reply(msg, reply_markup=keyboard, parse_mode="HTML")
+    except MessageNotModified:
+        logger.warning("[STATUS_UNIFIED] MESSAGE_NOT_MODIFIED: текст не изменился")
+    except Exception as e:
+        logger.error(f"[STATUS_UNIFIED] Ошибка при отправке/редактировании с parse_mode=HTML: {e}")
+        try:
+            if callback_query:
+                await callback_query.edit_message_text(msg, reply_markup=keyboard)
+            elif message:
+                await message.reply(msg, reply_markup=keyboard)
+        except MessageNotModified:
+            logger.warning("[STATUS_UNIFIED] MESSAGE_NOT_MODIFIED: текст не изменился (fallback)")
+        except Exception as e2:
+            logger.error(f"[STATUS_UNIFIED] Ошибка при отправке/редактировании без parse_mode: {e2}")
+
+# Команда из клавиатуры
+async def monitorings_command(client: Client, message: Message):
+    await send_or_edit_status_message(message=message)
+
+# Inline-кнопка
+async def check_tasks_status_callback(client: Client, callback_query):
+    await send_or_edit_status_message(callback_query=callback_query)
+
+# Добавляю обработку stop_task:<task_id> прямо здесь
+@Client.on_callback_query(filters.regex("^stop_task:"))
+async def stop_task_callback(client: Client, callback_query):
+    try:
+        data = callback_query.data
+        if data.startswith("stop_task:"):
+            task_id = data.split(":", 1)[1]
+            result = await api_client.stop_task(task_id)
+            if result.get("status") == "stopped":
+                await callback_query.answer("✅ Задача остановлена!")
+                await check_tasks_status_callback(client, callback_query)
+            else:
+                await callback_query.answer("❌ Ошибка при остановке задачи")
+    except Exception as e:
+        logger.error(f"Ошибка при остановке задачи: {e}")
+        await callback_query.answer("❌ Ошибка при остановке задачи")
+
+# Обработчик остановки мониторинга
+@Client.on_callback_query(filters.regex(r"^stop_monitoring:(.+):(.+)"))
+async def stop_monitoring_callback(client, callback_query):
+    parts = callback_query.data.split(":", 2)
+    channel_id = parts[1]
+    target_channel_id = parts[2]
+    logger.info(f"[STOP_MONITORING] channel_id={channel_id}, target_channel_id={target_channel_id}")
+    try:
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.post(f"{config.PARSER_SERVICE_URL}/forwarding/stop", json={"channel_id": int(channel_id), "target_channel_id": str(target_channel_id)})
+        logger.info(f"[STOP_MONITORING] API resp: {resp.status_code} {resp.text}")
+        if resp.status_code == 200:
+            await callback_query.answer("✅ Мониторинг остановлен!")
+        else:
+            await callback_query.answer(f"❌ Ошибка: {resp.text}")
+    except Exception as e:
+        logger.error(f"[STOP_MONITORING] Ошибка: {e}")
+        await callback_query.answer(f"❌ Ошибка: {e}")
+    await send_or_edit_status_message(callback_query=callback_query)
+
+# Обработчик остановки всех задач и мониторингов
+@Client.on_callback_query(filters.regex(r"^stop_all_tasks$"))
+async def stop_all_tasks_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    errors = []
+    logger.info(f"[STOP_ALL_TASKS] user_id={user_id}")
+    # Остановить все мониторинги
+    monitoring_data = await api_client.get_monitoring_status()
+    monitorings = monitoring_data.get("monitorings", [])
+    # Собираем уникальные пары (channel_id, target_channel_id)
+    pairs = set()
+    for m in monitorings:
+        channel_id = m.get("channel_id")
+        target_channel_id = m.get("target_channel")
+        if channel_id and target_channel_id:
+            pairs.add((channel_id, target_channel_id))
+    for channel_id, target_channel_id in pairs:
+        try:
+            async with httpx.AsyncClient() as http_client:
+                resp = await http_client.post(f"{config.PARSER_SERVICE_URL}/forwarding/stop", json={"channel_id": int(channel_id), "target_channel_id": str(target_channel_id)})
+            logger.info(f"[STOP_ALL_TASKS] stop_monitoring {channel_id} -> {target_channel_id}: {resp.status_code} {resp.text}")
+        except Exception as e:
+            logger.error(f"[STOP_ALL_TASKS] Ошибка: {e}")
+            errors.append(str(e))
+    # Остановить все задачи
+    tasks_data = await api_client.get_all_tasks()
+    tasks = tasks_data.get("tasks", [])
+    for t in tasks:
+        task_id = t.get("task_id")
+        if task_id:
+            try:
+                resp = await api_client.stop_task(task_id)
+                logger.info(f"[STOP_ALL_TASKS] stop_task {task_id}: {resp}")
+            except Exception as e:
+                logger.error(f"[STOP_ALL_TASKS] Ошибка: {e}")
+                errors.append(str(e))
+    if errors:
+        await callback_query.answer(f"❌ Ошибки: {'; '.join(errors)[:50]}")
+    else:
+        await callback_query.answer("✅ Все задачи и мониторинги остановлены!")
+    await send_or_edit_status_message(callback_query=callback_query)
+
+async def process_callback_query(client, callback_query):
+    """
+    Универсальный обработчик callback-запросов: вызывает forwarding_callback_handler только если callback не обработан ни одним из специализированных обработчиков.
+    Возвращает True если callback обработан, иначе False.
+    """
+    data = callback_query.data
+    # Проверяем все специализированные обработчики
+    if data is None:
+        return False
+    # stop_monitoring
+    if data.startswith("stop_monitoring:"):
+        # Импортируем и вызываем напрямую
+        await stop_monitoring_callback(client, callback_query)
+        return True
+    # stop_all_tasks
+    if data == "stop_all_tasks":
+        await stop_all_tasks_callback(client, callback_query)
+        return True
+    # stop_task
+    if data.startswith("stop_task:"):
+        await stop_task_callback(client, callback_query)
+        return True
+    # check_tasks_status
+    if data == "check_tasks_status":
+        await check_tasks_status_callback(client, callback_query)
+        return True
+    # ... можно добавить другие кастомные обработчики ...
+    # Если не обработано — fallback: вызываем forwarding_callback_handler
+    await forwarding_callback_handler(client, callback_query)
+    return True

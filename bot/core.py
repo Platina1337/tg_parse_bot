@@ -18,12 +18,11 @@ from bot.states import (
     FSM_FORWARD_CHANNEL, FSM_FORWARD_TARGET, FSM_FORWARD_SETTINGS, FSM_FORWARD_HASHTAG,
     FSM_FORWARD_DELAY, FSM_FORWARD_FOOTER, FSM_FORWARD_TEXT_MODE, FSM_FORWARD_LIMIT,
     FSM_FORWARD_DIRECTION, FSM_FORWARD_MEDIA_FILTER, FSM_FORWARD_RANGE, FSM_FORWARD_RANGE_START, FSM_FORWARD_RANGE_END,
-    FSM_NAVIGATION_MENU, FSM_NAVIGATION_AWAIT_CHANNEL, FSM_NAVIGATION_CONFIRM,
     get_main_keyboard, get_channel_history_keyboard, get_target_channel_history_keyboard,
     get_forwarding_keyboard, get_forwarding_settings_keyboard, get_parse_mode_keyboard, get_text_mode_keyboard,
     get_direction_keyboard, get_media_filter_keyboard, get_range_mode_keyboard,
-    get_monitor_settings_keyboard, get_monitoring_stop_keyboard,
-    posting_stats
+    get_monitor_settings_keyboard, posting_stats, start_forwarding_parsing_api, get_forwarding_history_stats_api, 
+    clear_forwarding_history_api, get_channel_info, get_target_channel_info
 )
 from bot.config import config
 from bot.navigation_manager import *

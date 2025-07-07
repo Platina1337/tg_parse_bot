@@ -48,6 +48,7 @@ def get_main_keyboard():
         [
             [KeyboardButton("📡 Мониторить канал")],
             [KeyboardButton("⛔ Остановить мониторинг"), KeyboardButton("🧭 Навигация по хэштегам")],
+            [KeyboardButton("📊 Статус задач")],
             [KeyboardButton("⭐ Пересылка")],
         ],
         resize_keyboard=True
@@ -61,7 +62,6 @@ async def get_channel_history_keyboard(user_id):
         print(f"[DEBUG] Нет каналов в истории для user_id={user_id}")
         return None
     buttons = [[KeyboardButton(f"{ch['title']} (ID: {ch['id']})")] for ch in channels]
-    buttons.append([KeyboardButton("Ввести другой канал")])
     buttons.append([KeyboardButton("Назад")])
     print(f"[DEBUG] Клавиатура для user_id={user_id}: {[ch['title'] for ch in channels]}")
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -74,27 +74,17 @@ async def get_target_channel_history_keyboard(user_id):
         print(f"[DEBUG] Нет целевых каналов в истории для user_id={user_id}")
         return None
     buttons = [[KeyboardButton(f"{ch['title']} (ID: {ch['id']})")] for ch in channels]
-    buttons.append([KeyboardButton("Ввести другой канал")])
     buttons.append([KeyboardButton("Назад")])
     print(f"[DEBUG] Клавиатура целевых каналов для user_id={user_id}: {[ch['title'] for ch in channels]}")
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 # --- Новые клавиатуры для пересылки ---
-def get_forwarding_keyboard():
-    """Главная клавиатура пересылки с inline кнопками"""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⚙️ Настройки", callback_data="forward_settings")
-        ],
-        [
-            InlineKeyboardButton("▶️ Запустить", callback_data="forward_start"),
-            InlineKeyboardButton("📥 Парсинг + пересылка", callback_data="forward_parse_and_forward")
-        ],
-        [
-            InlineKeyboardButton("⏸️ Остановить", callback_data="forward_stop"),
-            InlineKeyboardButton("🔙 Назад", callback_data="forward_back")
-        ]
-    ])
+def get_forwarding_keyboard(channel_id=None, target_channel=None):
+    """Главная клавиатура пересылки после выбора канала и цели (обычная клавиатура)."""
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("📊 Статус задач")],
+        [KeyboardButton("🔙 Назад")]
+    ], resize_keyboard=True)
 
 def get_forwarding_settings_keyboard():
     """Клавиатура настроек пересылки"""
@@ -177,21 +167,17 @@ def get_monitor_settings_keyboard(monitor_settings):
         resize_keyboard=True
     )
 
-def get_monitoring_stop_keyboard(monitorings, user_channels, user_targets):
-    # Кнопки вида: 'Из <имя> в <имя>'
-    buttons = [[KeyboardButton(f"Из {user_channels.get(m['channel_id'], m['channel_id'])} в {user_targets.get(m['target_channel'], m['target_channel'])}")] for m in monitorings]
-    buttons.append([KeyboardButton("Назад")])
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
 # --- Вспомогательные функции для пересылки ---
 def format_channel_stats(stats: dict) -> str:
-    """Форматирование статистики канала"""
+    """
+    Форматирование статистики канала для вывода пользователю
+    """
     return f"""
 👥 Подписчиков: {stats.get('members_count', 'N/A')}
 📊 Сообщений: {stats.get('total_posts', 'N/A')}
 📝 Спаршено: {stats.get('parsed_posts', 'N/A')}
 📅 Создан: {stats.get('created_at', 'N/A')}
-📄 Описание: {stats.get('description', 'N/A')[:100]}...
+📄 Описание: {stats.get('description', 'N/A')[:100] if stats.get('description') else 'N/A'}...
 """
 
 def format_forwarding_config(config: dict) -> str:
@@ -260,13 +246,11 @@ def get_monitor_stat_text(stats, monitor_settings):
     stat_text = (
         f"Канал: {title}\n"
         f"ID: {stats.get('channel_id', '-') or '-'}\n"
-        f"Всего постов: {stats.get('total_posts', '-') or '-'}\n"
-        f"Спаршено: {stats.get('parsed_posts', '-') or '-'}\n"
-        f"Медиагрупп: {stats.get('parsed_media_groups', '-') or '-'}\n"
-        f"Одиночных: {stats.get('parsed_singles', '-') or '-'}\n"
-        f"ID диапазон: {stats.get('min_id', '-')} - {stats.get('max_id', '-') }\n"
-        f"Последний спаршенный: {stats.get('last_parsed_id', '-')} ({stats.get('last_parsed_date', '-')})\n"
-        f"Опубликовано: - сообщений\n"
+        f"👥 Подписчиков: {stats.get('members_count', 'N/A')}\n"
+        f"📊 Сообщений: {stats.get('total_posts', 'N/A')}\n"
+        f"📝 Спаршено: {stats.get('parsed_posts', 'N/A')}\n"
+        f"📅 Создан: {stats.get('created_at', 'N/A')}\n"
+        f"📄 Описание: {stats.get('description', 'N/A')[:100] if stats.get('description') else 'N/A'}...\n"
         f"\n"
         f"Параметры мониторинга:\n"
         f"Порядок: {monitor_settings.get('order', 'old_to_new')}\n"
@@ -336,20 +320,41 @@ async def save_forwarding_config_api(user_id: int) -> bool:
         print(f"[ERROR] Ошибка сохранения конфигурации пересылки через API: {e}")
         return False
 
-async def start_forwarding_parsing_api(user_id: int) -> bool:
-    """Запуск парсинга и пересылки через API"""
+async def start_forwarding_parsing_api(user_id: int) -> dict:
+    """Запуск парсинга и пересылки через API в фоновом режиме"""
     try:
-        # Сначала сохраняем конфигурацию
-        config_saved = await save_forwarding_config_api(user_id)
-        if not config_saved:
-            print(f"[ERROR] Не удалось сохранить конфигурацию для пользователя {user_id}")
-            return False
+        # Получаем настройки из состояния пользователя
+        settings = user_states.get(user_id, {}).get('forward_settings', {})
+        if not settings:
+            print(f"[ERROR] Нет настроек пересылки для пользователя {user_id}")
+            return {"success": False, "error": "Нет настроек пересылки"}
         
-        # Затем запускаем парсинг и пересылку
-        return await api_client.start_forwarding_parsing(user_id)
+        # Добавляем target_channel если есть
+        if 'forward_target_channel' in user_states.get(user_id, {}):
+            settings['target_channel'] = user_states[user_id]['forward_target_channel']
+        
+        # Получаем source_channel
+        source_channel = user_states.get(user_id, {}).get('forward_channel_id')
+        target_channel = user_states.get(user_id, {}).get('forward_target_channel')
+        
+        if not source_channel or not target_channel:
+            return {"success": False, "error": "Не указан исходный или целевой канал"}
+        
+        # Запускаем парсинг и пересылку в фоновом режиме
+        result = await api_client.start_parsing_background(str(source_channel), str(target_channel), settings)
+        
+        if result.get("status") == "started":
+            return {
+                "success": True, 
+                "task_id": result.get("task_id"),
+                "message": result.get("message", "Парсинг+пересылка запущены в фоновом режиме")
+            }
+        else:
+            return {"success": False, "error": result.get("error", "Неизвестная ошибка")}
+            
     except Exception as e:
         print(f"[ERROR] Ошибка запуска парсинга и пересылки через API: {e}")
-        return False
+        return {"success": False, "error": str(e)}
 
 async def clear_forwarding_history_api(channel_id: int = None, target_channel: str = None) -> dict:
     """Очистка истории пересылки через API"""
@@ -381,4 +386,22 @@ async def get_target_channel_info(target_channel: str) -> dict:
         return await api_client.get_channel_stats(target_channel)
     except Exception as e:
         print(f"[ERROR] Ошибка получения информации о целевом канале через API: {e}")
-        return {} 
+        return {}
+
+# Новая функция для inline-кнопки остановки последней задачи
+def get_stop_last_task_inline_keyboard(task_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏹️ Остановить задачу", callback_data=f"stop_task:{task_id}")]
+    ])
+
+def get_forwarding_inline_keyboard(channel_id=None, target_channel=None, last_task_id=None):
+    buttons = [
+        [InlineKeyboardButton("▶️ Запустить", callback_data="forward_start"),
+         InlineKeyboardButton("📥 Парсинг + пересылка", callback_data="forward_parse_and_forward")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="forward_settings")],
+    ]
+    if last_task_id:
+        buttons.append([InlineKeyboardButton("⏹️ Остановить задачу", callback_data=f"stop_task:{last_task_id}")])
+    buttons.append([InlineKeyboardButton("📊 Статус задач", callback_data="check_tasks_status")])
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="forward_back")])
+    return InlineKeyboardMarkup(buttons) 

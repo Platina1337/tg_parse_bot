@@ -14,6 +14,7 @@ from pydantic import BaseModel
 import logging
 from dotenv import load_dotenv
 from pyrogram.errors import PeerIdInvalid
+from fastapi.responses import JSONResponse
 
 from parser.database import Database
 from shared.models import ForwardingConfigRequest, ParseConfig
@@ -382,7 +383,10 @@ async def get_channel_stats(channel_id: str):
         username = getattr(chat, 'username', None)
         is_member = not getattr(chat, 'left', False)
         is_public = bool(username)
-        logger.info(f"[API] Извлечённые данные: title={channel_title}, username={username}, total_posts={total_posts}, is_member={is_member}, is_public={is_public}")
+        description = getattr(chat, 'description', None)
+        created_at = getattr(chat, 'date', None)
+        members_count = getattr(chat, 'members_count', None)
+        logger.info(f"[API] Извлечённые данные: title={channel_title}, username={username}, total_posts={total_posts}, is_member={is_member}, is_public={is_public}, description={description}, created_at={created_at}, members_count={members_count}")
         
         # Сохраняем информацию о канале в БД
         logger.info(f"[API] Сохраняем информацию о канале в БД")
@@ -415,7 +419,10 @@ async def get_channel_stats(channel_id: str):
             "is_member": is_member,
             "is_public": is_public,
             "accessible": True,
-            "source": "telegram_api"
+            "source": "telegram_api",
+            "description": description,
+            "created_at": created_at,
+            "members_count": members_count
         }
     except HTTPException as e:
         logger.error(f"[API] Возвращаем HTTPException: {e.status_code} - {e.detail}")
@@ -523,18 +530,22 @@ async def start_forwarding_parsing(request: ForwardingRequest):
 
 @app.post("/forwarding/stop")
 async def stop_forwarding(request: dict):
-    """Остановка пересылки"""
-    try:
-        forwarder = get_or_create_forwarder()
-        channel_id = request.get("channel_id")
-        user_id = request.get("user_id")
-        if not channel_id:
-            raise HTTPException(status_code=400, detail="channel_id is required")
-        await forwarder.stop_forwarding(int(channel_id))
-        return {"status": "success", "message": "Forwarding stopped"}
-    except Exception as e:
-        logger.error(f"Error stopping forwarding: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """
+    Остановить пересылку/мониторинг для канала и цели (если указана).
+    """
+    channel_id = request.get("channel_id")
+    target_channel_id = request.get("target_channel_id")
+    logger.info(f"[API] /forwarding/stop: channel_id={channel_id}, target_channel_id={target_channel_id}")
+    forwarder = get_or_create_forwarder()
+    if channel_id is not None:
+        try:
+            channel_id_int = int(channel_id)
+        except Exception:
+            channel_id_int = channel_id
+        await forwarder.stop_forwarding(channel_id_int, target_channel_id)
+        logger.info(f"[API] Остановлен мониторинг: {channel_id} -> {target_channel_id}")
+        return {"status": "stopped", "channel_id": channel_id, "target_channel_id": target_channel_id}
+    return JSONResponse(status_code=400, content={"error": "channel_id обязателен"})
 
 @app.get("/forwarding/stats/{channel_id}")
 async def get_forwarding_stats(channel_id: int):
@@ -673,6 +684,7 @@ async def forward_messages(user_id: int, source_channel_id: int, target_channel_
             forwarder = TelegramForwarder(db_instance=db)
             logger.info("Forwarder initialized with existing userbot")
         try:
+            logger.info(f"[FORWARD_MESSAGES] Вызов start_forwarding для пересылки новых сообщений (handler)")
             result = await forwarder.start_forwarding(
                 source_channel=str(source_channel_id),
                 target_channel=str(target_channel_id),
@@ -1005,6 +1017,113 @@ async def get_forwarding_history_stats(channel_id: Optional[int] = None, target_
     except Exception as e:
         logger.error(f"Error getting forwarding history stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/forwarding/monitoring_status")
+async def get_forwarding_monitoring_status():
+    """
+    Получить список всех активных мониторингов с полным config каждого.
+    Теперь для каждого мониторинга возвращается также target_channel (цель мониторинга).
+    """
+    forwarder = get_or_create_forwarder()
+    status = forwarder.get_all_monitoring_status()
+    return JSONResponse(content={"monitorings": status})
+
+@app.post("/forwarding/start_parsing_background")
+async def start_forwarding_parsing_background(request: dict):
+    """Запустить парсинг+пересылку в фоновом режиме (возвращает task_id сразу)."""
+    try:
+        source_channel = request.get("source_channel")
+        target_channel = request.get("target_channel")
+        config = request.get("config", {})
+        
+        if not source_channel or not target_channel:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "source_channel и target_channel обязательны"}
+            )
+        
+        forwarder = get_or_create_forwarder()
+        task_id = await forwarder.start_forwarding_parsing(source_channel, target_channel, config)
+        
+        return JSONResponse(content={
+            "status": "started",
+            "task_id": task_id,
+            "message": "Парсинг+пересылка запущены в фоновом режиме"
+        })
+        
+    except Exception as e:
+        logger.error(f"Ошибка при запуске парсинг+пересылки в фоне: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+@app.get("/forwarding/task_status/{task_id}")
+async def get_parse_forward_task_status(task_id: str):
+    """Получить статус задачи парсинг+пересылки по task_id."""
+    try:
+        forwarder = get_or_create_forwarder()
+        status = forwarder.get_parse_forward_task_status(task_id)
+        
+        if "error" in status:
+            return JSONResponse(
+                status_code=404,
+                content=status
+            )
+        
+        return JSONResponse(content=status)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении статуса задачи {task_id}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+@app.post("/forwarding/stop_task/{task_id}")
+async def stop_parse_forward_task(task_id: str):
+    """Остановить задачу парсинг+пересылки по task_id."""
+    try:
+        forwarder = get_or_create_forwarder()
+        success = forwarder.stop_parse_forward_task(task_id)
+        
+        if success:
+            return JSONResponse(content={
+                "status": "stopped",
+                "task_id": task_id,
+                "message": "Задача остановлена"
+            })
+        else:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Задача не найдена или уже завершена"}
+            )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при остановке задачи {task_id}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+@app.get("/forwarding/all_tasks")
+async def get_all_parse_forward_tasks():
+    """Получить список всех задач парсинг+пересылки."""
+    try:
+        forwarder = get_or_create_forwarder()
+        tasks = forwarder.get_all_parse_forward_tasks()
+        
+        return JSONResponse(content={
+            "tasks": tasks,
+            "count": len(tasks)
+        })
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении списка задач: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 if __name__ == "__main__":
     import uvicorn

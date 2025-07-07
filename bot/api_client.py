@@ -216,5 +216,55 @@ class ParserAPIClient:
         response = await self._make_request("GET", f"/monitor/stats/{channel_id}/{target_channel}")
         return response.get("stats", {})
 
+    async def get_monitoring_status(self) -> dict:
+        """
+        Получить статус всех активных мониторингов.
+        Возвращает список monitorings, где для каждого теперь есть:
+        - channel_id
+        - config
+        - active
+        - task_running
+        - target_channel (новое поле, цель мониторинга)
+        """
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(f"{self.base_url}/forwarding/monitoring_status")
+            response.raise_for_status()
+            return response.json()
+
+    async def start_parsing_background(self, source_channel: str, target_channel: str, config: dict) -> dict:
+        """Запустить парсинг+пересылку в фоновом режиме."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{self.base_url}/forwarding/start_parsing_background",
+                json={
+                    "source_channel": source_channel,
+                    "target_channel": target_channel,
+                    "config": config
+                }
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def get_task_status(self, task_id: str) -> dict:
+        """Получить статус задачи парсинг+пересылки."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(f"{self.base_url}/forwarding/task_status/{task_id}")
+            response.raise_for_status()
+            return response.json()
+
+    async def stop_task(self, task_id: str) -> dict:
+        """Остановить задачу парсинг+пересылки."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(f"{self.base_url}/forwarding/stop_task/{task_id}")
+            response.raise_for_status()
+            return response.json()
+
+    async def get_all_tasks(self) -> dict:
+        """Получить список всех задач парсинг+пересылки."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(f"{self.base_url}/forwarding/all_tasks")
+            response.raise_for_status()
+            return response.json()
+
 # Глобальный экземпляр API клиента
 api_client = ParserAPIClient() 

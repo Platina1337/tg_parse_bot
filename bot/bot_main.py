@@ -14,10 +14,12 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from pyrogram import Client, filters
+from pyrogram.errors import RPCError
 from bot.config import config
 from bot.states import user_states
-from bot.handlers import start_command, text_handler, forwarding_callback_handler
+from bot.handlers import start_command, text_handler, forwarding_callback_handler, monitorings_command, check_tasks_status_callback, process_callback_query
 from bot.navigation_manager import navigation_menu_handler, navigation_text_handler
+import bot.handlers  # Для регистрации всех callback-обработчиков
 
 # Настройка логирования
 logging.basicConfig(
@@ -61,8 +63,30 @@ async def text_message_handler(client, message):
 
 @app.on_callback_query()
 async def callback_query_handler(client, callback_query):
-    """Обработчик callback запросов"""
-    await forwarding_callback_handler(client, callback_query)
+    """
+    Глобальный обработчик callback-запросов: вызывает forwarding_callback_handler только если не сработал ни один другой обработчик.
+    """
+    try:
+        # Попробуем вызвать process_callback_query, которая вернёт True если обработала callback
+        handled = await process_callback_query(client, callback_query)
+        if not handled:
+            # Если не обработано — можно логировать или отправить fallback-ответ
+            await callback_query.answer("Неизвестное действие", show_alert=True)
+    except RPCError as e:
+        # Pyrogram может выбрасывать ошибки RPC
+        logger.error(f"[CALLBACK_HANDLER] RPCError: {e}")
+        await callback_query.answer("Ошибка Telegram API", show_alert=True)
+    except Exception as e:
+        logger.error(f"[CALLBACK_HANDLER] Ошибка: {e}")
+        await callback_query.answer("Внутренняя ошибка", show_alert=True)
+
+@app.on_message(filters.command("monitorings"))
+async def monitorings_handler(client, message):
+    await monitorings_command(client, message)
+
+@app.on_callback_query(filters.regex("^check_tasks_status$"))
+async def check_tasks_status_handler(client, callback_query):
+    await check_tasks_status_callback(client, callback_query)
 
 def run_bot():
     """Функция для запуска бота извне"""
