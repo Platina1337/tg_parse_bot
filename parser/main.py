@@ -60,6 +60,10 @@ class ForwardingConfigRequest(BaseModel):
     hashtag_filter: Optional[str] = None
     delay_seconds: int = 0
     footer_text: str = ""
+    # Поля для гиперссылки в приписке
+    footer_link: Optional[str] = None  # URL для гиперссылки
+    footer_link_text: Optional[str] = None  # Текст, который будет гиперссылкой
+    footer_full_link: bool = False  # Превращать ли всю приписку в ссылку
     text_mode: str = "hashtags_only"
     max_posts: Optional[int] = None
     hide_sender: bool = True
@@ -477,6 +481,10 @@ async def start_forwarding(request: dict):
                 'paid_content_hashtag': settings.get('paid_content_hashtag'),
                 'paid_content_every': settings.get('paid_content_every'),
                 'paid_content_chance': settings.get('paid_content_chance'),
+                # Добавляем настройки гиперссылки
+                'footer_link': settings.get('footer_link'),
+                'footer_link_text': settings.get('footer_link_text'),
+                'footer_full_link': settings.get('footer_full_link', False),
             }
             logger.info(f"[API] Итоговый config для форвардера (из settings): {config}")
         else:
@@ -494,6 +502,10 @@ async def start_forwarding(request: dict):
                 'paid_content_hashtag': request.get('paid_content_hashtag'),
                 'paid_content_every': request.get('paid_content_every'),
                 'paid_content_chance': request.get('paid_content_chance'),
+                # Добавляем настройки гиперссылки
+                'footer_link': request.get('footer_link'),
+                'footer_link_text': request.get('footer_link_text'),
+                'footer_full_link': request.get('footer_full_link', False),
             }
             logger.info(f"[API] Итоговый config для форвардера (из request): {config}")
         await forward_messages(user_id, source_channel_id, target_channel_id, config)

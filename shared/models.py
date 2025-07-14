@@ -116,6 +116,10 @@ class PostingSettings(BaseModel):
     truncate_long_messages: bool = True  # Обрезать длинные сообщения
     add_footer: bool = True  # Добавлять подпись
     footer_text: Optional[str] = None  # Текст подписи
+    # --- Новые поля для гиперссылки в приписке ---
+    footer_link: Optional[str] = None  # URL для гиперссылки
+    footer_link_text: Optional[str] = None  # Текст, который будет гиперссылкой
+    footer_full_link: bool = False  # Превращать ли всю приписку в ссылку
     add_header: bool = True  # Добавлять заголовок
     header_text: Optional[str] = None  # Текст заголовка
     filter_words: List[str] = []  # Слова для фильтрации
@@ -228,6 +232,10 @@ class ForwardingConfigRequest(BaseModel):
     hashtag_filter: Optional[str] = None
     delay_seconds: int = 0
     footer_text: str = ""
+    # --- Новые поля для гиперссылки в приписке ---
+    footer_link: Optional[str] = None  # URL для гиперссылки
+    footer_link_text: Optional[str] = None  # Текст, который будет гиперссылкой
+    footer_full_link: bool = False  # Превращать ли всю приписку в ссылку
     text_mode: str = "hashtags_only"  # "remove", "as_is", "hashtags_only"
     max_posts: Optional[int] = None
     hide_sender: bool = True

@@ -508,12 +508,15 @@ class TelegramForwarder:
                     logger.warning(f"[FORWARDER] Тип {media_type} не поддерживается для платного контента (файл)")
                     return False
             logger.info(f"[FORWARDER] 🚀 Отправляем платный контент: {media_type} с {stars} звездами (is_bot_admin={is_bot_admin})")
+            # Проверяем наличие HTML-разметки в caption
+            contains_html = "<a href=" in caption or "<b>" in caption or "<i>" in caption or "<code>" in caption
+            
             result = await self.tg_bot.send_paid_media(
                 chat_id=chat_id,
                 star_count=stars,
                 media=media,
                 caption=caption,
-                parse_mode=TgParseMode.HTML
+                parse_mode=TgParseMode.HTML if contains_html else None
             )
             logger.info(f"[FORWARDER] ✅ Платный пост отправлен через python-telegram-bot: {media_type} с {stars} звездами")
             if not is_bot_admin and temp_file_path:
@@ -541,11 +544,24 @@ class TelegramForwarder:
             logger.info(f"[FORWARDER] 🔍 Условие для платного контента: paid_content_stars > 0 = {paid_content_stars > 0}")
             original_text = message.text or message.caption or ""
             processed_text = self._process_message_text(original_text, text_mode)
+            
+            # Получаем настройки гиперссылки из конфигурации канала
+            channel_id = message.chat.id if hasattr(message, 'chat') and hasattr(message.chat, 'id') else None
+            config = self._forwarding_settings.get(channel_id, {})
+            footer_link = config.get("footer_link")
+            footer_link_text = config.get("footer_link_text")
+            footer_full_link = config.get("footer_full_link", False)
+            
+            # Форматируем приписку с гиперссылкой, если настроена
             if add_footer:
+                formatted_footer = self._format_footer_with_link(add_footer, footer_link, footer_link_text, footer_full_link)
                 if processed_text:
-                    processed_text += f"\n\n{add_footer}"
+                    processed_text += f"\n\n{formatted_footer}"
                 else:
-                    processed_text = add_footer
+                    processed_text = formatted_footer
+                    
+                # Устанавливаем флаг, содержит ли текст HTML-разметку
+                contains_html = "<a href=" in processed_text or "<b>" in processed_text or "<i>" in processed_text
             should_send_paid = paid_content_stars > 0 and self.tg_bot is not None
             channel_id = message.chat.id if hasattr(message, 'chat') and hasattr(message.chat, 'id') else None
             
@@ -668,6 +684,38 @@ class TelegramForwarder:
             import re
             hashtags = re.findall(r'#\w+', text)
             return ' '.join(hashtags)
+    
+    def _format_footer_with_link(self, footer_text: str, footer_link: str = None, footer_link_text: str = None, footer_full_link: bool = False) -> str:
+        """
+        Форматирует текст приписки с гиперссылкой
+        
+        Args:
+            footer_text (str): Текст приписки
+            footer_link (str, optional): URL для гиперссылки
+            footer_link_text (str, optional): Текст, который нужно сделать гиперссылкой
+            footer_full_link (bool, optional): Сделать всю приписку гиперссылкой
+            
+        Returns:
+            str: Отформатированная приписка с HTML-разметкой для ссылок
+        """
+        if not footer_text:
+            return ""
+        
+        if not footer_link:
+            return footer_text
+        
+        if footer_full_link:
+            # Вся приписка - гиперссылка
+            return f'<a href="{footer_link}">{footer_text}</a>'
+        
+        if footer_link_text and footer_link_text in footer_text:
+            # Часть приписки - гиперссылка
+            html_link = f'<a href="{footer_link}">{footer_link_text}</a>'
+            return footer_text.replace(footer_link_text, html_link)
+        
+        # По умолчанию добавляем ссылку в конец
+        link_text = footer_link_text or "ссылка"
+        return f'{footer_text} <a href="{footer_link}">{link_text}</a>'
     
     async def _save_to_posts_json(self, messages, caption, channel_id):
         """Сохранение информации в posts.json"""
@@ -906,10 +954,18 @@ class TelegramForwarder:
             import re
             hashtags = re.findall(r'#\w+', group_caption or "")
             group_caption = " ".join(hashtags)
-        if add_footer and group_caption:
-            group_caption = f"{group_caption}\n\n{add_footer}"
-        elif add_footer:
-            group_caption = add_footer
+        # Получаем настройки гиперссылки из конфигурации
+        footer_link = config.get("footer_link") if config else None
+        footer_link_text = config.get("footer_link_text") if config else None
+        footer_full_link = config.get("footer_full_link", False) if config else False
+        
+        # Форматируем приписку с гиперссылкой, если настроена
+        if add_footer:
+            formatted_footer = self._format_footer_with_link(add_footer, footer_link, footer_link_text, footer_full_link)
+            if group_caption:
+                group_caption = f"{group_caption}\n\n{formatted_footer}"
+            else:
+                group_caption = formatted_footer
         group_message_ids = []
         try:
             if forward_mode == "forward":
@@ -1022,12 +1078,15 @@ class TelegramForwarder:
                                     tg_media = [InputPaidMediaPhoto(media=fid) if mt == 'photo' else InputPaidMediaVideo(media=fid) for mt, fid, _ in media_list]
                                 else:
                                     tg_media = [InputPaidMediaPhoto(media=open(tf, 'rb')) if mt == 'photo' else InputPaidMediaVideo(media=open(tf, 'rb')) for mt, fid, tf in media_list]
+                                # Проверяем наличие HTML-разметки в caption
+                                contains_html = "<a href=" in group_caption or "<b>" in group_caption or "<i>" in group_caption or "<code>" in group_caption
+                                
                                 result = await self.tg_bot.send_paid_media(
                                     chat_id=target_channel,
                                     star_count=paid_content_stars,
                                     media=tg_media,
                                     caption=group_caption,
-                                    parse_mode=TgParseMode.HTML
+                                    parse_mode=TgParseMode.HTML if contains_html else None
                                 )
                                 logger.info(f"[FORWARDER] ✅ Платная медиагруппа {group_id} отправлена через python-telegram-bot с {paid_content_stars} звездами")
                                 if not is_bot_admin:

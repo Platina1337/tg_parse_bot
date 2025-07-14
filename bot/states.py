@@ -29,6 +29,8 @@ FSM_FORWARD_SETTINGS = "forward_settings"
 FSM_FORWARD_HASHTAG = "forward_hashtag"
 FSM_FORWARD_DELAY = "forward_delay"
 FSM_FORWARD_FOOTER = "forward_footer"
+FSM_FORWARD_FOOTER_LINK = "forward_footer_link"
+FSM_FORWARD_FOOTER_LINK_TEXT = "forward_footer_link_text"
 FSM_FORWARD_TEXT_MODE = "forward_text_mode"
 FSM_FORWARD_LIMIT = "forward_limit"
 FSM_FORWARD_DIRECTION = "forward_direction"
@@ -96,6 +98,9 @@ def get_forwarding_settings_keyboard():
         [
             InlineKeyboardButton("⏱️ Задержка", callback_data="forward_delay"),
             InlineKeyboardButton("📝 Приписка", callback_data="forward_footer")
+        ],
+        [
+            InlineKeyboardButton("🔗 Гиперссылка в приписке", callback_data="forward_footer_link")
         ],
         [
             InlineKeyboardButton("📄 Режим текста", callback_data="forward_text_mode"),
@@ -212,11 +217,27 @@ def format_forwarding_config(config: dict) -> str:
         target_channel_display = str(target_channel)
     else:
         target_channel_display = 'Не выбран'
+    # Информация о гиперссылке
+    footer_link = config.get('footer_link')
+    footer_link_text = config.get('footer_link_text')
+    footer_full_link = config.get('footer_full_link', False)
+    
+    if footer_link:
+        if footer_full_link:
+            hyperlink_info = f"🔗 Гиперссылка: Вся приписка → {footer_link}"
+        elif footer_link_text:
+            hyperlink_info = f"🔗 Гиперссылка: \"{footer_link_text}\" → {footer_link}"
+        else:
+            hyperlink_info = f"🔗 Гиперссылка: {footer_link}"
+    else:
+        hyperlink_info = ""
+    
     return f"""
 🏷️ Режим: {'По хэштегам' if config.get('parse_mode') == 'hashtags' else 'Все сообщения'}
 {'🏷️ Хэштег: ' + config.get('hashtag_filter') if config.get('hashtag_filter') else ''}
 ⏱️ Задержка: {config.get('delay_seconds', 0)} сек
 📝 Приписка: {config.get('footer_text') or 'Нет'}
+{hyperlink_info}
 📄 Текст: {'Удалить' if config.get('text_mode') == 'remove' else 'Как есть' if config.get('text_mode') == 'as_is' else 'Только хэштеги'}
 📊 Лимит: {limit_text}
 ⭐️ Платные посты: {paid_content_status}
