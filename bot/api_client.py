@@ -204,6 +204,10 @@ class ParserAPIClient:
     async def get_channel_stats(self, channel_id: str) -> Dict:
         """Получить статистику канала"""
         response = await self._make_request("GET", f"/channel/stats/{channel_id}")
+        import logging
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger("api_client")
+        logger.info(f"[get_channel_stats] Ответ от parser: {response!r}")
         return response
     
     async def get_channel_hashtags(self, channel_id: str) -> List[str]:

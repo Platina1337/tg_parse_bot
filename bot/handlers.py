@@ -1134,8 +1134,9 @@ async def show_forwarding_menu(client, message, user_id: int):
 
 # --- Обработчик callback запросов ---
 async def forwarding_callback_handler(client, callback_query):
-    data = callback_query.data
     user_id = callback_query.from_user.id
+    data = callback_query.data
+    state = user_states[user_id].get("state")
     
     # Извлекаем действие из callback_data
     action = data.replace("forward_", "")
@@ -2225,6 +2226,20 @@ async def forwarding_callback_handler(client, callback_query):
 
     # --- Удалены дублирующиеся обработчики FSM_FORWARD_FOOTER_LINK и FSM_FORWARD_FOOTER_LINK_TEXT ---
 
+    if data == "forward_back_to_stats":
+        # Возвращаемся к статистике канала
+        stats = await api_client.get_channel_stats(str(user_states[user_id]['forward_channel_id']))
+        stat_text = format_channel_stats(stats)
+        channel_id = user_states[user_id]['forward_channel_id']
+        target_channel = user_states[user_id].get('forward_target_channel')
+        await safe_edit_callback_message(
+            callback_query,
+            f"📊 Статистика канала {user_states[user_id]['forward_channel_title']}:\n\n{stat_text}\n\nВыберите действие:",
+            reply_markup=get_forwarding_inline_keyboard(channel_id, target_channel)
+        )
+        user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
+        return
+
 async def start_forwarding(user_id: int, channel_id: int, target_channel: int) -> bool:
     """Запуск пересылки через API"""
     try:
@@ -2419,7 +2434,7 @@ async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings,
         buttons.append([InlineKeyboardButton("⏹️ Остановить все", callback_data="stop_all_tasks")])
     # Кнопки управления
     buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="check_tasks_status")])
-    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="forward_back")])
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_stats")])
     keyboard = InlineKeyboardMarkup(buttons)
     return msg, keyboard
 
@@ -2440,7 +2455,7 @@ async def send_or_edit_status_message(message=None, callback_query=None):
     if not monitorings and not tasks:
         text = "📊 Нет активных задач и мониторингов."
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Назад", callback_data="forward_back")]
+            [InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_stats")]
         ])
         if callback_query:
             try:

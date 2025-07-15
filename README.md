@@ -47,3 +47,9 @@ cd ..
 python -m bot.main_new
 
 python parser/main.py
+
+
+cd bot
+source venv/bin/activate
+cd ..
+python -m bot.bot_main

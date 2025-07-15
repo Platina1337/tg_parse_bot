@@ -121,7 +121,7 @@ def get_forwarding_settings_keyboard():
             InlineKeyboardButton("💾 Сохранить", callback_data="forward_save")
         ],
         [
-            InlineKeyboardButton("🔙 Назад", callback_data="forward_back")
+            InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_stats")
         ]
     ])
 
