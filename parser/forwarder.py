@@ -1228,12 +1228,18 @@ class TelegramForwarder:
 
     async def start_forwarding_parsing(self, source_channel: str, target_channel: str, config: dict, callback: Optional[Callable] = None):
         """Запуск парсинга + пересылки (background task)"""
+        # ДОБАВЛЕНО: Проверка и запуск userbot
+        if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
+            await self.userbot.start()
         task_id = self.create_parse_forward_task(source_channel, target_channel, config)
         task_info = self._parse_forward_tasks[task_id]
         
         # Создаем background task
         async def run_parse_forward():
             try:
+                # ДОБАВЛЕНО: Проверка и запуск userbot внутри таска (на всякий случай)
+                if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
+                    await self.userbot.start()
                 logger.info(f"[FORWARDER] 🚀 ЗАПУСК ПАРСИНГА + ПЕРЕСЫЛКИ (НЕ МОНИТОРИНГА!)")
                 logger.info(f"[FORWARDER] Источник: {source_channel} -> Цель: {target_channel}")
                 logger.info(f"[FORWARDER] Конфигурация: {config}")

@@ -179,9 +179,8 @@ def format_channel_stats(stats: dict) -> str:
     """
     return f"""
 👥 Подписчиков: {stats.get('members_count', 'N/A')}
-📊 Сообщений: {stats.get('total_posts', 'N/A')}
+🆔 Последний ID сообщения: {stats.get('last_message_id', 'N/A')}
 📝 Спаршено: {stats.get('parsed_posts', 'N/A')}
-📅 Создан: {stats.get('created_at', 'N/A')}
 📄 Описание: {stats.get('description', 'N/A')[:100] if stats.get('description') else 'N/A'}...
 """
 
@@ -268,9 +267,8 @@ def get_monitor_stat_text(stats, monitor_settings):
         f"Канал: {title}\n"
         f"ID: {stats.get('channel_id', '-') or '-'}\n"
         f"👥 Подписчиков: {stats.get('members_count', 'N/A')}\n"
-        f"📊 Сообщений: {stats.get('total_posts', 'N/A')}\n"
+        f"🆔 Последний ID сообщения: {stats.get('last_message_id', 'N/A')}\n"
         f"📝 Спаршено: {stats.get('parsed_posts', 'N/A')}\n"
-        f"📅 Создан: {stats.get('created_at', 'N/A')}\n"
         f"📄 Описание: {stats.get('description', 'N/A')[:100] if stats.get('description') else 'N/A'}...\n"
         f"\n"
         f"Параметры мониторинга:\n"
@@ -399,7 +397,15 @@ async def get_channel_info(channel_id: str) -> dict:
         return await api_client.get_channel_stats(channel_id)
     except Exception as e:
         print(f"[ERROR] Ошибка получения информации о канале через API: {e}")
-        return {}
+        return {
+            "id": channel_id,
+            "title": f"Канал {channel_id}",
+            "username": "",
+            "members_count": "N/A",
+            "last_message_id": "N/A",
+            "parsed_posts": "0",
+            "description": ""
+        }
 
 async def get_target_channel_info(target_channel: str) -> dict:
     """Получение информации о целевом канале через API"""
@@ -407,7 +413,15 @@ async def get_target_channel_info(target_channel: str) -> dict:
         return await api_client.get_channel_stats(target_channel)
     except Exception as e:
         print(f"[ERROR] Ошибка получения информации о целевом канале через API: {e}")
-        return {}
+        return {
+            "id": target_channel,
+            "title": f"Канал {target_channel}",
+            "username": "",
+            "members_count": "N/A",
+            "last_message_id": "N/A",
+            "parsed_posts": "0",
+            "description": ""
+        }
 
 # Новая функция для inline-кнопки остановки последней задачи
 def get_stop_last_task_inline_keyboard(task_id):

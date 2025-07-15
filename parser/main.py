@@ -250,10 +250,11 @@ async def get_channel_stats(channel_id: str):
         # Проверяем, есть ли в БД информация о канале (не только статистика парсинга)
         logger.info(f"[API] Проверяем таблицу channel_info для канала {channel_id_typed}")
         channel_info_from_db = None
+        last_message_id = None
         try:
             # Проверяем, есть ли запись о канале в БД
             async with db.conn.execute(
-                "SELECT channel_title, username, total_posts, is_public, last_updated FROM channel_info WHERE channel_id = ?",
+                "SELECT channel_title, username, total_posts, is_public, last_updated, last_message_id FROM channel_info WHERE channel_id = ?",
                 (str(channel_id_typed),)
             ) as cursor:
                 row = await cursor.fetchone()
@@ -263,8 +264,10 @@ async def get_channel_stats(channel_id: str):
                         'username': row[1],
                         'total_posts': row[2],
                         'is_public': bool(row[3]),
-                        'last_updated': row[4]
+                        'last_updated': row[4],
+                        'last_message_id': row[5] if len(row) > 5 else None
                     }
+                    last_message_id = channel_info_from_db.get('last_message_id')
                     logger.info(f"[API] Найдена информация о канале в БД: {channel_info_from_db}")
                 else:
                     logger.info(f"[API] Информация о канале {channel_id_typed} в БД не найдена")
@@ -291,6 +294,7 @@ async def get_channel_stats(channel_id: str):
                     "max_id": db_stats['max_id'],
                     "last_parsed_id": db_stats['last_parsed_id'],
                     "last_parsed_date": db_stats['last_parsed_date'],
+                    "last_message_id": last_message_id,
                     "is_member": True,  # Если есть в БД, значит был доступ
                     "is_public": channel_info_from_db['is_public'],
                     "accessible": True,
@@ -303,66 +307,24 @@ async def get_channel_stats(channel_id: str):
         
         # Если данных нет или они устарели, делаем запрос к Telegram API
         logger.info(f"[API] Делаем запрос к Telegram API для канала {channel_id_typed}")
+        
+        # Получаем forwarder
         forwarder = get_or_create_forwarder()
-        if not getattr(forwarder.userbot, 'is_connected', False):
-            logger.info(f"[API] Userbot не подключен, запускаем...")
+        
+        # Запускаем userbot если не запущен
+        if not hasattr(forwarder.userbot, 'is_connected') or not forwarder.userbot.is_connected:
+            logger.info(f"[API] Userbot не запущен, запускаем...")
             await forwarder.userbot.start()
             logger.info(f"[API] Userbot успешно запущен")
-        else:
-            logger.info(f"[API] Userbot уже подключен")
         
-        # Получаем инфу о канале через Telegram API
-        logger.info(f"[API] Вызываем forwarder.userbot.get_chat({channel_id_typed})")
-        chat = None
+        # Получаем информацию о канале
         try:
             chat = await forwarder.userbot.get_chat(channel_id_typed)
-            logger.info(f"[API] Успешно получили информацию о канале: {getattr(chat, 'title', 'Unknown')}")
-        except (ValueError, PeerIdInvalid) as ve:
-            logger.warning(f"[API] Userbot не может получить доступ к каналу {channel_id_typed}: {ve}")
-            # Канал может существовать, но userbot не имеет к нему доступа
-            # Возвращаем информацию о недоступности, а не 404
-            return {
-                "status": "success",
-                "channel_id": channel_id_typed,
-                "channel_title": f"Канал {channel_id_typed}",
-                "username": None,
-                "total_posts": 0,
-                "parsed_posts": db_stats['parsed_count'],
-                "parsed_media_groups": db_stats['parsed_media_groups'],
-                "parsed_singles": db_stats['parsed_singles'],
-                "min_id": db_stats['min_id'],
-                "max_id": db_stats['max_id'],
-                "last_parsed_id": db_stats['last_parsed_id'],
-                "last_parsed_date": db_stats['last_parsed_date'],
-                "is_member": False,
-                "is_public": False,
-                "accessible": False,
-                "source": "unknown",
-                "message": "Канал недоступен для userbot (возможно, приватный или userbot не является участником)"
-            }
-        except Exception as chat_error:
-            logger.error(f"[API] Ошибка при получении чата: {chat_error}")
-            logger.error(f"[API] Тип исключения: {type(chat_error)}")
-            logger.error(f"[API] Содержимое исключения: {str(chat_error)}")
-            if "FLOOD_WAIT" in str(chat_error):
-                import re
-                wait_time = int(re.search(r'(\d+)', str(chat_error)).group(1))
-                logger.info(f"[API] FloodWait, ждём {wait_time} секунд")
-                await asyncio.sleep(wait_time)
-                try:
-                    chat = await forwarder.userbot.get_chat(channel_id_typed)
-                except Exception as chat_error2:
-                    logger.error(f"[API] Ошибка после FloodWait: {chat_error2}")
-                    raise HTTPException(status_code=500, detail=f"Ошибка получения информации о канале: {chat_error2}")
-            elif "Peer id invalid" in str(chat_error) or "ID not found" in str(chat_error):
-                logger.warning(f"[API] Userbot не может получить доступ к каналу {channel_id_typed}: {chat_error}")
-                # Канал может существовать, но userbot не имеет к нему доступа
+            if not chat:
+                logger.warning(f"[API] Канал {channel_id_typed} не найден")
                 return {
-                    "status": "success",
-                    "channel_id": channel_id_typed,
-                    "channel_title": f"Канал {channel_id_typed}",
-                    "username": None,
-                    "total_posts": 0,
+                    "status": "error",
+                    "message": f"Канал {channel_id_typed} не найден или недоступен",
                     "parsed_posts": db_stats['parsed_count'],
                     "parsed_media_groups": db_stats['parsed_media_groups'],
                     "parsed_singles": db_stats['parsed_singles'],
@@ -370,19 +332,47 @@ async def get_channel_stats(channel_id: str):
                     "max_id": db_stats['max_id'],
                     "last_parsed_id": db_stats['last_parsed_id'],
                     "last_parsed_date": db_stats['last_parsed_date'],
-                    "is_member": False,
-                    "is_public": False,
-                    "accessible": False,
-                    "source": "unknown",
-                    "message": "Канал недоступен для userbot (возможно, приватный или userbot не является участником)"
+                    "source": "database_only"
                 }
-            else:
-                logger.error(f"[API] Ошибка userbot.get_chat: {chat_error}", exc_info=True)
-                raise HTTPException(status_code=500, detail=f"Ошибка получения информации о канале: {chat_error}")
+        except Exception as e:
+            logger.error(f"[API] Ошибка при получении информации о канале: {e}")
+            return {
+                "status": "error",
+                "message": f"Ошибка при получении информации о канале: {str(e)}",
+                "parsed_posts": db_stats['parsed_count'],
+                "parsed_media_groups": db_stats['parsed_media_groups'],
+                "parsed_singles": db_stats['parsed_singles'],
+                "min_id": db_stats['min_id'],
+                "max_id": db_stats['max_id'],
+                "last_parsed_id": db_stats['last_parsed_id'],
+                "last_parsed_date": db_stats['last_parsed_date'],
+                "source": "database_only"
+            }
         
-        # Извлекаем данные из Telegram API
-        logger.info(f"[API] Извлекаем данные из объекта chat")
-        total_posts = getattr(chat, 'available_messages_count', None) or getattr(chat, 'full_available_messages_count', None) or 0
+        # Попробуем получить последнее сообщение
+        try:
+            # Получаем историю сообщений (только 1 сообщение, самое новое)
+            messages = []
+            async for message in forwarder.userbot.get_chat_history(channel_id_typed, limit=1):
+                messages.append(message)
+                break  # Берем только первое (самое новое)
+            
+            if messages:
+                last_message = messages[0]
+                last_message_id = last_message.id
+                logger.info(f"[API] Получено последнее сообщение ID: {last_message_id}")
+            else:
+                logger.info(f"[API] В канале нет сообщений")
+                last_message_id = None
+        except Exception as e:
+            logger.error(f"[API] Ошибка при получении последнего сообщения: {e}")
+            last_message_id = None
+        
+        # Теперь получаем общее количество сообщений
+        total_posts = getattr(chat, 'message_count', 0) or 0
+        logger.info(f"[API] Общее количество постов: {total_posts}")
+        
+        # Извлекаем остальные данные из объекта chat
         channel_title = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(channel_id_typed)
         username = getattr(chat, 'username', None)
         is_member = not getattr(chat, 'left', False)
@@ -390,16 +380,16 @@ async def get_channel_stats(channel_id: str):
         description = getattr(chat, 'description', None)
         created_at = getattr(chat, 'date', None)
         members_count = getattr(chat, 'members_count', None)
-        logger.info(f"[API] Извлечённые данные: title={channel_title}, username={username}, total_posts={total_posts}, is_member={is_member}, is_public={is_public}, description={description}, created_at={created_at}, members_count={members_count}")
+        logger.info(f"[API] Извлечённые данные: title={channel_title}, username={username}, total_posts={total_posts}, is_member={is_member}, is_public={is_public}, description={description}, created_at={created_at}, members_count={members_count}, last_message_id={last_message_id}")
         
         # Сохраняем информацию о канале в БД
         logger.info(f"[API] Сохраняем информацию о канале в БД")
         try:
             await db.conn.execute(
                 """INSERT OR REPLACE INTO channel_info 
-                   (channel_id, channel_title, username, total_posts, is_public, last_updated) 
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (str(channel_id_typed), channel_title, username, total_posts, is_public, datetime.now().isoformat())
+                   (channel_id, channel_title, username, total_posts, is_public, last_updated, last_message_id) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (str(channel_id_typed), channel_title, username, total_posts, is_public, datetime.now().isoformat(), last_message_id)
             )
             await db.conn.commit()
             logger.info(f"[API] Сохранена информация о канале в БД")
@@ -407,6 +397,7 @@ async def get_channel_stats(channel_id: str):
             logger.warning(f"[API] Не удалось сохранить информацию о канале в БД: {e}")
         
         logger.info(f"[API] Возвращаем результат")
+        
         return {
             "status": "success",
             "channel_id": channel_id_typed,
@@ -420,20 +411,22 @@ async def get_channel_stats(channel_id: str):
             "max_id": db_stats['max_id'],
             "last_parsed_id": db_stats['last_parsed_id'],
             "last_parsed_date": db_stats['last_parsed_date'],
+            "last_message_id": last_message_id,
             "is_member": is_member,
             "is_public": is_public,
             "accessible": True,
-            "source": "telegram_api",
+            "members_count": members_count,
             "description": description,
-            "created_at": created_at,
-            "members_count": members_count
+            "created_at": created_at.isoformat() if created_at else None,
+            "source": "telegram_api"
         }
-    except HTTPException as e:
-        logger.error(f"[API] Возвращаем HTTPException: {e.status_code} - {e.detail}")
-        raise e
     except Exception as e:
-        logger.error(f"[API] Ошибка в /channel/stats/{channel_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"[API] Непредвиденная ошибка: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "source": "error"
+        }
     finally:
         logger.info(f"[API] === КОНЕЦ ОБРАБОТКИ /channel/stats/{channel_id} ===")
 

@@ -23,12 +23,16 @@ from bot.states import (
     get_direction_keyboard, get_media_filter_keyboard, get_range_mode_keyboard,
     get_monitor_settings_keyboard, posting_stats, start_forwarding_parsing_api, get_forwarding_history_stats_api, 
     clear_forwarding_history_api, get_channel_info, get_target_channel_info,
-    get_stop_last_task_inline_keyboard, get_forwarding_inline_keyboard
+    get_stop_last_task_inline_keyboard, get_forwarding_inline_keyboard,
+     format_channel_stats, format_forwarding_stats,
+    start_forwarding_api, stop_forwarding_api, get_forwarding_stats_api, save_forwarding_config_api,
+    check_monitoring_status, get_monitor_stat_text,
+    start_forwarding_parsing_api, get_forwarding_history_stats_api, clear_forwarding_history_api,
+    get_channel_info, get_target_channel_info
 )
 from bot.config import config
 from bot.core import (
-    show_main_menu, format_channel_stats, format_forwarding_stats,
-    start_forwarding_api, stop_forwarding_api, get_forwarding_stats_api, save_forwarding_config_api,
+    show_main_menu, start_forwarding_api, stop_forwarding_api, get_forwarding_stats_api, save_forwarding_config_api,
     check_monitoring_status, get_monitor_stat_text,
     start_forwarding_parsing_api, get_forwarding_history_stats_api, clear_forwarding_history_api,
     get_channel_info, get_target_channel_info
@@ -169,8 +173,10 @@ async def text_handler(client: Client, message: Message):
             await show_main_menu(client, message, "Пожалуйста, выберите действие из меню:")
             return
 
-
-
+    # В начале text_handler, перед обработкой любого пользовательского ввода для настроек пересылки:
+    if user_states.get(user_id, {}).get("state") in [FSM_FORWARD_FOOTER_LINK, FSM_FORWARD_FOOTER_LINK_TEXT]:
+        # Если пользователь переключился на другой режим, сбрасываем состояние
+        user_states[user_id]["state"] = None
 
     # --- FSM: Пересылка ---
     if state == FSM_FORWARD_CHANNEL:
@@ -253,7 +259,7 @@ async def text_handler(client: Client, message: Message):
             'parse_mode': 'all',
             'hashtag_filter': None,
             'delay_seconds': 1,
-            'footer_text': '@TESAMSH',
+            'footer_text': '🌐 <a href="https://t.me/TESAMSH/4026">_TSSH_Fans_</a>',
             'text_mode': 'hashtags_only',
             'max_posts': None,
             'hide_sender': True
@@ -881,6 +887,7 @@ async def text_handler(client: Client, message: Message):
                 user_states[user_id]['last_msg_id'] = sent.id
             return
         elif text == "⏱️ Задержка":
+            user_states[user_id]["state"] = FSM_FORWARD_DELAY
             # Запрашиваем ввод задержки
             current_delay = user_states[user_id]['forward_settings'].get('delay_seconds', 0)
             sent = await message.reply(
@@ -889,9 +896,9 @@ async def text_handler(client: Client, message: Message):
             )
             if sent is not None:
                 user_states[user_id]['last_msg_id'] = sent.id
-            user_states[user_id]['forward_state'] = 'delay_input'
             return
         elif text == "📝 Приписка":
+            user_states[user_id]["state"] = FSM_FORWARD_FOOTER
             # Запрашиваем ввод приписки
             current_footer = user_states[user_id]['forward_settings'].get('footer_text', '')
             sent = await message.reply(
@@ -900,7 +907,6 @@ async def text_handler(client: Client, message: Message):
             )
             if sent is not None:
                 user_states[user_id]['last_msg_id'] = sent.id
-            user_states[user_id]['forward_state'] = 'footer_input'
             return
         elif text == "📄 Режим текста":
             # Переключаем режим текста
@@ -936,6 +942,7 @@ async def text_handler(client: Client, message: Message):
                 user_states[user_id]['last_msg_id'] = sent.id
             return
         elif text == "📊 Лимит постов":
+            user_states[user_id]["state"] = FSM_FORWARD_LIMIT
             # Запрашиваем ввод лимита
             current_limit = user_states[user_id]['forward_settings'].get('max_posts')
             sent = await message.reply(
@@ -944,9 +951,9 @@ async def text_handler(client: Client, message: Message):
             )
             if sent is not None:
                 user_states[user_id]['last_msg_id'] = sent.id
-            user_states[user_id]['forward_state'] = 'limit_input'
             return
         elif text == "🏷️ Хэштег фильтр":
+            user_states[user_id]["state"] = FSM_FORWARD_HASHTAG
             # Запрашиваем ввод хэштега
             current_hashtag = user_states[user_id]['forward_settings'].get('hashtag_filter', '')
             sent = await message.reply(
@@ -955,7 +962,6 @@ async def text_handler(client: Client, message: Message):
             )
             if sent is not None:
                 user_states[user_id]['last_msg_id'] = sent.id
-            user_states[user_id]['forward_state'] = 'hashtag_input'
             return
         elif text == "🎯 Целевой канал":
             # Переходим к выбору целевого канала
@@ -1019,44 +1025,41 @@ async def text_handler(client: Client, message: Message):
         print(f"[FSM][DEBUG] FSM_FORWARD_FOOTER_LINK | text='{text}'")
         if text == "Назад":
             await show_forwarding_settings(client, message, user_id)
+            user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
             return
-        
-        # Проверка URL на корректность (разрешаем Telegram ссылки)
-        if not text.startswith(('http://', 'https://', 't.me/', 'telegram.me/')):
-            sent = await message.reply("⚠️ Пожалуйста, введите корректный URL (должен начинаться с http://, https://, t.me/ или telegram.me/)")
-            if sent:
-                user_states[user_id]["last_msg_id"] = sent.id
-            return
-            
-        # Сохраняем URL
-        user_states[user_id]["forward_settings"]["footer_link"] = text
-        
-        # Запрашиваем текст гиперссылки с инлайн кнопками
-        footer_text = user_states[user_id]["forward_settings"].get("footer_text", "")
+        # Сохраняем новый URL
+        new_url = text.strip()
+        forwarding_config = user_states[user_id]["forward_settings"]
+        forwarding_config["footer_link"] = new_url
+        forwarding_config["footer_link_text"] = None
+        forwarding_config["footer_full_link"] = True
+        user_states[user_id]["forward_settings"] = forwarding_config
+        # Показываем меню управления гиперссылкой
+        text_msg = f"Текущая ссылка в приписке: {new_url}\n\nВся приписка является гиперссылкой.\n\nВыберите действие:"
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Вся приписка как ссылка", callback_data="forward_footer_link_full")],
-            [InlineKeyboardButton("◀️ Отмена", callback_data="forward_back_to_settings")]
+            [InlineKeyboardButton("🔄 Изменить URL", callback_data="forward_footer_link_change")],
+            [InlineKeyboardButton("📝 Изменить текст ссылки", callback_data="forward_footer_link_text")],
+            [InlineKeyboardButton("🗑️ Удалить ссылку", callback_data="forward_footer_link_delete")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="forward_back_to_settings")]
         ])
-        sent = await message.reply(
-            f"URL сохранен: {text}\n\nТекущая приписка: \"{footer_text}\"\n\nВыберите опцию:\n"
-            f"1. Сделать всю приписку гиперссылкой (нажмите кнопку ниже)\n"
-            f"2. Введите часть текста приписки, которую нужно сделать гиперссылкой:",
-            reply_markup=keyboard
-        )
+        sent = await message.reply(text_msg, reply_markup=keyboard)
         if sent:
             user_states[user_id]["last_msg_id"] = sent.id
-        user_states[user_id]["state"] = FSM_FORWARD_FOOTER_LINK_TEXT
+        user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
         return
-        
+
     # --- FSM: Настройка текста гиперссылки в приписке ---
+    def insert_link_once(footer_text, link_text, url):
+        # Заменить только первое вхождение link_text на ссылку
+        return re.sub(re.escape(link_text), f'<a href="{url}">{link_text}</a>', footer_text, count=1)
+
     if state == FSM_FORWARD_FOOTER_LINK_TEXT:
         print(f"[FSM][DEBUG] FSM_FORWARD_FOOTER_LINK_TEXT | text='{text}'")
         if text == "Назад":
             await show_forwarding_settings(client, message, user_id)
+            user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
             return
-        
         footer_text = user_states[user_id]["forward_settings"].get("footer_text", "")
-        
         # Проверяем, что указанный текст присутствует в приписке
         if text not in footer_text:
             sent = await message.reply(
@@ -1067,22 +1070,18 @@ async def text_handler(client: Client, message: Message):
             if sent:
                 user_states[user_id]["last_msg_id"] = sent.id
             return
-            
         # Сохраняем текст для гиперссылки
         user_states[user_id]["forward_settings"]["footer_link_text"] = text
         user_states[user_id]["forward_settings"]["footer_full_link"] = False
-        
         # Формируем превью того, как будет выглядеть приписка
         footer_link = user_states[user_id]["forward_settings"].get("footer_link", "")
-        preview = footer_text.replace(text, f"<a href='{footer_link}'>{text}</a>")
-        
+        preview = insert_link_once(footer_text, text, footer_link)
         sent = await message.reply(
             f"✅ Гиперссылка настроена!\n\n"
             f"Так будет выглядеть приписка:\n{preview}",
         )
         if sent:
             user_states[user_id]["last_msg_id"] = sent.id
-            
         await show_forwarding_settings(client, message, user_id)
         user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
         return
@@ -1149,21 +1148,32 @@ async def forwarding_callback_handler(client, callback_query):
     # --- Обработка действий для гиперссылки в приписке ---
     if action == "footer_link":
         # Проверяем, есть ли уже приписка (footer_text)
-        footer_text = forwarding_config.get("footer_text")
-        if not footer_text:
-            await callback_query.answer("Сначала добавьте приписку!", show_alert=True)
-            await show_forwarding_settings(client, callback_query.message, user_id)
-            return
-            
-        # Проверяем, есть ли уже гиперссылка
+        footer_text = forwarding_config.get("footer_text", "")
+        # Проверяем, есть ли гиперссылка в приписке (HTML <a href=...>)
+        import re
+        link_match = re.search(r'<a href=["\\\']([^"\\\']+)["\\\']>(.*?)</a>', footer_text)
         footer_link = forwarding_config.get("footer_link")
+        if not footer_link and link_match:
+            forwarding_config["footer_link"] = link_match.group(1)
+            forwarding_config["footer_link_text"] = link_match.group(2)
+            # Проверяем: вся ли приписка — гиперссылка
+            # Удаляем HTML-теги и пробелы для сравнения
+            import html
+            text_inside_link = html.unescape(link_match.group(2)).strip()
+            text_no_link = re.sub(r'<a href=["\\\']([^"\\\']+)["\\\']>(.*?)</a>', text_inside_link, footer_text).strip()
+            # Если вся приписка — только ссылка (без эмодзи и пробелов)
+            if footer_text.strip() == link_match.group(0).strip():
+                forwarding_config["footer_full_link"] = True
+            else:
+                forwarding_config["footer_full_link"] = False
+            user_states[user_id]["forward_settings"] = forwarding_config
+            footer_link = link_match.group(1)
         if footer_link:
             text = f"Текущая ссылка в приписке: {footer_link}\n\n"
             if forwarding_config.get("footer_full_link", False):
                 text += "Вся приписка является гиперссылкой.\n\n"
             elif forwarding_config.get("footer_link_text"):
                 text += f"Текст ссылки: {forwarding_config.get('footer_link_text')}\n\n"
-            
             text += "Выберите действие:"
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Изменить URL", callback_data="forward_footer_link_change")],
@@ -1181,29 +1191,26 @@ async def forwarding_callback_handler(client, callback_query):
             await callback_query.edit_message_text(text, reply_markup=keyboard)
             await callback_query.answer()
             return
-        
         await callback_query.edit_message_text(text, reply_markup=keyboard)
         await callback_query.answer()
         return
     
     elif action == "footer_link_change":
-        # Запрашиваем новый URL для гиперссылки
+        # Показываем форму для ввода нового URL, не дублируем текст и не показываем меню
         text = "Введите новый URL для гиперссылки:"
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("◀️ Отмена", callback_data="forward_footer_link")]
+            [InlineKeyboardButton("◀️ Отмена", callback_data="forward_back_to_settings")]
         ])
         await callback_query.edit_message_text(text, reply_markup=keyboard)
         user_states[user_id]["state"] = FSM_FORWARD_FOOTER_LINK
         await callback_query.answer()
         return
-    
     elif action == "footer_link_text":
-        # Запрашиваем текст для гиперссылки
         footer_text = forwarding_config.get("footer_text", "")
         text = f"Текущая приписка: {footer_text}\n\nВведите часть текста приписки, которую нужно сделать гиперссылкой:"
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Вся приписка как ссылка", callback_data="forward_footer_link_full")],
-            [InlineKeyboardButton("◀️ Отмена", callback_data="forward_footer_link")]
+            [InlineKeyboardButton("◀️ Отмена", callback_data="forward_back_to_settings")]
         ])
         await callback_query.edit_message_text(text, reply_markup=keyboard)
         user_states[user_id]["state"] = FSM_FORWARD_FOOTER_LINK_TEXT
@@ -1798,6 +1805,8 @@ async def forwarding_callback_handler(client, callback_query):
     if data == "forward_back_to_settings":
         # Возвращаемся к настройкам
         await show_forwarding_settings(client, callback_query.message, user_id)
+        user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
+        await callback_query.answer()
         return
     
     if data.startswith('showmedia_'):

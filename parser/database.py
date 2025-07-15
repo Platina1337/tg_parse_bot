@@ -23,170 +23,141 @@ class Database:
         self._lock = asyncio.Lock()
 
     async def init(self):
-        """Инициализация базы данных и установка соединения"""
-        logger.debug("[init] Открываю соединение с БД")
+        """Инициализация базы данных"""
         try:
             self.conn = await aiosqlite.connect(self.db_path)
-            cursor = await self.conn.cursor()
-            logger.debug("[init] Соединение открыто, создаю таблицы")
-            
-            # Таблица для отслеживания спарсенных сообщений
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS parsed_messages (
-                    channel_id INTEGER,
-                    message_id INTEGER,
-                    text TEXT,
-                    has_media BOOLEAN,
-                    media_group_id TEXT,
-                    local_file_path TEXT,
-                    forwarded_to TEXT,
-                    type TEXT DEFAULT 'text_only',
-                    parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    published BOOLEAN DEFAULT FALSE,
-                    PRIMARY KEY (channel_id, message_id)
-                )
-            """)
-            
-            # Миграция: добавляем колонку type, если её нет
-            try:
-                await cursor.execute("SELECT type FROM parsed_messages LIMIT 1")
-            except sqlite3.OperationalError:
-                # Колонки type нет, добавляем её
-                await cursor.execute("ALTER TABLE parsed_messages ADD COLUMN type TEXT DEFAULT 'text_only'")
-                await self.conn.commit()
-            
-            # Таблица для конфигураций парсинга
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS parse_configs (
-                    channel_id INTEGER PRIMARY KEY,
-                    mode TEXT,
-                    settings TEXT,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_parsed_at TIMESTAMP
-                )
-            """)
-            
-            # Таблица для медиагрупп
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS media_groups (
-                    channel_id INTEGER,
-                    group_id INTEGER,
-                    message_ids TEXT,
-                    text TEXT,
-                    created_at TIMESTAMP,
-                    PRIMARY KEY (channel_id, group_id)
-                )
-            """)
-            
-            # Таблица для истории каналов пользователя
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_channels (
-                    user_id INTEGER,
-                    channel_id TEXT,
-                    channel_title TEXT,
-                    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, channel_id)
-                )
-            """)
-            
-            # Таблица для целевых каналов пользователя
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_target_channels (
-                    user_id INTEGER,
-                    channel_id TEXT,
-                    channel_title TEXT,
-                    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, channel_id)
-                )
-            """)
-            
-            # Таблица для отслеживания активных мониторингов пользователя
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_monitorings (
-                    user_id INTEGER,
-                    channel_id TEXT,
-                    target_channel TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    PRIMARY KEY (user_id, channel_id, target_channel)
-                )
-            """)
-            
-            # --- НОВАЯ ТАБЛИЦА для истории публикаций ---
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS published_messages (
-                    source_channel_id INTEGER,
-                    message_id INTEGER,
-                    target_channel_id INTEGER,
-                    published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (source_channel_id, message_id, target_channel_id)
-                )
-            """)
-            
-            # Таблица для шаблонов публикации
-            await cursor.execute('''
-                CREATE TABLE IF NOT EXISTS posting_templates (
-                    user_id INTEGER,
-                    name TEXT,
-                    settings_json TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, name)
-                )
-            ''')
-            
-            # Таблица для навигационных сообщений
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS navigation_messages (
-                    channel_id TEXT PRIMARY KEY,
-                    message_id INTEGER
-                )
-            """)
-            
-            # Таблица для кэширования информации о каналах из Telegram API
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS channel_info (
-                    channel_id TEXT PRIMARY KEY,
-                    channel_title TEXT,
-                    username TEXT,
-                    total_posts INTEGER,
-                    is_public BOOLEAN,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
-            # Индексы для оптимизации запросов
-            await cursor.execute("CREATE INDEX IF NOT EXISTS idx_parsed_messages_channel ON parsed_messages(channel_id)")
-            await cursor.execute("CREATE INDEX IF NOT EXISTS idx_parsed_messages_forwarded ON parsed_messages(forwarded_to)")
-            await cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_groups_channel ON media_groups(channel_id)")
-            await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_channels_user ON user_channels(user_id)")
-            await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_target_channels_user ON user_target_channels(user_id)")
-            await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_monitorings_user ON user_monitorings(user_id)")
-            
-            # Создаем таблицу forwarding_configs если её нет
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS forwarding_configs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    source_channel_id INTEGER NOT NULL,
-                    target_channel_id INTEGER NOT NULL,
-                    parse_mode VARCHAR DEFAULT 'all',
-                    hashtag_filter VARCHAR,
-                    delay_seconds INTEGER DEFAULT 0,
-                    footer_text VARCHAR DEFAULT '',
-                    text_mode VARCHAR DEFAULT 'hashtags_only',
-                    max_posts INTEGER,
-                    hide_sender BOOLEAN DEFAULT 1,
-                    paid_content_stars INTEGER DEFAULT 0,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            
+            await self.conn.execute("PRAGMA journal_mode=WAL")
+            async with self.conn.cursor() as cursor:
+                # Таблица для хранения информации о спарсенных сообщениях из канала
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS parsed_messages (
+                        channel_id INTEGER,
+                        message_id INTEGER,
+                        text TEXT,
+                        has_media BOOLEAN,
+                        media_group_id INTEGER,
+                        local_file_path TEXT,
+                        forwarded_to TEXT,
+                        type TEXT,
+                        published BOOLEAN DEFAULT FALSE,
+                        parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (channel_id, message_id)
+                    )
+                """)
+                
+                # Таблица для хранения информации о медиагруппах (для оптимизации парсинга)
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS media_groups (
+                        channel_id INTEGER,
+                        group_id INTEGER,
+                        message_ids TEXT, -- список ID сообщений в группе (JSON)
+                        parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (channel_id, group_id)
+                    )
+                """)
+                
+                # Таблица для хранения истории просмотренных пользователем каналов
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_channels (
+                        user_id INTEGER,
+                        channel_id TEXT,
+                        channel_title TEXT,
+                        last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (user_id, channel_id)
+                    )
+                """)
+                
+                # Таблица для хранения истории целевых каналов пользователя
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_target_channels (
+                        user_id INTEGER,
+                        channel_id TEXT,
+                        channel_title TEXT,
+                        last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (user_id, channel_id)
+                    )
+                """)
+                
+                # Таблица для хранения активных мониторингов
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_monitorings (
+                        user_id INTEGER,
+                        channel_id TEXT,
+                        target_channel TEXT,
+                        config TEXT, -- JSON с настройками
+                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        PRIMARY KEY (user_id, channel_id, target_channel)
+                    )
+                """)
+                
+                # Таблица для хранения опубликованных постов
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS published_messages (
+                        source_channel_id INTEGER,
+                        source_message_id INTEGER,
+                        target_channel_id TEXT,
+                        target_message_id INTEGER,
+                        published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (source_channel_id, source_message_id, target_channel_id)
+                    )
+                """)
+                
+                # Таблица для сохранения ID сообщений с навигацией по хэштегам
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS navigation_messages (
+                        channel_id TEXT PRIMARY KEY,
+                        message_id INTEGER,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Таблица для хранения шаблонов парсинга пользователей
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_posting_templates (
+                        user_id INTEGER,
+                        name TEXT,
+                        settings TEXT,  -- JSON с настройками
+                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (user_id, name)
+                    )
+                """)
+                
+                # Таблица для кэширования информации о каналах из Telegram API
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS channel_info (
+                        channel_id TEXT PRIMARY KEY,
+                        channel_title TEXT,
+                        username TEXT,
+                        total_posts INTEGER,
+                        is_public BOOLEAN,
+                        last_message_id INTEGER,
+                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Индексы для оптимизации запросов
+                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_parsed_messages_channel ON parsed_messages(channel_id)")
+                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_parsed_messages_forwarded ON parsed_messages(forwarded_to)")
+                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_groups_channel ON media_groups(channel_id)")
+                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_channels_user ON user_channels(user_id)")
+                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_target_channels_user ON user_target_channels(user_id)")
+                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_monitorings_user ON user_monitorings(user_id)")
+
+            # Проверяем, нужно ли добавить поле last_message_id в таблицу channel_info
+            async with self.conn.execute("PRAGMA table_info(channel_info)") as cursor:
+                columns = [row[1] async for row in cursor]
+                if "last_message_id" not in columns:
+                    logger.info("Добавляем столбец last_message_id в таблицу channel_info")
+                    await self.conn.execute("ALTER TABLE channel_info ADD COLUMN last_message_id INTEGER")
+                    await self.conn.commit()
+
+            # Предзаполняем кэш для часто используемых каналов
+            # await self._preload_cache()
             await self.conn.commit()
-            logger.debug("[init] Таблицы созданы и коммит выполнен")
+            logger.info("База данных инициализирована")
         except Exception as e:
-            logger.error(f"[init] Ошибка: {e}")
+            logger.error(f"Ошибка инициализации базы данных: {e}")
             raise
 
     async def close(self):

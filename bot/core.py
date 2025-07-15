@@ -98,8 +98,9 @@ async def start_forwarding_api(user_id: int) -> bool:
         channel_id = user_states[user_id]['forward_channel_id']
         target_channel = user_states[user_id]['forward_target_channel']
         forward_settings = user_states[user_id]['forward_settings']
-        # Останавливаем старую пересылку, если она есть
-        # await stop_forwarding_api(user_id)
+        # Дефолтная приписка-гиперссылка
+        if not forward_settings.get('footer_text'):
+            forward_settings['footer_text'] = '🌐 <a href="https://t.me/TESAMSH/4026">TSSH_Fans</a>'
         payload = {
             'user_id': user_id,
             'source_channel_id': channel_id,
@@ -229,15 +230,7 @@ async def save_forwarding_config_api(user_id: int) -> bool:
         return False
 
 # --- Вспомогательные функции для форматирования ---
-def format_channel_stats(stats: dict) -> str:
-    """Форматирование статистики канала"""
-    return f"""
-👥 Подписчиков: {stats.get('members_count', 'N/A')}
-📊 Сообщений: {stats.get('total_posts', 'N/A')}
-📝 Спаршено: {stats.get('parsed_posts', 'N/A')}
-📅 Создан: {stats.get('created_at', 'N/A')}
-📄 Описание: {stats.get('description', 'N/A')[:100]}...
-"""
+# Removing duplicate format_channel_stats, using the one from states.py instead
 
 def format_forwarding_stats(stats: dict) -> str:
     """Форматирование статистики пересылки"""
@@ -378,7 +371,10 @@ async def get_channel_info(channel_id: str) -> dict:
                     "id": channel_id,
                     "title": data.get("channel_title", f"Канал {channel_id}"),
                     "username": data.get("channel_username", ""),
-                    "members_count": data.get("members_count", "N/A")
+                    "members_count": data.get("members_count", "N/A"),
+                    "last_message_id": data.get("last_message_id", "N/A"),
+                    "parsed_posts": data.get("parsed_posts", "0"),
+                    "description": data.get("description", "")
                 }
     except Exception as e:
         logger.error(f"Error getting channel info: {e}")
@@ -388,7 +384,10 @@ async def get_channel_info(channel_id: str) -> dict:
         "id": channel_id,
         "title": f"Канал {channel_id}",
         "username": "",
-        "members_count": "N/A"
+        "members_count": "N/A",
+        "last_message_id": "N/A",
+        "parsed_posts": "0",
+        "description": ""
     }
 
 async def get_target_channel_info(target_channel: str) -> dict:
@@ -400,21 +399,30 @@ async def get_target_channel_info(target_channel: str) -> dict:
                 "id": target_channel,
                 "title": f"Канал {target_channel}",
                 "username": "",
-                "members_count": "N/A"
+                "members_count": "N/A",
+                "last_message_id": "N/A",
+                "parsed_posts": "0",
+                "description": ""
             }
         elif target_channel.startswith("@"):
             return {
                 "id": target_channel,
                 "title": target_channel,
                 "username": target_channel,
-                "members_count": "N/A"
+                "members_count": "N/A",
+                "last_message_id": "N/A",
+                "parsed_posts": "0",
+                "description": ""
             }
         else:
             return {
                 "id": target_channel,
                 "title": target_channel,
                 "username": target_channel,
-                "members_count": "N/A"
+                "members_count": "N/A",
+                "last_message_id": "N/A",
+                "parsed_posts": "0",
+                "description": ""
             }
     except Exception as e:
         logger.error(f"Error getting target channel info: {e}")
@@ -422,7 +430,10 @@ async def get_target_channel_info(target_channel: str) -> dict:
             "id": target_channel,
             "title": f"Канал {target_channel}",
             "username": "",
-            "members_count": "N/A"
+            "members_count": "N/A",
+            "last_message_id": "N/A",
+            "parsed_posts": "0",
+            "description": ""
         }
 
 async def main():

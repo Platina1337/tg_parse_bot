@@ -203,12 +203,38 @@ class ParserAPIClient:
     
     async def get_channel_stats(self, channel_id: str) -> Dict:
         """Получить статистику канала"""
-        response = await self._make_request("GET", f"/channel/stats/{channel_id}")
-        import logging
-        logging.basicConfig(level=logging.INFO)
-        logger = logging.getLogger("api_client")
-        logger.info(f"[get_channel_stats] Ответ от parser: {response!r}")
-        return response
+        try:
+            response = await self._make_request("GET", f"/channel/stats/{channel_id}")
+            logger.info(f"[get_channel_stats] Ответ от parser: {response}")
+            
+            # Если в ответе нет необходимых полей, создаем их с дефолтными значениями
+            if not isinstance(response, dict):
+                logger.error(f"[get_channel_stats] Неверный формат ответа: {response}")
+                response = {}
+                
+            # Обеспечиваем наличие всех необходимых полей
+            result = {
+                "id": channel_id,
+                "title": response.get("channel_title", f"Канал {channel_id}"),
+                "username": response.get("channel_username", ""),
+                "members_count": response.get("members_count", "N/A"),
+                "last_message_id": response.get("last_message_id", "N/A"),
+                "parsed_posts": response.get("parsed_posts", "0"),
+                "description": response.get("description", "")
+            }
+            logger.info(f"[get_channel_stats] Возвращаем: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"[get_channel_stats] Ошибка: {e}")
+            return {
+                "id": channel_id,
+                "title": f"Канал {channel_id}",
+                "username": "",
+                "members_count": "N/A",
+                "last_message_id": "N/A",
+                "parsed_posts": "0",
+                "description": ""
+            }
     
     async def get_channel_hashtags(self, channel_id: str) -> List[str]:
         """Получить хэштеги канала"""
