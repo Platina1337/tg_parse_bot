@@ -1300,15 +1300,15 @@ async def forwarding_callback_handler(client, callback_query):
         logger.info(f"[DEBUG][MONITOR] Итоговый monitor_config: {monitor_config}")
         logger.info(f"[BOT][MONITOR] Отправляю запрос на мониторинг: {monitor_config}")
         try:
-            async with httpx.AsyncClient() as client_api:
-                resp = await client_api.post(f"{config.PARSER_SERVICE_URL}/forwarding/start", json=monitor_config)
-                if resp.status_code == 200:
-                    await api_client.add_user_monitoring(user_id, str(monitor_channel_id), str(monitor_target_channel))
-                    await callback_query.answer('Мониторинг запущен!')
-                    await client.send_message(callback_query.message.chat.id, f"Мониторинг запущен!\n\nБот будет следить за каналом и публиковать новые посты в {monitor_target_channel}.", reply_markup=get_main_keyboard())
-                else:
-                    await callback_query.answer('Ошибка запуска мониторинга!', show_alert=True)
-                    await client.send_message(callback_query.message.chat.id, f"Ошибка запуска мониторинга: {resp.text}", reply_markup=get_main_keyboard())
+            # Используем новый метод API клиента для запуска мониторинга
+            response = await api_client.start_monitoring(str(monitor_channel_id), str(monitor_target_channel), monitor_config)
+            if response.get("status") == "success":
+                await api_client.add_user_monitoring(user_id, str(monitor_channel_id), str(monitor_target_channel))
+                await callback_query.answer('Мониторинг запущен!')
+                await client.send_message(callback_query.message.chat.id, f"Мониторинг запущен!\n\nБот будет следить за каналом и публиковать новые посты в {monitor_target_channel}.", reply_markup=get_main_keyboard())
+            else:
+                await callback_query.answer('Ошибка запуска мониторинга!', show_alert=True)
+                await client.send_message(callback_query.message.chat.id, f"Ошибка запуска мониторинга: {response.get('message', 'Неизвестная ошибка')}", reply_markup=get_main_keyboard())
         except Exception as e:
             await callback_query.answer('Ошибка запуска мониторинга!', show_alert=True)
             await client.send_message(callback_query.message.chat.id, f"Ошибка запуска мониторинга: {e}", reply_markup=get_main_keyboard())

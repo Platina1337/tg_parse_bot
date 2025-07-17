@@ -124,6 +124,12 @@ class TelegramForwarder:
     async def start_forwarding(self, source_channel: str, target_channel: str, config: dict, callback: Optional[Callable] = None):
         """Запуск пересылки сообщений из одного канала в другой (множественные мониторинги поддерживаются)"""
         try:
+            # ПЕРЕМЕЩЕНО: Проверка и запуск userbot в начало метода
+            if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
+                logger.info(f"[FORWARDER] Userbot не запущен, запускаем...")
+                await self.userbot.start()
+                logger.info(f"[FORWARDER] Userbot успешно запущен")
+                
             if str(source_channel).startswith("-100"):
                 channel = await self.userbot.get_chat(int(source_channel))
             else:
@@ -144,10 +150,7 @@ class TelegramForwarder:
             logger.info(f"[FORWARDER] 🔄 ЗАПУСК МОНИТОРИНГА (НЕ ПАРСИНГА!)")
             logger.info(f"[FORWARDER] Источник: {source_channel} -> Цель: {target_channel}")
             logger.info(f"[FORWARDER] Конфигурация: {config}")
-            if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
-                logger.info(f"[FORWARDER] Userbot не запущен, запускаем...")
-                await self.userbot.start()
-                logger.info(f"[FORWARDER] Userbot успешно запущен")
+            # УДАЛЕНО: старая проверка и запуск userbot, которая была здесь
             self._channel_cache = {
                 'id': channel_id,
                 'name': channel_name,
@@ -754,6 +757,15 @@ class TelegramForwarder:
     
     async def _monitoring_loop(self):
         """Цикл мониторинга"""
+        try:
+            # ДОБАВЛЕНО: Проверка и запуск userbot в начале мониторинга
+            if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
+                logger.info(f"[FORWARDER][MONITORING_LOOP] Userbot не запущен, запускаем...")
+                await self.userbot.start()
+                logger.info(f"[FORWARDER][MONITORING_LOOP] Userbot успешно запущен")
+        except Exception as e:
+            logger.error(f"[FORWARDER][MONITORING_LOOP] Ошибка при запуске userbot: {e}")
+            
         while True:
             try:
                 await asyncio.sleep(1)
@@ -1802,6 +1814,16 @@ class TelegramForwarder:
         return result
 
     def _update_source_handler(self, channel_id):
+        # ДОБАВЛЕНО: Проверка и запуск userbot асинхронно
+        async def ensure_userbot_started():
+            if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
+                logger.info(f"[FORWARDER][UPDATE_HANDLER] Userbot не запущен, запускаем...")
+                await self.userbot.start()
+                logger.info(f"[FORWARDER][UPDATE_HANDLER] Userbot успешно запущен")
+        
+        # Запускаем проверку в фоновом режиме
+        asyncio.create_task(ensure_userbot_started())
+        
         # Удалить старый handler, если есть
         if channel_id in self._handlers:
             self.userbot.remove_handler(self._handlers[channel_id])

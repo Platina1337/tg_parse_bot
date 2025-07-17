@@ -46,7 +46,21 @@ class ParserAPIClient:
             raise
         except httpx.ConnectError as e:
             logger.error(f"[API] Connection error for {url}: {e}")
-            raise
+            # Вместо вызова исключения возвращаем пустой результат с сообщением об ошибке
+            if "channel/stats" in url:
+                return {"status": "error", "message": "Сервис парсера недоступен", "title": "Канал недоступен", "username": "", "members_count": "N/A", "last_message_id": "N/A", "parsed_posts": "0", "description": ""}
+            elif "user/channels" in url:
+                return {"status": "error", "message": "Сервис парсера недоступен", "channels": []}
+            elif "user/target-channels" in url:
+                return {"status": "error", "message": "Сервис парсера недоступен", "channels": []}
+            elif "user/monitorings" in url:
+                return {"status": "error", "message": "Сервис парсера недоступен", "monitorings": []}
+            elif "user/posting-templates" in url:
+                return {"status": "error", "message": "Сервис парсера недоступен", "templates": []}
+            elif "forwarding/start" in url or "forwarding/stop" in url or "forwarding/config" in url:
+                return {"status": "error", "message": "Сервис парсера недоступен. Проверьте, запущен ли сервис парсера (uvicorn parser.main:app)."}
+            else:
+                return {"status": "error", "message": "Сервис парсера недоступен. Проверьте, запущен ли сервис парсера (uvicorn parser.main:app)."}
         except Exception as e:
             logger.error(f"[API] Request error for {url}: {e}")
             raise
@@ -295,6 +309,18 @@ class ParserAPIClient:
             response = await client.get(f"{self.base_url}/forwarding/all_tasks")
             response.raise_for_status()
             return response.json()
+            
+    async def start_monitoring(self, channel_id: str, target_channel: str, config: dict) -> dict:
+        """Запустить мониторинг канала"""
+        monitor_request = {
+            "channel_link": str(channel_id),
+            "config": {
+                "user_id": config.get("user_id"),
+                "settings": config
+            }
+        }
+        response = await self._make_request("POST", "/monitor/start", json=monitor_request)
+        return response
 
 # Глобальный экземпляр API клиента
 api_client = ParserAPIClient() 
