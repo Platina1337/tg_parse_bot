@@ -12,6 +12,7 @@ from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument,
 import re
 import traceback
 from datetime import datetime
+from parser.session_manager import SessionManager
 
 # Импорты для python-telegram-bot
 try:
@@ -28,11 +29,16 @@ logger = logging.getLogger(__name__)
 class TelegramForwarder:
     """Класс для пересылки сообщений без скачивания"""
     
-    def __init__(self, db_instance, userbot=None, bot_token=None):
+    def __init__(self, db_instance, userbot=None, bot_token=None, session_manager=None):
         logger.info(f"[FORWARDER] 🔍 Инициализация TelegramForwarder")
+        
+        self.session_manager = session_manager
         
         if userbot:
             self.userbot = userbot
+        elif self.session_manager:
+            # If session manager is provided, try to get the client for parsing task
+            self.userbot = None  # Will be initialized in start() method
         else:
             session_name = os.path.join(os.path.dirname(__file__), "sessions", "userbot")
             self.userbot = Client(
@@ -86,6 +92,20 @@ class TelegramForwarder:
     
     async def start(self):
         """Запуск форвардера (только если используется отдельный userbot)"""
+        if self.session_manager:
+            # Get client for parsing task
+            if self.userbot is None:
+                parsing_client = await self.session_manager.get_client("parsing")
+                if parsing_client:
+                    self.userbot = parsing_client
+                else:
+                    session_name = os.path.join(os.path.dirname(__file__), "sessions", "userbot")
+                    self.userbot = Client(
+                        name=session_name,
+                        api_id=os.getenv("API_ID"),
+                        api_hash=os.getenv("API_HASH")
+                    )
+        
         if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
             session_path = os.path.join(os.path.dirname(__file__), "sessions", "userbot")
             api_id = os.getenv("API_ID")
@@ -1928,4 +1948,29 @@ class TelegramForwarder:
                     except Exception as e:
                         logger.error(f"[FORWARDER][HANDLER] Ошибка при пересылке в {tgt_id}: {e}")
         self._handlers[channel_id] = handle_new_message
+
+    async def add_reaction(self, chat_id, message_id, reaction, session_names=None):
+        """Add reaction to a message using multiple accounts"""
+        if self.session_manager:
+            return await self.session_manager.add_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=reaction,
+                session_names=session_names
+            )
+        else:
+            # If no session manager, use the default userbot
+            try:
+                if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
+                    await self.userbot.start()
+                
+                await self.userbot.send_reaction(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    emoji=reaction
+                )
+                return {"default": "success"}
+            except Exception as e:
+                logger.error(f"[FORWARDER] Error adding reaction: {e}")
+                return {"default": f"error: {str(e)}"}
 

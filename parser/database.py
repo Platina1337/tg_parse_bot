@@ -4,7 +4,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Tuple, Set, Any
-from shared.models import Message, ParseConfig, ParseMode
+from shared.models import Message, ParseConfig, ParseMode, SessionMeta
 from functools import lru_cache
 import asyncio
 from collections import defaultdict
@@ -135,6 +135,23 @@ class Database:
                         last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
+                
+                # Таблица для хранения метаданных о сессиях Telegram-аккаунтов
+                await cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        alias TEXT UNIQUE NOT NULL,
+                        api_id INTEGER NOT NULL,
+                        api_hash TEXT NOT NULL,
+                        phone TEXT NOT NULL,
+                        session_path TEXT NOT NULL,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_used_at TIMESTAMP,
+                        assigned_task TEXT,
+                        notes TEXT
+                    )
+                ''')
                 
                 # Индексы для оптимизации запросов
                 await cursor.execute("CREATE INDEX IF NOT EXISTS idx_parsed_messages_channel ON parsed_messages(channel_id)")
@@ -879,3 +896,83 @@ class Database:
                 logger.error(f"[get_channel_stats] Ошибка: {e}")
                 raise
             return stats
+
+    # --- Методы для работы сессиями Telegram-аккаунтов ---
+    async def create_session(self, session: SessionMeta) -> int:
+        async with self.conn.execute(
+            """
+            INSERT INTO sessions (alias, api_id, api_hash, phone, session_path, is_active, created_at, last_used_at, assigned_task, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session.alias,
+                session.api_id,
+                session.api_hash,
+                session.phone,
+                session.session_path,
+                session.is_active,
+                session.created_at,
+                session.last_used_at,
+                session.assigned_task,
+                session.notes
+            )
+        ) as cursor:
+            await self.conn.commit()
+            return cursor.lastrowid
+
+    async def get_session_by_id(self, session_id: int) -> SessionMeta:
+        async with self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return SessionMeta(**dict(zip([column[0] for column in cursor.description], row)))
+            return None
+
+    async def get_session_by_alias(self, alias: str) -> SessionMeta:
+        async with self.conn.execute("SELECT * FROM sessions WHERE alias = ?", (alias,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return SessionMeta(**dict(zip([column[0] for column in cursor.description], row)))
+            return None
+
+    async def get_all_sessions(self) -> list:
+        async with self.conn.execute("SELECT * FROM sessions") as cursor:
+            rows = await cursor.fetchall()
+            columns = [column[0] for column in cursor.description]
+            return [SessionMeta(**dict(zip(columns, row))) for row in rows]
+
+    async def update_session(self, session_id: int, **kwargs) -> None:
+        fields = ', '.join([f"{k} = ?" for k in kwargs.keys()])
+        values = list(kwargs.values())
+        values.append(session_id)
+        await self.conn.execute(f"UPDATE sessions SET {fields} WHERE id = ?", values)
+        await self.conn.commit()
+
+    async def delete_session(self, session_id: int) -> None:
+        await self.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        await self.conn.commit()
+
+    async def import_existing_sessions(self, sessions_dir: str = "sessions/") -> int:
+        """Импортирует все .session файлы, которых нет в БД, с минимальными данными."""
+        imported = 0
+        if not os.path.exists(sessions_dir):
+            return 0
+        files = [f for f in os.listdir(sessions_dir) if f.endswith('.session')]
+        for file in files:
+            session_path = os.path.join(sessions_dir, file)
+            alias = os.path.splitext(file)[0]
+            # Проверяем, есть ли уже такая сессия в БД
+            existing = await self.get_session_by_alias(alias)
+            if not existing:
+                # Минимальные данные, остальное пользователь может заполнить позже
+                session = SessionMeta(
+                    id=0,
+                    alias=alias,
+                    api_id=0,
+                    api_hash='',
+                    phone='',
+                    session_path=session_path,
+                    is_active=True
+                )
+                await self.create_session(session)
+                imported += 1
+        return imported

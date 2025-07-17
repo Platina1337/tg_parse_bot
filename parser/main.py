@@ -23,6 +23,9 @@ from parser.forwarder import TelegramForwarder
 import aiosqlite
 from parser.navigation_api import router as navigation_router
 from fastapi.middleware.cors import CORSMiddleware
+from parser.session_manager import SessionManager
+from parser.reaction_manager import ReactionManager
+from pydantic import BaseModel, Field
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -96,9 +99,15 @@ db = Database()
 # Инициализация форвардера (будет запущен при необходимости)
 forwarder = None
 
+# Initialize session manager and reaction manager
+session_manager = None
+reaction_manager = None
+
 @app.on_event("startup")
 async def startup_event():
     """Действия при запуске сервиса"""
+    global forwarder, session_manager, reaction_manager
+    
     await db.init()
     # Сбросить все мониторинги в неактивные (на случай падения/рестарта)
     async with aiosqlite.connect('parser.db') as conn:
@@ -106,24 +115,34 @@ async def startup_event():
         await conn.execute("UPDATE parse_configs SET is_active = FALSE")
         await conn.commit()
     logger.info("Parser service started")
-    # Восстанавливаем активные мониторинги (если нужно)
-    # active_monitors = await db.get_active_configs()
-    # for monitor in active_monitors:
-    #     await parser.start_monitoring(monitor.channel_id, monitor)
+    
+    # Initialize session manager (DB-backed)
+    session_manager = SessionManager(db=db, session_dir="sessions")
+    await session_manager.import_sessions_from_files()
+    await session_manager.load_clients()
+    
+    # Initialize reaction manager
+    reaction_manager = ReactionManager(session_manager=session_manager)
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Действия при остановке сервиса"""
+    global forwarder, session_manager
 
     if forwarder:
         await forwarder.stop()  # Останавливаем форвардер только если он был запущен
+    
+    # Stop all sessions
+    if session_manager:
+        await session_manager.stop_all()
+    
     await db.close()
 
 def get_or_create_forwarder():
     """Получить существующий forwarder или создать новый"""
-    global forwarder
+    global forwarder, session_manager
     if forwarder is None:
-        forwarder = TelegramForwarder(db_instance=db)
+        forwarder = TelegramForwarder(db_instance=db, session_manager=session_manager)
     return forwarder
 
 @app.post("/monitor/start")
@@ -1147,6 +1166,235 @@ async def get_all_parse_forward_tasks():
             status_code=500,
             content={"error": str(e)}
         )
+
+# --- Session Management API Endpoints ---
+
+class SessionRequest(BaseModel):
+    session_name: str
+    api_id: Optional[str] = None
+    api_hash: Optional[str] = None
+    phone: Optional[str] = None
+
+class CodeRequest(BaseModel):
+    session_name: str
+    phone: str
+
+class SignInRequest(BaseModel):
+    session_name: str
+    phone: str
+    code: str
+    phone_code_hash: str
+
+class PasswordRequest(BaseModel):
+    session_name: str
+    password: str
+
+class AssignSessionRequest(BaseModel):
+    task: str
+    session_name: str
+
+class RemoveAssignmentRequest(BaseModel):
+    task: str
+    session_name: Optional[str] = None
+
+@app.post("/sessions/add")
+async def add_session(request: SessionRequest):
+    """Add a new session"""
+    global session_manager
+    if not session_manager:
+        raise HTTPException(status_code=500, detail="Session manager not initialized")
+    api_id = request.api_id or os.getenv("API_ID")
+    api_hash = request.api_hash or os.getenv("API_HASH")
+    if not api_id or not api_hash:
+        raise HTTPException(status_code=400, detail="API credentials are required")
+    result = await session_manager.add_account(
+        alias=request.session_name,
+        api_id=int(api_id),
+        api_hash=api_hash,
+        phone=request.phone or ""
+    )
+    if not result.get("success", False):
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    return result
+
+@app.post("/sessions/send_code")
+async def send_code(request: CodeRequest):
+    """Send authentication code"""
+    global session_manager
+    if not session_manager:
+        raise HTTPException(status_code=500, detail="Session manager not initialized")
+    result = await session_manager.send_code(
+        alias=request.session_name,
+        phone=request.phone
+    )
+    if not result.get("success", False):
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    return result
+
+@app.post("/sessions/sign_in")
+async def sign_in(request: SignInRequest):
+    """Sign in with code"""
+    global session_manager
+    if not session_manager:
+        raise HTTPException(status_code=500, detail="Session manager not initialized")
+    result = await session_manager.sign_in(
+        alias=request.session_name,
+        phone=request.phone,
+        code=request.code,
+        phone_code_hash=request.phone_code_hash
+    )
+    if not result.get("success", False):
+        if result.get("needs_password", False):
+            return JSONResponse(status_code=202, content={"needs_password": True})
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    return result
+
+@app.post("/sessions/sign_in_with_password")
+async def sign_in_with_password(request: PasswordRequest):
+    """Sign in with 2FA password"""
+    global session_manager
+    if not session_manager:
+        raise HTTPException(status_code=500, detail="Session manager not initialized")
+    result = await session_manager.sign_in_with_password(
+        alias=request.session_name,
+        password=request.password
+    )
+    if not result.get("success", False):
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    return result
+
+@app.get("/sessions/list")
+async def list_sessions():
+    """Get list of all sessions"""
+    global session_manager
+    if not session_manager:
+        raise HTTPException(status_code=500, detail="Session manager not initialized")
+    sessions = await session_manager.get_all_sessions()
+    # assignments = await session_manager.get_assignments() # TODO: реализовать если нужно
+    return {
+        "success": True,
+        "sessions": [s.dict() for s in sessions],
+        # "assignments": assignments
+    }
+
+@app.post("/sessions/assign")
+async def assign_session(request: AssignSessionRequest):
+    """Assign a session to a task"""
+    global session_manager
+    if not session_manager:
+        raise HTTPException(status_code=500, detail="Session manager not initialized")
+    result = await session_manager.assign_task(
+        alias=request.session_name,
+        task=request.task
+    )
+    if not result.get("success", False):
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    return result
+
+@app.post("/sessions/remove_assignment")
+async def remove_assignment(request: RemoveAssignmentRequest):
+    """Remove a session assignment"""
+    global session_manager
+    if not session_manager:
+        raise HTTPException(status_code=500, detail="Session manager not initialized")
+    result = await session_manager.assign_task(
+        alias=request.session_name,
+        task="default"
+    )
+    if not result.get("success", False):
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    return result
+
+@app.get("/sessions/status/{session_name}")
+async def get_session_status(session_name: str):
+    """Check session status"""
+    global session_manager
+    if not session_manager:
+        raise HTTPException(status_code=500, detail="Session manager not initialized")
+    result = await session_manager.check_session_status(session_name)
+    if not result.get("success", False):
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    return result
+
+@app.delete("/sessions/{session_name}")
+async def delete_session(session_name: str):
+    """Delete a session"""
+    global session_manager
+    if not session_manager:
+        raise HTTPException(status_code=500, detail="Session manager not initialized")
+    result = await session_manager.delete_session(session_name)
+    if not result.get("success", False):
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    return result
+
+# --- Reaction API Endpoints ---
+
+class ReactionRequest(BaseModel):
+    chat_id: str
+    message_id: int
+    reaction: str
+    session_names: Optional[List[str]] = None
+
+class MultipleReactionsRequest(BaseModel):
+    chat_id: str
+    message_ids: List[int]
+    reaction: str
+    session_names: Optional[List[str]] = None
+
+@app.post("/reactions/add")
+async def add_reaction(request: ReactionRequest):
+    """Add reaction to a message"""
+    global reaction_manager
+    
+    if not reaction_manager:
+        raise HTTPException(status_code=500, detail="Reaction manager not initialized")
+    
+    result = await reaction_manager.add_reaction(
+        chat_id=request.chat_id,
+        message_id=request.message_id,
+        reaction=request.reaction,
+        session_names=request.session_names
+    )
+    
+    if not result.get("success", False):
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    
+    return result
+
+@app.post("/reactions/add_multiple")
+async def add_multiple_reactions(request: MultipleReactionsRequest):
+    """Add reactions to multiple messages"""
+    global reaction_manager
+    
+    if not reaction_manager:
+        raise HTTPException(status_code=500, detail="Reaction manager not initialized")
+    
+    result = await reaction_manager.add_reaction_to_multiple_messages(
+        chat_id=request.chat_id,
+        message_ids=request.message_ids,
+        reaction=request.reaction,
+        session_names=request.session_names
+    )
+    
+    if not result.get("success", False):
+        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
+    
+    return result
+
+@app.get("/reactions/available")
+async def get_available_reactions():
+    """Get list of available reactions"""
+    global reaction_manager
+    
+    if not reaction_manager:
+        raise HTTPException(status_code=500, detail="Reaction manager not initialized")
+    
+    reactions = await reaction_manager.get_available_reactions()
+    
+    return {
+        "success": True,
+        "reactions": reactions
+    }
 
 if __name__ == "__main__":
     import uvicorn

@@ -250,3 +250,16 @@ class ForwardingConfigRequest(BaseModel):
     range_mode: str = "all"  # "all" (все сообщения) или "range" (по диапазону)
     range_start_id: Optional[int] = None  # ID сообщения для начала диапазона
     range_end_id: Optional[int] = None  # ID сообщения для конца диапазона 
+
+class SessionMeta(BaseModel):
+    id: int  # Primary key in DB
+    alias: str  # Удобное имя/псевдоним
+    api_id: int
+    api_hash: str
+    phone: str
+    session_path: str  # Путь к .session файлу
+    is_active: bool = True
+    created_at: datetime = datetime.now()
+    last_used_at: Optional[datetime] = None
+    assigned_task: Optional[str] = None  # Например: 'parser', 'reactions', 'monitoring', etc.
+    notes: Optional[str] = None 

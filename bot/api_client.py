@@ -322,5 +322,97 @@ class ParserAPIClient:
         response = await self._make_request("POST", "/monitor/start", json=monitor_request)
         return response
 
+    # --- Methods for working with sessions ---
+    
+    async def add_session(self, session_name: str, api_id: str = None, api_hash: str = None, phone: str = None) -> dict:
+        """Add a new session"""
+        data = {
+            "session_name": session_name,
+            "api_id": api_id,
+            "api_hash": api_hash,
+            "phone": phone
+        }
+        return await self._make_request("POST", "/sessions/add", json=data)
+    
+    async def send_code(self, session_name: str, phone: str) -> dict:
+        """Send authentication code"""
+        data = {
+            "session_name": session_name,
+            "phone": phone
+        }
+        return await self._make_request("POST", "/sessions/send_code", json=data)
+    
+    async def sign_in(self, session_name: str, phone: str, code: str, phone_code_hash: str) -> dict:
+        """Sign in with code"""
+        data = {
+            "session_name": session_name,
+            "phone": phone,
+            "code": code,
+            "phone_code_hash": phone_code_hash
+        }
+        return await self._make_request("POST", "/sessions/sign_in", json=data)
+    
+    async def sign_in_with_password(self, session_name: str, password: str) -> dict:
+        """Sign in with 2FA password"""
+        data = {
+            "session_name": session_name,
+            "password": password
+        }
+        return await self._make_request("POST", "/sessions/sign_in_with_password", json=data)
+    
+    async def list_sessions(self) -> dict:
+        """Get list of all sessions"""
+        return await self._make_request("GET", "/sessions/list")
+    
+    async def assign_session(self, task: str, session_name: str) -> dict:
+        """Assign a session to a task"""
+        data = {
+            "task": task,
+            "session_name": session_name
+        }
+        return await self._make_request("POST", "/sessions/assign", json=data)
+    
+    async def remove_assignment(self, task: str, session_name: str = None) -> dict:
+        """Remove a session assignment"""
+        data = {
+            "task": task,
+            "session_name": session_name
+        }
+        return await self._make_request("POST", "/sessions/remove_assignment", json=data)
+    
+    async def get_session_status(self, session_name: str) -> dict:
+        """Check session status"""
+        return await self._make_request("GET", f"/sessions/status/{session_name}")
+    
+    async def delete_session(self, session_name: str) -> dict:
+        """Delete a session"""
+        return await self._make_request("DELETE", f"/sessions/{session_name}")
+    
+    # --- Methods for working with reactions ---
+    
+    async def add_reaction(self, chat_id: str, message_id: int, reaction: str, session_names: list = None) -> dict:
+        """Add reaction to a message"""
+        data = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": reaction,
+            "session_names": session_names
+        }
+        return await self._make_request("POST", "/reactions/add", json=data)
+    
+    async def add_multiple_reactions(self, chat_id: str, message_ids: list, reaction: str, session_names: list = None) -> dict:
+        """Add reactions to multiple messages"""
+        data = {
+            "chat_id": chat_id,
+            "message_ids": message_ids,
+            "reaction": reaction,
+            "session_names": session_names
+        }
+        return await self._make_request("POST", "/reactions/add_multiple", json=data)
+    
+    async def get_available_reactions(self) -> dict:
+        """Get list of available reactions"""
+        return await self._make_request("GET", "/reactions/available")
+
 # Глобальный экземпляр API клиента
 api_client = ParserAPIClient() 

@@ -20,6 +20,8 @@ from bot.states import user_states
 from bot.handlers import start_command, text_handler, forwarding_callback_handler, monitorings_command, check_tasks_status_callback, process_callback_query
 from bot.navigation_manager import navigation_menu_handler, navigation_text_handler
 import bot.handlers  # Для регистрации всех callback-обработчиков
+from bot.session_handlers import sessions_command, handle_session_text_input
+from bot.reaction_handlers import reactions_command, handle_reaction_text_input
 
 # Настройка логирования
 logging.basicConfig(
@@ -51,6 +53,16 @@ async def navigation_command_handler(client, message):
     """Обработчик команды /navigation для управления навигацией по хэштегам"""
     await navigation_menu_handler(client, message)
 
+@app.on_message(filters.command("sessions"))
+async def sessions_command_handler(client, message):
+    """Handler for /sessions command for managing multiple Telegram sessions"""
+    await sessions_command(client, message)
+
+@app.on_message(filters.command("reactions"))
+async def reactions_command_handler(client, message):
+    """Handler for /reactions command for adding reactions with multiple accounts"""
+    await reactions_command(client, message)
+
 @app.on_message(filters.text & filters.private)
 async def text_message_handler(client, message):
     """Обработчик текстовых сообщений"""
@@ -58,6 +70,18 @@ async def text_message_handler(client, message):
     state = user_states.get(user_id, {}).get("state")
     if state and state.startswith("navigation_"):
         await navigation_text_handler(client, message)
+    elif state and state.startswith("session_"):
+        # Handle session management text input
+        handled = await handle_session_text_input(client, message)
+        if handled:
+            return
+        await text_handler(client, message)
+    elif state and state.startswith("reaction_"):
+        # Handle reaction management text input
+        handled = await handle_reaction_text_input(client, message)
+        if handled:
+            return
+        await text_handler(client, message)
     else:
         await text_handler(client, message)
 
