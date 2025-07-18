@@ -326,10 +326,12 @@ class ParserAPIClient:
     
     async def add_session(self, session_name: str, api_id: str = None, api_hash: str = None, phone: str = None) -> dict:
         """Add a new session"""
+        # Используем значения из переменных окружения, если не переданы
+        import os
         data = {
             "session_name": session_name,
-            "api_id": api_id,
-            "api_hash": api_hash,
+            "api_id": api_id or os.getenv("API_ID"),
+            "api_hash": api_hash or os.getenv("API_HASH"),
             "phone": phone
         }
         return await self._make_request("POST", "/sessions/add", json=data)
@@ -387,6 +389,28 @@ class ParserAPIClient:
     async def delete_session(self, session_name: str) -> dict:
         """Delete a session"""
         return await self._make_request("DELETE", f"/sessions/{session_name}")
+    
+    async def confirm_code(self, session_name, phone, code, phone_code_hash):
+        # Логируем данные перед отправкой
+        logger.info(f"[API_CONFIRM_CODE] Preparing data: session_name='{session_name}', phone='{phone}', code='{code}', phone_code_hash='{phone_code_hash}'")
+        logger.info(f"[API_CONFIRM_CODE] Code type: {type(code)}, length: {len(code) if code else 0}")
+        
+        data = {
+            "session_name": session_name,
+            "phone": phone,
+            "code": code,
+            "phone_code_hash": phone_code_hash
+        }
+        
+        logger.info(f"[API_CONFIRM_CODE] Sending data: {data}")
+        return await self._make_request("POST", "/sessions/confirm_code", json=data)
+    
+    async def init_session(self, session_name: str):
+        try:
+            return await self._make_request("POST", "/sessions/init", json={"session_name": session_name})
+        except Exception as e:
+            logging.error(f"[API] Error in init_session: {e}")
+            return {"success": False, "error": str(e)}
     
     # --- Methods for working with reactions ---
     

@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from parser.session_manager import SessionManager
 from parser.reaction_manager import ReactionManager
 from pydantic import BaseModel, Field
+from pyrogram import Client
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -123,6 +124,18 @@ async def startup_event():
     
     # Initialize reaction manager
     reaction_manager = ReactionManager(session_manager=session_manager)
+
+    # --- Новое: инициализация userbot при старте ---
+    forwarder = get_or_create_forwarder()
+    try:
+        userbot = await forwarder.get_userbot()
+        logger.info(f"[STARTUP] Проверка userbot: {userbot}")
+        if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
+            logger.info(f"[STARTUP] Userbot не запущен, запускаем...")
+            await userbot.start()
+            logger.info(f"[STARTUP] Userbot успешно запущен")
+    except Exception as e:
+        logger.error(f"[STARTUP] Ошибка при инициализации userbot: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -326,19 +339,20 @@ async def get_channel_stats(channel_id: str):
         
         # Если данных нет или они устарели, делаем запрос к Telegram API
         logger.info(f"[API] Делаем запрос к Telegram API для канала {channel_id_typed}")
-        
-        # Получаем forwarder
+        logger.info(f"[API][DEBUG] Перед get_or_create_forwarder")
         forwarder = get_or_create_forwarder()
-        
+        logger.info(f"[API][DEBUG] Получен forwarder: {forwarder}")
+        # Получаем userbot асинхронно
+        userbot = await forwarder.get_userbot()
+        logger.info(f"[API][DEBUG] userbot: {userbot}")
         # Запускаем userbot если не запущен
-        if not hasattr(forwarder.userbot, 'is_connected') or not forwarder.userbot.is_connected:
-            logger.info(f"[API] Userbot не запущен, запускаем...")
-            await forwarder.userbot.start()
-            logger.info(f"[API] Userbot успешно запущен")
-        
+        if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
+            logger.info(f"[API][DEBUG] Userbot не запущен, запускаем... userbot: {userbot}")
+            await userbot.start()
+            logger.info(f"[API][DEBUG] Userbot успешно запущен")
         # Получаем информацию о канале
         try:
-            chat = await forwarder.userbot.get_chat(channel_id_typed)
+            chat = await userbot.get_chat(channel_id_typed)
             if not chat:
                 logger.warning(f"[API] Канал {channel_id_typed} не найден")
                 return {
@@ -1197,25 +1211,48 @@ class RemoveAssignmentRequest(BaseModel):
     task: str
     session_name: Optional[str] = None
 
+class ConfirmCodeRequest(BaseModel):
+    session_name: str
+    phone: str
+    code: str
+    phone_code_hash: str
+
 @app.post("/sessions/add")
 async def add_session(request: SessionRequest):
     """Add a new session"""
     global session_manager
+    import logging
+    logger = logging.getLogger("sessions.add")
+    logger.info(f"[API] /sessions/add: session_name='{request.session_name}' api_id={request.api_id} api_hash={request.api_hash} phone='{request.phone}'")
     if not session_manager:
+        logger.error("Session manager not initialized")
         raise HTTPException(status_code=500, detail="Session manager not initialized")
     api_id = request.api_id or os.getenv("API_ID")
     api_hash = request.api_hash or os.getenv("API_HASH")
+    logger.info(f"[API] /sessions/add: Using api_id={api_id} api_hash={api_hash[:10] if api_hash else None}...")
     if not api_id or not api_hash:
+        logger.error("API credentials are required")
         raise HTTPException(status_code=400, detail="API credentials are required")
-    result = await session_manager.add_account(
-        alias=request.session_name,
-        api_id=int(api_id),
-        api_hash=api_hash,
-        phone=request.phone or ""
-    )
-    if not result.get("success", False):
-        raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
-    return result
+    # Проверка на уникальность alias
+    existing = await session_manager.db.get_session_by_alias(request.session_name)
+    if existing:
+        logger.warning(f"Session with alias '{request.session_name}' already exists")
+        return JSONResponse(status_code=400, content={"success": False, "error": "Session with this name already exists"})
+    try:
+        result = await session_manager.add_account(
+            alias=request.session_name,
+            api_id=int(api_id),
+            api_hash=api_hash,
+            phone=request.phone or ""
+        )
+        logger.info(f"Session add result: {result}")
+        if not result.get("success", False):
+            logger.error(f"Session add error: {result.get('error', 'Unknown error')}")
+            return JSONResponse(status_code=500, content={"success": False, "error": result.get("error", "Unknown error")})
+        return result
+    except Exception as e:
+        logger.error(f"Exception in /sessions/add: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
 @app.post("/sessions/send_code")
 async def send_code(request: CodeRequest):
@@ -1263,6 +1300,26 @@ async def sign_in_with_password(request: PasswordRequest):
         raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
     return result
 
+@app.post("/sessions/confirm_code")
+async def confirm_code(request: ConfirmCodeRequest):
+    global session_manager
+    if not session_manager:
+        raise HTTPException(status_code=500, detail="Session manager not initialized")
+    
+    # Логируем входящие данные
+    logger.info(f"[API_ENDPOINT] confirm_code received: session_name='{request.session_name}', phone='{request.phone}', code='{request.code}', phone_code_hash='{request.phone_code_hash}'")
+    logger.info(f"[API_ENDPOINT] Code type: {type(request.code)}, length: {len(request.code) if request.code else 0}")
+    
+    result = await session_manager.confirm_code(
+        alias=request.session_name,
+        phone=request.phone,
+        code=request.code,
+        phone_code_hash=request.phone_code_hash
+    )
+    if not result.get("success", False):
+        raise HTTPException(status_code=400, detail=result.get("error", "Unknown error"))
+    return result
+
 @app.get("/sessions/list")
 async def list_sessions():
     """Get list of all sessions"""
@@ -1270,11 +1327,11 @@ async def list_sessions():
     if not session_manager:
         raise HTTPException(status_code=500, detail="Session manager not initialized")
     sessions = await session_manager.get_all_sessions()
-    # assignments = await session_manager.get_assignments() # TODO: реализовать если нужно
+    assignments = await session_manager.get_assignments()
     return {
         "success": True,
         "sessions": [s.dict() for s in sessions],
-        # "assignments": assignments
+        "assignments": assignments
     }
 
 @app.post("/sessions/assign")
@@ -1297,9 +1354,9 @@ async def remove_assignment(request: RemoveAssignmentRequest):
     global session_manager
     if not session_manager:
         raise HTTPException(status_code=500, detail="Session manager not initialized")
-    result = await session_manager.assign_task(
+    result = await session_manager.remove_assignment(
         alias=request.session_name,
-        task="default"
+        task=request.task
     )
     if not result.get("success", False):
         raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
@@ -1326,6 +1383,22 @@ async def delete_session(session_name: str):
     if not result.get("success", False):
         raise HTTPException(status_code=500, detail=result.get("error", "Unknown error"))
     return result
+
+@app.post("/sessions/init")
+async def init_session(request: dict, background_tasks: BackgroundTasks):
+    """Инициализация новой сессии с заданным именем: интерактивный ввод api_id, api_hash, телефона и кода в терминале."""
+    session_name = request.get("session_name")
+    if not session_name:
+        raise HTTPException(status_code=400, detail="session_name обязателен")
+    def run_pyrogram_interactive():
+        print(f"[SESSIONS/INIT] Запуск интерактивной авторизации для сессии: {session_name}")
+        app = Client(session_name)
+        app.start()
+        print(f"[SESSIONS/INIT] Сессия {session_name} успешно создана!")
+        app.stop()
+    background_tasks.add_task(run_pyrogram_interactive)
+    logger.info(f"[API] /sessions/init: инициирована интерактивная авторизация для {session_name}")
+    return {"success": True, "message": f"Интерактивная авторизация для {session_name} запущена в терминале парсера."}
 
 # --- Reaction API Endpoints ---
 

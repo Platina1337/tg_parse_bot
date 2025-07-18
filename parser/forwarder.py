@@ -13,6 +13,7 @@ import re
 import traceback
 from datetime import datetime
 from parser.session_manager import SessionManager
+from parser.config import config
 
 # Импорты для python-telegram-bot
 try:
@@ -31,21 +32,23 @@ class TelegramForwarder:
     
     def __init__(self, db_instance, userbot=None, bot_token=None, session_manager=None):
         logger.info(f"[FORWARDER] 🔍 Инициализация TelegramForwarder")
-        
         self.session_manager = session_manager
-        
+        self._userbot = userbot
         if userbot:
-            self.userbot = userbot
+            logger.info(f"[FORWARDER] userbot передан явно: {self._userbot}")
         elif self.session_manager:
-            # If session manager is provided, try to get the client for parsing task
-            self.userbot = None  # Will be initialized in start() method
+            self._userbot = None  # Will be initialized lazily
+            logger.info(f"[FORWARDER] session_manager передан, userbot будет инициализирован позже")
         else:
-            session_name = os.path.join(os.path.dirname(__file__), "sessions", "userbot")
-            self.userbot = Client(
+            session_name = os.path.join(config.SESSIONS_DIR, "userbot")
+            logger.info(f"[FORWARDER] userbot будет создан: {session_name}")
+            self._userbot = Client(
                 name=session_name,
                 api_id=os.getenv("API_ID"),
                 api_hash=os.getenv("API_HASH")
             )
+        if self._userbot is None:
+            logger.error(f"[FORWARDER] ВНИМАНИЕ: self._userbot остался None после конструктора!")
         self.db = db_instance
         self._forwarding_tasks: Dict[int, asyncio.Task] = {}
         self._monitoring_tasks: Dict[Tuple[int, str], asyncio.Task] = {}  # (channel_id, target_channel_id) -> task
@@ -90,32 +93,30 @@ class TelegramForwarder:
         self._monitoring_targets: Dict[Tuple[int, str], str] = {}  # (channel_id, target_channel_id) -> target_channel
         self._handlers = {}  # (source_channel, target_channel) -> handler
     
+    async def get_userbot(self, task: str = "parsing"):
+        if self._userbot is None:
+            logger.info(f"[FORWARDER][get_userbot] _userbot is None, инициализирую...")
+            if self.session_manager:
+                # Получаем первую сессию, назначенную на нужный task
+                sessions = await self.session_manager.get_sessions_for_task(task)
+                if sessions:
+                    client = await self.session_manager.get_client(sessions[0].alias)
+                    if client:
+                        self._userbot = client
+                        logger.info(f"[FORWARDER][get_userbot] Использую сессию {sessions[0].alias} для задачи {task}")
+        return self._userbot
+
     async def start(self):
-        """Запуск форвардера (только если используется отдельный userbot)"""
-        if self.session_manager:
-            # Get client for parsing task
-            if self.userbot is None:
-                parsing_client = await self.session_manager.get_client("parsing")
-                if parsing_client:
-                    self.userbot = parsing_client
-                else:
-                    session_name = os.path.join(os.path.dirname(__file__), "sessions", "userbot")
-                    self.userbot = Client(
-                        name=session_name,
-                        api_id=os.getenv("API_ID"),
-                        api_hash=os.getenv("API_HASH")
-                    )
-        
-        if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
-            session_path = os.path.join(os.path.dirname(__file__), "sessions", "userbot")
-            api_id = os.getenv("API_ID")
-            api_hash = os.getenv("API_HASH")
-            logger.info(f"[FORWARDER] Session file: {session_path}")
-            logger.info(f"[FORWARDER] API_ID: {api_id}")
-            logger.info(f"[FORWARDER] API_HASH: {api_hash[:4]}***{api_hash[-4:] if api_hash else ''}")
-            await self.userbot.start()
+        logger.info(f"[FORWARDER] Вход в start(). self._userbot: {self._userbot}")
+        self._userbot = await self.get_userbot(task="forwarding")
+        if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
+            session_file = os.path.join(config.SESSIONS_DIR, "userbot.session")
+            logger.info(f"[FORWARDER] Проверка наличия session-файла: {session_file}")
+            if not os.path.exists(session_file):
+                logger.info(f"[FORWARDER] Session-файл не найден, будет создан новый при авторизации.")
+            await self._userbot.start()
             try:
-                me = await self.userbot.get_me()
+                me = await self._userbot.get_me()
                 logger.info(f"[FORWARDER] Logged in as: {me.first_name} {me.last_name or ''} (@{me.username or 'no_username'})")
             except Exception as e:
                 logger.error(f"[FORWARDER] Error getting user info: {e}")
@@ -128,8 +129,8 @@ class TelegramForwarder:
         
         try:
             # Проверяем, что клиент еще не остановлен
-            if hasattr(self.userbot, 'is_connected') and self.userbot.is_connected:
-                await self.userbot.stop()
+            if hasattr(self._userbot, 'is_connected') and self._userbot.is_connected:
+                await self._userbot.stop()
         except asyncio.CancelledError:
             logger.info("Forwarder stop cancelled (asyncio.CancelledError)")
         except ConnectionError as e:
@@ -144,16 +145,18 @@ class TelegramForwarder:
     async def start_forwarding(self, source_channel: str, target_channel: str, config: dict, callback: Optional[Callable] = None):
         """Запуск пересылки сообщений из одного канала в другой (множественные мониторинги поддерживаются)"""
         try:
-            # ПЕРЕМЕЩЕНО: Проверка и запуск userbot в начало метода
-            if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
+            self._userbot = await self.get_userbot(task="monitoring")
+            # Логируем путь к сессионному файлу
+            if hasattr(self._userbot, 'name'):
+                logger.info(f"[FORWARDER][MONITORING] Используется сессионный файл: {self._userbot.name}")
+            if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
                 logger.info(f"[FORWARDER] Userbot не запущен, запускаем...")
-                await self.userbot.start()
+                await self._userbot.start()
                 logger.info(f"[FORWARDER] Userbot успешно запущен")
-                
             if str(source_channel).startswith("-100"):
-                channel = await self.userbot.get_chat(int(source_channel))
+                channel = await self._userbot.get_chat(int(source_channel))
             else:
-                channel = await self.userbot.get_chat(source_channel)
+                channel = await self._userbot.get_chat(source_channel)
             channel_id = channel.id
             key = (channel_id, str(target_channel))
             # --- Остановить все мониторинги, у которых target_channel не совпадает с новым ---
@@ -250,7 +253,7 @@ class TelegramForwarder:
             media_group_hashtag_paid_counter = 0
             
             # Слушаем только исходный канал, НЕ целевой
-            @self.userbot.on_message(filters.chat(channel_id))
+            @self._userbot.on_message(filters.chat(channel_id))
             async def handle_new_message(client, message):
                 logger.info(f"[FORWARDER][HANDLER] Вызван handler для channel_id={channel_id}, message_id={getattr(message, 'id', None)}")
                 nonlocal forwarded_count, select_paid_counter, hashtag_paid_counter
@@ -609,7 +612,7 @@ class TelegramForwarder:
                             ext = '.jpg' if media_type == 'photo' else '.mp4'
                             with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                                 temp_file_path = tmp.name
-                            temp_file_path = await self.userbot.download_media(message, file_name=temp_file_path)
+                            temp_file_path = await self._userbot.download_media(message, file_name=temp_file_path)
                         result = await self._send_paid_media(target_channel, media_type, file_id, processed_text, paid_content_stars, is_bot_admin, temp_file_path)
                         if result:
                             logger.info(f"[FORWARDER] ✅ Переслано платное {media_type} сообщение {message.id} с {paid_content_stars} звездами")
@@ -643,28 +646,28 @@ class TelegramForwarder:
                 logger.info(f"[FORWARDER][DEBUG] Итоговый parse_mode для медиа: {parse_mode}")
                 if media_type == 'photo':
                     logger.info(f"[FORWARDER][DEBUG] send_photo params: photo={message.photo.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                    await self.userbot.send_photo(photo=message.photo.file_id, caption=processed_text, chat_id=target_channel)
+                    await self._userbot.send_photo(photo=message.photo.file_id, caption=processed_text, chat_id=target_channel)
                 elif media_type == 'video':
                     logger.info(f"[FORWARDER][DEBUG] send_video params: video={message.video.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                    await self.userbot.send_video(video=message.video.file_id, caption=processed_text, chat_id=target_channel)
+                    await self._userbot.send_video(video=message.video.file_id, caption=processed_text, chat_id=target_channel)
                 elif media_type == 'document':
                     logger.info(f"[FORWARDER][DEBUG] send_document params: document={message.document.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                    await self.userbot.send_document(document=message.document.file_id, caption=processed_text, chat_id=target_channel)
+                    await self._userbot.send_document(document=message.document.file_id, caption=processed_text, chat_id=target_channel)
                 elif media_type == 'audio':
                     logger.info(f"[FORWARDER][DEBUG] send_audio params: audio={message.audio.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                    await self.userbot.send_audio(audio=message.audio.file_id, caption=processed_text, chat_id=target_channel)
+                    await self._userbot.send_audio(audio=message.audio.file_id, caption=processed_text, chat_id=target_channel)
                 elif media_type == 'voice':
                     logger.info(f"[FORWARDER][DEBUG] send_voice params: voice={message.voice.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                    await self.userbot.send_voice(voice=message.voice.file_id, caption=processed_text, chat_id=target_channel)
+                    await self._userbot.send_voice(voice=message.voice.file_id, caption=processed_text, chat_id=target_channel)
                 elif media_type == 'video_note':
                     logger.info(f"[FORWARDER][DEBUG] send_video_note params: video_note={message.video_note.file_id}, chat_id={target_channel}")
-                    await self.userbot.send_video_note(video_note=message.video_note.file_id, chat_id=target_channel)
+                    await self._userbot.send_video_note(video_note=message.video_note.file_id, chat_id=target_channel)
                 elif media_type == 'animation':
                     logger.info(f"[FORWARDER][DEBUG] send_animation params: animation={message.animation.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                    await self.userbot.send_animation(animation=message.animation.file_id, caption=processed_text, chat_id=target_channel)
+                    await self._userbot.send_animation(animation=message.animation.file_id, caption=processed_text, chat_id=target_channel)
                 elif media_type == 'sticker':
                     logger.info(f"[FORWARDER][DEBUG] send_sticker params: sticker={message.sticker.file_id}, chat_id={target_channel}")
-                    await self.userbot.send_sticker(sticker=message.sticker.file_id, chat_id=target_channel)
+                    await self._userbot.send_sticker(sticker=message.sticker.file_id, chat_id=target_channel)
                 else:
                     logger.warning(f"[FORWARDER] Неподдерживаемый тип медиа: {media_type}, пропускаем!")
                     return False  # <-- теперь не отправляем как текст
@@ -679,7 +682,7 @@ class TelegramForwarder:
                 if entities and len(entities) > 0 and self._should_use_parse_mode(entities):
                     send_params['parse_mode'] = 'HTML'
                 logger.info(f"[FORWARDER][DEBUG] Итоговый send_params для send_message: {send_params}")
-                await self.userbot.send_message(text=processed_text or original_text, chat_id=target_channel)
+                await self._userbot.send_message(text=processed_text or original_text, chat_id=target_channel)
             logger.info(f"[FORWARDER] ✅ Переслано одиночное сообщение {message.id}")
             return True
         except Exception as e:
@@ -779,9 +782,9 @@ class TelegramForwarder:
         """Цикл мониторинга"""
         try:
             # ДОБАВЛЕНО: Проверка и запуск userbot в начале мониторинга
-            if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
+            if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
                 logger.info(f"[FORWARDER][MONITORING_LOOP] Userbot не запущен, запускаем...")
-                await self.userbot.start()
+                await self._userbot.start()
                 logger.info(f"[FORWARDER][MONITORING_LOOP] Userbot успешно запущен")
         except Exception as e:
             logger.error(f"[FORWARDER][MONITORING_LOOP] Ошибка при запуске userbot: {e}")
@@ -853,7 +856,7 @@ class TelegramForwarder:
             # Преобразуем username в id, если нужно
             if isinstance(channel_id, str) and not channel_id.startswith("-100") and not channel_id.isdigit():
                 try:
-                    chat = await self.userbot.get_chat(channel_id)
+                    chat = await self._userbot.get_chat(channel_id)
                     channel_id = chat.id
                 except Exception as e:
                     logger.error(f"[FORWARDER] Не удалось получить id для канала {channel_id}: {e}")
@@ -912,7 +915,7 @@ class TelegramForwarder:
                     forward_channel_title = self._channel_cache["title"]
                 else:
                     try:
-                        chat = await self.userbot.get_chat(channel_id)
+                        chat = await self._userbot.get_chat(channel_id)
                         forward_channel_title = getattr(chat, "title", None)
                     except Exception as chat_error:
                         if "Peer id invalid" in str(chat_error) or "ID not found" in str(chat_error):
@@ -1002,7 +1005,7 @@ class TelegramForwarder:
         try:
             if forward_mode == "forward":
                 for m in group_msgs:
-                    await self.userbot.forward_messages(
+                    await self._userbot.forward_messages(
                         chat_id=target_channel,
                         from_chat_id=channel_id,
                         message_ids=m.id,
@@ -1041,7 +1044,7 @@ class TelegramForwarder:
                                     ext = '.jpg'
                                     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                                         temp_file_path = tmp.name
-                                    temp_file_path = await self.userbot.download_media(m, file_name=temp_file_path)
+                                    temp_file_path = await self._userbot.download_media(m, file_name=temp_file_path)
                                     if not temp_file_path or not os.path.exists(temp_file_path):
                                         logger.error(f"[FORWARDER] Не удалось скачать файл для платного поста: message_id={getattr(m, 'id', None)}, media_type={media_type}")
                                         continue
@@ -1056,7 +1059,7 @@ class TelegramForwarder:
                                     ext = '.mp4'
                                     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                                         temp_file_path = tmp.name
-                                    temp_file_path = await self.userbot.download_media(m, file_name=temp_file_path)
+                                    temp_file_path = await self._userbot.download_media(m, file_name=temp_file_path)
                                     if not temp_file_path or not os.path.exists(temp_file_path):
                                         logger.error(f"[FORWARDER] Не удалось скачать файл для платного поста: message_id={getattr(m, 'id', None)}, media_type={media_type}")
                                         continue
@@ -1072,7 +1075,7 @@ class TelegramForwarder:
                                         ext = '.jpg'
                                         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                                             temp_file_path = tmp.name
-                                        temp_file_path = await self.userbot.download_media(m, file_name=temp_file_path)
+                                        temp_file_path = await self._userbot.download_media(m, file_name=temp_file_path)
                                         if not temp_file_path or not os.path.exists(temp_file_path):
                                             logger.error(f"[FORWARDER] Не удалось скачать файл для платного поста: message_id={getattr(m, 'id', None)}, media_type={media_type}")
                                             continue
@@ -1087,7 +1090,7 @@ class TelegramForwarder:
                                         ext = '.mp4'
                                         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
                                             temp_file_path = tmp.name
-                                        temp_file_path = await self.userbot.download_media(m, file_name=temp_file_path)
+                                        temp_file_path = await self._userbot.download_media(m, file_name=temp_file_path)
                                         if not temp_file_path or not os.path.exists(temp_file_path):
                                             logger.error(f"[FORWARDER] Не удалось скачать файл для платного поста: message_id={getattr(m, 'id', None)}, media_type={media_type}")
                                             continue
@@ -1184,7 +1187,7 @@ class TelegramForwarder:
                             
                             if media_objs:
                                 logger.info(f"[FORWARDER][DEBUG] media_objs для отправки: {[type(obj).__name__ + ':' + getattr(obj, 'media', 'NO_MEDIA') for obj in media_objs]}")
-                                await self.userbot.send_media_group(
+                                await self._userbot.send_media_group(
                                     chat_id=target_channel,
                                     media=media_objs
                                 )
@@ -1229,7 +1232,7 @@ class TelegramForwarder:
                     
                     if media_objs:
                         logger.info(f"[FORWARDER][DEBUG] media_objs для отправки: {[type(obj).__name__ + ':' + getattr(obj, 'media', 'NO_MEDIA') for obj in media_objs]}")
-                        await self.userbot.send_media_group(
+                        await self._userbot.send_media_group(
                             chat_id=target_channel,
                             media=media_objs
                         )
@@ -1260,9 +1263,12 @@ class TelegramForwarder:
 
     async def start_forwarding_parsing(self, source_channel: str, target_channel: str, config: dict, callback: Optional[Callable] = None):
         """Запуск парсинга + пересылки (background task)"""
-        # ДОБАВЛЕНО: Проверка и запуск userbot
-        if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
-            await self.userbot.start()
+        self._userbot = await self.get_userbot(task="parsing")
+        # Логируем путь к сессионному файлу
+        if hasattr(self._userbot, 'name'):
+            logger.info(f"[FORWARDER][PARSING] Используется сессионный файл: {self._userbot.name}")
+        if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
+            await self._userbot.start()
         task_id = self.create_parse_forward_task(source_channel, target_channel, config)
         task_info = self._parse_forward_tasks[task_id]
         
@@ -1270,8 +1276,8 @@ class TelegramForwarder:
         async def run_parse_forward():
             try:
                 # ДОБАВЛЕНО: Проверка и запуск userbot внутри таска (на всякий случай)
-                if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
-                    await self.userbot.start()
+                if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
+                    await self._userbot.start()
                 logger.info(f"[FORWARDER] 🚀 ЗАПУСК ПАРСИНГА + ПЕРЕСЫЛКИ (НЕ МОНИТОРИНГА!)")
                 logger.info(f"[FORWARDER] Источник: {source_channel} -> Цель: {target_channel}")
                 logger.info(f"[FORWARDER] Конфигурация: {config}")
@@ -1280,9 +1286,9 @@ class TelegramForwarder:
                 
                 # Получаем информацию о канале
                 if str(source_channel).startswith("-100"):
-                    channel = await self.userbot.get_chat(int(source_channel))
+                    channel = await self._userbot.get_chat(int(source_channel))
                 else:
-                    channel = await self.userbot.get_chat(source_channel)
+                    channel = await self._userbot.get_chat(source_channel)
                 channel_id = channel.id
                 channel_name = channel.username or str(channel_id)
                 channel_title = getattr(channel, "title", None)
@@ -1337,7 +1343,7 @@ class TelegramForwarder:
                 all_messages = []
                 media_groups = {}
                 try:
-                    async for message in self.userbot.get_chat_history(channel_id, limit=1000):
+                    async for message in self._userbot.get_chat_history(channel_id, limit=1000):
                         try:
                             all_messages.append(message)
                             # Группируем сообщения по media_group_id
@@ -1836,9 +1842,9 @@ class TelegramForwarder:
     def _update_source_handler(self, channel_id):
         # ДОБАВЛЕНО: Проверка и запуск userbot асинхронно
         async def ensure_userbot_started():
-            if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
+            if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
                 logger.info(f"[FORWARDER][UPDATE_HANDLER] Userbot не запущен, запускаем...")
-                await self.userbot.start()
+                await self._userbot.start()
                 logger.info(f"[FORWARDER][UPDATE_HANDLER] Userbot успешно запущен")
         
         # Запускаем проверку в фоновом режиме
@@ -1846,13 +1852,13 @@ class TelegramForwarder:
         
         # Удалить старый handler, если есть
         if channel_id in self._handlers:
-            self.userbot.remove_handler(self._handlers[channel_id])
+            self._userbot.remove_handler(self._handlers[channel_id])
             del self._handlers[channel_id]
         # Найти все target_channel для этого source_channel
         targets = [tgt_id for (src_id, tgt_id) in self._monitoring_tasks.keys() if src_id == channel_id]
         if not targets:
             return  # Нет активных мониторингов — handler не нужен
-        @self.userbot.on_message(filters.chat(channel_id))
+        @self._userbot.on_message(filters.chat(channel_id))
         async def handle_new_message(client, message):
             logger.info(f"[FORWARDER][HANDLER] Вызван handler для channel_id={channel_id}, message_id={getattr(message, 'id', None)}")
             # --- Медиагруппы ---
@@ -1961,10 +1967,10 @@ class TelegramForwarder:
         else:
             # If no session manager, use the default userbot
             try:
-                if not hasattr(self.userbot, 'is_connected') or not self.userbot.is_connected:
-                    await self.userbot.start()
+                if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
+                    await self._userbot.start()
                 
-                await self.userbot.send_reaction(
+                await self._userbot.send_reaction(
                     chat_id=chat_id,
                     message_id=message_id,
                     emoji=reaction
@@ -1973,4 +1979,19 @@ class TelegramForwarder:
             except Exception as e:
                 logger.error(f"[FORWARDER] Error adding reaction: {e}")
                 return {"default": f"error: {str(e)}"}
+
+    async def get_userbot_for_monitoring(self):
+        if self.session_manager:
+            sessions = await self.session_manager.get_sessions_for_task('monitoring')
+            if sessions:
+                client = await self.session_manager.get_client(sessions[0].alias)
+                if client:
+                    return client
+        return await self.get_userbot(task="monitoring")
+
+    async def start_monitoring(self, source_channel: str, target_channel: str, config: dict, callback: Optional[Callable] = None):
+        self._userbot = await self.get_userbot_for_monitoring()
+        if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
+            await self._userbot.start()
+        # ... остальной код ...
 

@@ -9,6 +9,7 @@ import os
 import sys
 import asyncio
 from pathlib import Path
+import traceback
 
 # Добавляем корневую директорию в путь
 sys.path.append(str(Path(__file__).parent.parent))
@@ -20,8 +21,24 @@ from bot.states import user_states
 from bot.handlers import start_command, text_handler, forwarding_callback_handler, monitorings_command, check_tasks_status_callback, process_callback_query
 from bot.navigation_manager import navigation_menu_handler, navigation_text_handler
 import bot.handlers  # Для регистрации всех callback-обработчиков
-from bot.session_handlers import sessions_command, handle_session_text_input
-from bot.reaction_handlers import reactions_command, handle_reaction_text_input
+from bot.session_handlers import (
+    sessions_command,  # добавляю импорт этой функции обратно
+    add_session_callback,
+    assign_session_callback,
+    select_session_callback,
+    assign_task_callback,
+    delete_session_callback,
+    confirm_delete_callback,
+    delete_confirmed_callback,
+    cancel_session_action_callback,
+    resend_code_callback,
+    handle_session_text_input  # добавляю импорт этой функции
+)
+from bot.reaction_handlers import (
+    reactions_command,
+    handle_reaction_text_input
+)
+from pyrogram.handlers import CallbackQueryHandler
 
 # Настройка логирования
 logging.basicConfig(
@@ -68,41 +85,54 @@ async def text_message_handler(client, message):
     """Обработчик текстовых сообщений"""
     user_id = message.from_user.id
     state = user_states.get(user_id, {}).get("state")
+    
+    # Добавляем логирование для отладки
+    logger.info(f"[TEXT_HANDLER] User {user_id}, state: {state}, text: '{message.text.strip()}'")
+    
     if state and state.startswith("navigation_"):
+        logger.info(f"[TEXT_HANDLER] Handling navigation for user {user_id}")
         await navigation_text_handler(client, message)
     elif state and state.startswith("session_"):
         # Handle session management text input
+        logger.info(f"[TEXT_HANDLER] Handling session for user {user_id}")
         handled = await handle_session_text_input(client, message)
         if handled:
+            logger.info(f"[TEXT_HANDLER] Session handled for user {user_id}")
             return
-        await text_handler(client, message)
+        # Don't call text_handler if session input was handled
+        logger.info(f"[TEXT_HANDLER] Session not handled, returning for user {user_id}")
+        return
     elif state and state.startswith("reaction_"):
         # Handle reaction management text input
+        logger.info(f"[TEXT_HANDLER] Handling reaction for user {user_id}")
         handled = await handle_reaction_text_input(client, message)
         if handled:
+            logger.info(f"[TEXT_HANDLER] Reaction handled for user {user_id}")
             return
-        await text_handler(client, message)
+        # Don't call text_handler if reaction input was handled
+        logger.info(f"[TEXT_HANDLER] Reaction not handled, returning for user {user_id}")
+        return
     else:
+        logger.info(f"[TEXT_HANDLER] Calling text_handler for user {user_id}")
         await text_handler(client, message)
 
+# Удаляю глобальный обработчик @app.on_callback_query()
+# @app.on_callback_query()
+# async def callback_query_handler(client, callback_query):
+#     try:
+#         handled = await process_callback_query(client, callback_query)
+#         if not handled:
+#             await callback_query.answer("Неизвестное действие", show_alert=True)
+#     except RPCError as e:
+#         logger.error(f"[CALLBACK_HANDLER] RPCError: {e}\n{traceback.format_exc()}")
+#         await callback_query.answer("Ошибка Telegram API", show_alert=True)
+#     except Exception as e:
+#         logger.error(f"[CALLBACK_HANDLER] Ошибка типа {type(e)}: {e}\n{traceback.format_exc()}")
+#         await callback_query.answer(f"Внутренняя ошибка: {e}", show_alert=True)
+
 @app.on_callback_query()
-async def callback_query_handler(client, callback_query):
-    """
-    Глобальный обработчик callback-запросов: вызывает forwarding_callback_handler только если не сработал ни один другой обработчик.
-    """
-    try:
-        # Попробуем вызвать process_callback_query, которая вернёт True если обработала callback
-        handled = await process_callback_query(client, callback_query)
-        if not handled:
-            # Если не обработано — можно логировать или отправить fallback-ответ
-            await callback_query.answer("Неизвестное действие", show_alert=True)
-    except RPCError as e:
-        # Pyrogram может выбрасывать ошибки RPC
-        logger.error(f"[CALLBACK_HANDLER] RPCError: {e}")
-        await callback_query.answer("Ошибка Telegram API", show_alert=True)
-    except Exception as e:
-        logger.error(f"[CALLBACK_HANDLER] Ошибка: {e}")
-        await callback_query.answer("Внутренняя ошибка", show_alert=True)
+async def universal_callback_handler(client, callback_query):
+    await process_callback_query(client, callback_query)
 
 @app.on_message(filters.command("monitorings"))
 async def monitorings_handler(client, message):
@@ -111,6 +141,22 @@ async def monitorings_handler(client, message):
 @app.on_callback_query(filters.regex("^check_tasks_status$"))
 async def check_tasks_status_handler(client, callback_query):
     await check_tasks_status_callback(client, callback_query)
+
+# После инициализации app:
+app.add_handler(CallbackQueryHandler(add_session_callback, filters.regex("^add_session$")))
+app.add_handler(CallbackQueryHandler(assign_session_callback, filters.regex("^assign_session$")))
+app.add_handler(CallbackQueryHandler(select_session_callback, filters.regex("^select_session:(.+)$")))
+app.add_handler(CallbackQueryHandler(assign_task_callback, filters.regex("^assign_task:(.+):(.+)$")))
+app.add_handler(CallbackQueryHandler(delete_session_callback, filters.regex("^delete_session$")))
+app.add_handler(CallbackQueryHandler(confirm_delete_callback, filters.regex("^confirm_delete:(.+)$")))
+app.add_handler(CallbackQueryHandler(delete_confirmed_callback, filters.regex("^delete_confirmed:(.+)$")))
+app.add_handler(CallbackQueryHandler(cancel_session_action_callback, filters.regex("^cancel_session_action$")))
+app.add_handler(CallbackQueryHandler(resend_code_callback, filters.regex("^resend_code:(.+)$")))
+
+# Добавляю catch-all обработчик последним
+async def catch_all_callback_handler(client, callback_query):
+    await callback_query.answer("Неизвестное действие", show_alert=True)
+app.add_handler(CallbackQueryHandler(catch_all_callback_handler))
 
 def run_bot():
     """Функция для запуска бота извне"""

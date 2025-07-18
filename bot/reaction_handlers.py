@@ -37,6 +37,7 @@ async def reactions_command(client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex("^add_reaction$"))
 async def add_reaction_callback(client, callback_query):
+    logger.info(f"[add_reaction_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for adding a reaction"""
     user_id = callback_query.from_user.id
     
@@ -54,6 +55,7 @@ async def add_reaction_callback(client, callback_query):
 
 @Client.on_callback_query(filters.regex("^view_sessions$"))
 async def view_sessions_callback(client, callback_query):
+    logger.info(f"[view_sessions_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for viewing available sessions"""
     user_id = callback_query.from_user.id
     
@@ -102,6 +104,7 @@ async def view_sessions_callback(client, callback_query):
 
 @Client.on_callback_query(filters.regex("^assign_reaction_session$"))
 async def assign_reaction_session_callback(client, callback_query):
+    logger.info(f"[assign_reaction_session_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for assigning a session for reactions"""
     user_id = callback_query.from_user.id
     
@@ -145,6 +148,7 @@ async def assign_reaction_session_callback(client, callback_query):
 
 @Client.on_callback_query(filters.regex("^toggle_reaction_session:(.+)$"))
 async def toggle_reaction_session_callback(client, callback_query):
+    logger.info(f"[toggle_reaction_session_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for toggling a session for reactions"""
     user_id = callback_query.from_user.id
     
@@ -190,11 +194,13 @@ async def toggle_reaction_session_callback(client, callback_query):
 
 @Client.on_callback_query(filters.regex("^back_to_sessions$"))
 async def back_to_sessions_callback(client, callback_query):
+    logger.info(f"[back_to_sessions_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for going back to sessions view"""
     await view_sessions_callback(client, callback_query)
 
 @Client.on_callback_query(filters.regex("^back_to_reactions$"))
 async def back_to_reactions_callback(client, callback_query):
+    logger.info(f"[back_to_reactions_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for going back to reactions menu"""
     user_id = callback_query.from_user.id
     
@@ -215,6 +221,7 @@ async def back_to_reactions_callback(client, callback_query):
 
 @Client.on_callback_query(filters.regex("^select_reaction:(.+)$"))
 async def select_reaction_callback(client, callback_query):
+    logger.info(f"[select_reaction_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for selecting a reaction emoji"""
     user_id = callback_query.from_user.id
     
@@ -274,6 +281,7 @@ async def select_reaction_callback(client, callback_query):
 
 @Client.on_callback_query(filters.regex("^use_default_session$"))
 async def use_default_session_callback(client, callback_query):
+    logger.info(f"[use_default_session_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for using default session"""
     user_id = callback_query.from_user.id
     
@@ -299,6 +307,7 @@ async def use_default_session_callback(client, callback_query):
 
 @Client.on_callback_query(filters.regex("^confirm_reaction$"))
 async def confirm_reaction_callback(client, callback_query):
+    logger.info(f"[confirm_reaction_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for confirming reaction"""
     user_id = callback_query.from_user.id
     
@@ -350,6 +359,7 @@ async def confirm_reaction_callback(client, callback_query):
 
 @Client.on_callback_query(filters.regex("^confirm_reaction_default$"))
 async def confirm_reaction_default_callback(client, callback_query):
+    logger.info(f"[confirm_reaction_default_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for confirming reaction with default session"""
     user_id = callback_query.from_user.id
     
@@ -397,6 +407,7 @@ async def confirm_reaction_default_callback(client, callback_query):
 
 @Client.on_callback_query(filters.regex("^cancel_reaction$"))
 async def cancel_reaction_callback(client, callback_query):
+    logger.info(f"[cancel_reaction_callback] callback_data={callback_query.data}, user_id={callback_query.from_user.id}")
     """Callback for canceling reaction"""
     user_id = callback_query.from_user.id
     

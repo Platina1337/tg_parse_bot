@@ -98,6 +98,12 @@ async def text_handler(client: Client, message: Message):
     print(f"[FSM][DEBUG][ENTER] user_id={user_id} | old_state={old_state} | text='{text}'")
     print(f"[FSM][DEBUG] user_states[{user_id}] на входе: {user_states[user_id]}")
     
+    # --- FSM: обработка сессий ---
+    # Убираем дублирующий вызов handle_session_text_input, так как он уже вызывается в bot_main.py
+    # from bot.session_handlers import handle_session_text_input
+    # if await handle_session_text_input(client, message):
+    #     return  # Если обработано — не продолжаем дальше
+
     def set_state(new_state):
         nonlocal old_state
         print(f"[FSM][DEBUG][STATE_CHANGE] user_id={user_id} | from={old_state} -> to={new_state} | text='{text}'")
@@ -1086,6 +1092,11 @@ async def text_handler(client: Client, message: Message):
         user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
         return
 
+    # Проверяем состояния сессий и реакций
+    if state and (state.startswith("session_") or state.startswith("reaction_")):
+        # Эти состояния обрабатываются в других обработчиках
+        return
+    
     # Если этап не определён
     await show_main_menu(client, message, "Пожалуйста, выберите действие из меню:")
 
@@ -1135,6 +1146,9 @@ async def show_forwarding_menu(client, message, user_id: int):
 async def forwarding_callback_handler(client, callback_query):
     user_id = callback_query.from_user.id
     data = callback_query.data
+    if user_id not in user_states:
+        await callback_query.answer("Ваша сессия устарела или неактивна. Пожалуйста, начните сначала через /start или /sessions", show_alert=True)
+        return
     state = user_states[user_id].get("state")
     
     # Извлекаем действие из callback_data

@@ -153,6 +153,16 @@ class Database:
                     )
                 ''')
                 
+                # Таблица для множественных назначений задач на одну сессию
+                await cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS session_assignments (
+                        session_id INTEGER,
+                        task TEXT,
+                        PRIMARY KEY (session_id, task),
+                        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                    )
+                ''')
+                
                 # Индексы для оптимизации запросов
                 await cursor.execute("CREATE INDEX IF NOT EXISTS idx_parsed_messages_channel ON parsed_messages(channel_id)")
                 await cursor.execute("CREATE INDEX IF NOT EXISTS idx_parsed_messages_forwarded ON parsed_messages(forwarded_to)")
@@ -976,3 +986,45 @@ class Database:
                 await self.create_session(session)
                 imported += 1
         return imported
+
+    # --- Методы для работы с назначениями задач на сессии ---
+    async def add_session_assignment(self, session_id: int, task: str):
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO session_assignments (session_id, task) VALUES (?, ?)",
+            (session_id, task)
+        )
+        await self.conn.commit()
+
+    async def remove_session_assignment(self, session_id: int, task: str):
+        await self.conn.execute(
+            "DELETE FROM session_assignments WHERE session_id = ? AND task = ?",
+            (session_id, task)
+        )
+        await self.conn.commit()
+
+    async def get_assignments(self) -> Dict[str, list]:
+        """Возвращает assignments: task -> [session_alias]"""
+        async with self.conn.execute(
+            "SELECT sa.task, s.alias FROM session_assignments sa JOIN sessions s ON sa.session_id = s.id"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            assignments = {}
+            for task, alias in rows:
+                assignments.setdefault(task, []).append(alias)
+            return assignments
+
+    async def get_session_tasks(self, session_id: int) -> list:
+        async with self.conn.execute(
+            "SELECT task FROM session_assignments WHERE session_id = ?",
+            (session_id,)
+        ) as cursor:
+            return [row[0] async for row in cursor]
+
+    async def get_sessions_for_task(self, task: str) -> list:
+        async with self.conn.execute(
+            "SELECT s.* FROM session_assignments sa JOIN sessions s ON sa.session_id = s.id WHERE sa.task = ?",
+            (task,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            columns = [column[0] for column in cursor.description]
+            return [SessionMeta(**dict(zip(columns, row))) for row in rows]

@@ -21,6 +21,6 @@ class BotConfig(BaseSettings):
         extra = "ignore"
 
 # List of Telegram user IDs who are considered admins
-ADMIN_IDS: List[int] = [8185973411]  # TODO: Replace with your real Telegram user IDs
+ADMIN_IDS: List[int] = [8185973411, 7657388967, 7879908185]  # TODO: Replace with your real Telegram user IDs
 
 config = BotConfig() 

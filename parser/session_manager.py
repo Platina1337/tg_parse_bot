@@ -6,14 +6,15 @@ from pyrogram import Client
 from pyrogram.errors import AuthKeyUnregistered, AuthKeyDuplicated, SessionPasswordNeeded, PhoneCodeInvalid
 from parser.database import Database
 from shared.models import SessionMeta
+from parser.config import config
 
 logger = logging.getLogger(__name__)
 
 class SessionManager:
     """Manager for multiple Telegram sessions (now DB-backed)"""
-    def __init__(self, db: Database, session_dir="sessions"):
+    def __init__(self, db: Database, session_dir=None):
         self.db = db
-        self.session_dir = session_dir
+        self.session_dir = session_dir or config.SESSIONS_DIR
         self.clients: Dict[str, Client] = {}  # alias -> Client
         self.ensure_session_dir()
 
@@ -28,15 +29,20 @@ class SessionManager:
         sessions = await self.db.get_all_sessions()
         for session in sessions:
             if session.is_active:
+                # Используем абсолютный путь к файлу сессии
+                session_path = os.path.abspath(session.session_path)
                 self.clients[session.alias] = Client(
-                    name=session.session_path,
+                    name=session_path,
                     api_id=session.api_id,
                     api_hash=session.api_hash,
                     phone_number=session.phone if session.phone else None
                 )
 
     async def add_account(self, alias: str, api_id: int, api_hash: str, phone: str) -> Dict[str, Any]:
-        session_path = os.path.join(self.session_dir, alias)
+        # Формируем абсолютный путь к файлу сессии
+        session_dir_abs = os.path.abspath(self.session_dir)
+        os.makedirs(session_dir_abs, exist_ok=True)
+        session_path = os.path.join(session_dir_abs, alias)
         session = SessionMeta(
             id=0,
             alias=alias,
@@ -54,11 +60,19 @@ class SessionManager:
         return await self.db.get_all_sessions()
 
     async def assign_task(self, alias: str, task: str) -> Dict[str, Any]:
+        # Блокируем назначение forwarding как задачи
+        if task == 'forwarding':
+            return {"success": False, "error": "Назначение задачи 'forwarding' больше не поддерживается. Используйте 'monitoring' или 'parsing'."}
         session = await self.db.get_session_by_alias(alias)
         if not session:
             return {"success": False, "error": "Session not found"}
-        await self.db.update_session(session.id, assigned_task=task)
-        return {"success": True, "alias": alias, "task": task}
+        # Single-assignment mode: удаляем все старые назначения для этой задачи
+        all_sessions = await self.db.get_all_sessions()
+        for s in all_sessions:
+            await self.db.remove_session_assignment(s.id, task)
+        await self.db.add_session_assignment(session.id, task)
+        assignments = await self.get_assignments()
+        return {"success": True, "alias": alias, "task": task, "assignments": assignments}
 
     async def delete_session(self, alias: str) -> Dict[str, Any]:
         session = await self.db.get_session_by_alias(alias)
@@ -72,23 +86,43 @@ class SessionManager:
     async def get_client(self, alias: str) -> Optional[Client]:
         if alias not in self.clients:
             await self.load_clients()
+        client = self.clients.get(alias)
+        if not client:
+            # Попробовать создать клиента из БД
+            session = await self.db.get_session_by_alias(alias)
+            if session:
+                session_dir_abs = os.path.abspath(self.session_dir)
+                client = Client(
+                    name=session.session_path,
+                    api_id=session.api_id,
+                    api_hash=session.api_hash,
+                    workdir=session_dir_abs,
+                    phone_number=session.phone
+                )
+                self.clients[alias] = client
         return self.clients.get(alias)
 
     async def send_code(self, alias: str, phone: str) -> Dict[str, Any]:
         """Send authentication code to the phone number"""
+        logger.info(f"[SEND_CODE] alias={alias}, phone={phone}, session_dir={self.session_dir}")
+        logger.info(f"[SEND_CODE] sessions_dir exists: {os.path.exists(self.session_dir)}")
         client = self.clients.get(alias)
+        logger.info(f"[SEND_CODE] client for alias '{alias}': {client}")
         if not client:
+            logger.error(f"[SEND_CODE] No client found for alias '{alias}'")
             return {"success": False, "error": "Session not found"}
-        
         try:
+            logger.info(f"[SEND_CODE] Connecting client for alias '{alias}'...")
             await client.connect()
+            logger.info(f"[SEND_CODE] Connected. Sending code to {phone}...")
             sent_code = await client.send_code(phone)
+            logger.info(f"[SEND_CODE] Code sent. phone_code_hash={sent_code.phone_code_hash}")
             return {
                 "success": True,
                 "phone_code_hash": sent_code.phone_code_hash
             }
         except Exception as e:
-            logger.error(f"Error sending code: {e}")
+            logger.error(f"[SEND_CODE] Error sending code for alias '{alias}': {e}", exc_info=True)
             return {"success": False, "error": str(e)}
         finally:
             if client.is_connected:
@@ -102,7 +136,23 @@ class SessionManager:
         
         try:
             await client.connect()
-            await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+            # В Pyrogram 2.0+ используем правильную сигнатуру с именованными аргументами
+            try:
+                # Логируем параметры для отладки
+                logger.info(f"[SIGN_IN] Parameters: phone='{phone}', code='{code}', phone_code_hash='{phone_code_hash}'")
+                logger.info(f"[SIGN_IN] Code type: {type(code)}, length: {len(code) if code else 0}")
+                
+                # Пробуем с именованными аргументами
+                await client.sign_in(
+                    phone_number=phone,
+                    phone_code=code,
+                    phone_code_hash=phone_code_hash
+                )
+                logger.info(f"[SIGN_IN] sign_in completed")
+            except Exception as e:
+                logger.error(f"[SIGN_IN] sign_in error: {e}")
+                raise e
+                
             is_authorized = await client.is_user_authorized()
             
             if is_authorized:
@@ -174,16 +224,12 @@ class SessionManager:
         }
     
     async def remove_assignment(self, alias: str, task: str) -> Dict[str, Any]:
-        """Remove a session assignment"""
-        # The original code had reaction_sessions, which is removed.
-        # Assuming the intent was to update the assigned_task in the DB.
-        await self.db.update_session(self.clients[alias].name.replace(self.session_dir, ""), assigned_task="default")
-        
-        return {
-            "success": True,
-            "alias": alias,
-            "assignments": self.get_assignments()
-        }
+        session = await self.db.get_session_by_alias(alias)
+        if not session:
+            return {"success": False, "error": "Session not found"}
+        await self.db.remove_session_assignment(session.id, task)
+        assignments = await self.get_assignments()
+        return {"success": True, "alias": alias, "assignments": assignments}
     
     async def get_client(self, alias: str) -> Optional[Client]:
         if alias not in self.clients:
@@ -274,13 +320,9 @@ class SessionManager:
         """Get list of all sessions"""
         return await self.db.get_all_sessions()
     
-    def get_assignments(self) -> Dict[str, Any]:
-        """Get current session assignments"""
-        # This method needs to be updated to fetch assignments from the DB
-        # For now, it will return a placeholder or raise an error
-        # The original code had reaction_sessions, which is removed.
-        # Assuming the intent was to fetch assigned_task from the DB.
-        return {"parsing": "default", "monitoring": "default", "forwarding": "default"}
+    async def get_assignments(self) -> Dict[str, Any]:
+        """Возвращает assignments: task -> [session_alias]"""
+        return await self.db.get_assignments()
     
     async def check_session_status(self, alias: str) -> Dict[str, Any]:
         """Check if a session is valid and get user info"""
@@ -342,3 +384,57 @@ class SessionManager:
         except Exception as e:
             logger.error(f"Error deleting session {alias}: {e}")
             return {"success": False, "error": str(e)} 
+
+    async def confirm_code(self, alias: str, phone: str, code: str, phone_code_hash: str) -> dict:
+        logger.info(f"[CONFIRM_CODE] alias={alias}, phone={phone}, code={code}, phone_code_hash={phone_code_hash}")
+        client = self.clients.get(alias)
+        if not client:
+            # Попробовать создать клиента из БД
+            session = await self.db.get_session_by_alias(alias)
+            if session:
+                session_dir_abs = os.path.abspath(self.session_dir)
+                client = Client(
+                    name=session.session_path,
+                    api_id=session.api_id,
+                    api_hash=session.api_hash,
+                    workdir=session_dir_abs,
+                    phone_number=session.phone
+                )
+                self.clients[alias] = client
+                logger.info(f"[CONFIRM_CODE] Created client for alias '{alias}' from DB")
+            else:
+                logger.error(f"[CONFIRM_CODE] No session in DB for alias '{alias}'")
+                return {"success": False, "error": "Session not found"}
+        try:
+            await client.connect()
+            logger.info(f"[CONFIRM_CODE] Connected client for alias '{alias}'")
+            # В Pyrogram 2.0+ используем правильную сигнатуру с именованными аргументами
+            try:
+                # Логируем параметры для отладки
+                logger.info(f"[CONFIRM_CODE] Parameters: phone='{phone}', code='{code}', phone_code_hash='{phone_code_hash}'")
+                logger.info(f"[CONFIRM_CODE] Code type: {type(code)}, length: {len(code) if code else 0}")
+                
+                # Пробуем с именованными аргументами
+                await client.sign_in(
+                    phone_number=phone,
+                    phone_code=code,
+                    phone_code_hash=phone_code_hash
+                )
+                logger.info(f"[CONFIRM_CODE] sign_in completed")
+            except Exception as e:
+                logger.error(f"[CONFIRM_CODE] sign_in error: {e}")
+                # Проверяем тип ошибки
+                if "PHONE_CODE_EXPIRED" in str(e):
+                    return {"success": False, "error": "Код подтверждения истек. Запросите новый код.", "code_expired": True}
+                elif "PHONE_CODE_INVALID" in str(e):
+                    return {"success": False, "error": "Неверный код подтверждения. Проверьте код и попробуйте снова.", "invalid_code": True}
+                else:
+                    raise e
+            await client.disconnect()
+            return {"success": True, "result": "Code confirmed successfully"}
+        except Exception as e:
+            logger.error(f"[CONFIRM_CODE] Error: {e}", exc_info=True)
+            return {"success": False, "error": str(e)} 
+
+    async def get_sessions_for_task(self, task: str) -> list:
+        return await self.db.get_sessions_for_task(task) 

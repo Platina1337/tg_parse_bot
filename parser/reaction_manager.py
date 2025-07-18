@@ -14,28 +14,21 @@ class ReactionManager:
                           session_names: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Add a reaction to a message using multiple accounts
-        
-        Args:
-            chat_id: ID of the chat containing the message
-            message_id: ID of the message to react to
-            reaction: Emoji reaction to add
-            session_names: List of session names to use (if None, use all reaction sessions)
-            
-        Returns:
-            Dictionary with results for each session
         """
         try:
+            # Если session_names не указаны, берем все сессии, назначенные на reactions
+            if session_names is None:
+                sessions = await self.session_manager.get_sessions_for_task('reactions')
+                session_names = [s.alias for s in sessions]
             results = await self.session_manager.add_reaction(
                 chat_id=chat_id,
                 message_id=message_id,
                 reaction=reaction,
                 session_names=session_names
             )
-            
             # Count successes and failures
             success_count = sum(1 for status in results.values() if status == "success")
             error_count = len(results) - success_count
-            
             return {
                 "success": True,
                 "results": results,
