@@ -414,14 +414,9 @@ class ParserAPIClient:
     
     # --- Methods for working with reactions ---
     
-    async def add_reaction(self, chat_id: str, message_id: int, reaction: str, session_names: list = None) -> dict:
-        """Add reaction to a message"""
-        data = {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "reaction": reaction,
-            "session_names": session_names
-        }
+    async def add_reaction(self, chat_id: str, message_id: int, reaction: str) -> dict:
+        """Поставить реакцию на сообщение всеми userbot-ами, назначенными на reactions"""
+        data = {"chat_id": chat_id, "message_id": message_id, "reaction": reaction}
         return await self._make_request("POST", "/reactions/add", json=data)
     
     async def add_multiple_reactions(self, chat_id: str, message_ids: list, reaction: str, session_names: list = None) -> dict:

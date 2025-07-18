@@ -19,6 +19,7 @@ FSM_SESSION_PHONE = "session_phone_input"
 FSM_SESSION_CODE = "session_code"
 FSM_SESSION_PASSWORD = "session_password_input"
 FSM_SESSION_TASK = "session_task_input"
+FSM_AWAIT_REACTION_INPUT = "await_reaction_input"
 
 # Dictionary to store authentication data during the flow
 auth_data = {}
@@ -343,6 +344,18 @@ async def cancel_session_action_callback(client, callback_query):
     # Update message with sessions
     await sessions_command(client, callback_query)
 
+async def add_reaction_callback(client, callback_query):
+    user_id = int(callback_query.from_user.id)
+    logger.info(f"[ADD_REACTION_CALLBACK] Вызван add_reaction_callback | user_id={user_id} | callback_data={callback_query.data}")
+    if user_id not in ADMIN_IDS:
+        await callback_query.answer("You don't have permission to manage sessions.", show_alert=True)
+        return
+    user_states[user_id] = {"state": FSM_AWAIT_REACTION_INPUT}
+    await callback_query.message.reply(
+        "Введите параметры для реакции через пробел:\n<code>@channel_or_id message_id эмодзи</code>\n\nПример: <code>@mychannel 12345 👍</code>"
+    )
+    await callback_query.answer()
+
 async def handle_session_text_input(client: Client, message: Message):
     """Handle text input for session management"""
     user_id = int(message.from_user.id)
@@ -384,6 +397,19 @@ async def handle_session_text_input(client: Client, message: Message):
             if user_id in auth_data:
                 del auth_data[user_id]
             return True
+        elif state == FSM_AWAIT_REACTION_INPUT:
+            text = message.text.strip()
+            parts = text.split()
+            if len(parts) < 3:
+                await message.reply("❌ Формат: <code>@channel_or_id message_id эмодзи</code>\nПример: <code>@mychannel 12345 👍</code>")
+                return True
+            chat_id, message_id, reaction = parts[0], parts[1], parts[2]
+            try:
+                message_id = int(message_id)
+            except Exception:
+                await message.reply("❌ ID сообщения должен быть числом!")
+                return True
+            await message.reply("⏳ Ставим реакцию... Ожидайте.")
         # Удаляю обработку FSM_SESSION_API_ID и FSM_SESSION_API_HASH
         return False
     except Exception as e:

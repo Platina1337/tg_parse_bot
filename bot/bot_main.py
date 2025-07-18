@@ -166,6 +166,11 @@ async def cancel_session_action_callback_decorator(client, callback_query):
 async def resend_code_callback_decorator(client, callback_query):
     await resend_code_callback(client, callback_query)
 
+@app.on_callback_query(filters.regex("^add_reaction$"))
+async def add_reaction_callback_decorator(client, callback_query):
+    from bot.session_handlers import add_reaction_callback
+    await add_reaction_callback(client, callback_query)
+
 # Универсальный обработчик для всех остальных callback_data
 @app.on_callback_query()
 async def universal_callback_handler(client, callback_query):
