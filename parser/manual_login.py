@@ -13,7 +13,7 @@ if __name__ == "__main__":
     phone = input("Введите номер телефона (в международном формате): ").strip()
 
     # Путь к папке сессий
-    sessions_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "sessions"))
+    sessions_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sessions"))
     os.makedirs(sessions_dir, exist_ok=True)
     session_path = os.path.join(sessions_dir, session_name)
 

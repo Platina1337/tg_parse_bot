@@ -130,9 +130,47 @@ async def text_message_handler(client, message):
 #         logger.error(f"[CALLBACK_HANDLER] Ошибка типа {type(e)}: {e}\n{traceback.format_exc()}")
 #         await callback_query.answer(f"Внутренняя ошибка: {e}", show_alert=True)
 
+@app.on_callback_query(filters.regex("^add_session$"))
+async def add_session_callback_decorator(client, callback_query):
+    await add_session_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^assign_session$"))
+async def assign_session_callback_decorator(client, callback_query):
+    await assign_session_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^select_session:(.+)$"))
+async def select_session_callback_decorator(client, callback_query):
+    await select_session_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^assign_task:(.+):(.+)$"))
+async def assign_task_callback_decorator(client, callback_query):
+    await assign_task_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^delete_session$"))
+async def delete_session_callback_decorator(client, callback_query):
+    await delete_session_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^confirm_delete:(.+)$"))
+async def confirm_delete_callback_decorator(client, callback_query):
+    await confirm_delete_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^delete_confirmed:(.+)$"))
+async def delete_confirmed_callback_decorator(client, callback_query):
+    await delete_confirmed_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^cancel_session_action$"))
+async def cancel_session_action_callback_decorator(client, callback_query):
+    await cancel_session_action_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^resend_code:(.+)$"))
+async def resend_code_callback_decorator(client, callback_query):
+    await resend_code_callback(client, callback_query)
+
+# Универсальный обработчик для всех остальных callback_data
 @app.on_callback_query()
 async def universal_callback_handler(client, callback_query):
-    await process_callback_query(client, callback_query)
+    logger.info(f"[UNIVERSAL_CALLBACK_HANDLER] Вызван universal_callback_handler | user_id={callback_query.from_user.id} | callback_data={callback_query.data}")
+    await callback_query.answer("Неизвестное действие", show_alert=True)
 
 @app.on_message(filters.command("monitorings"))
 async def monitorings_handler(client, message):
@@ -143,20 +181,20 @@ async def check_tasks_status_handler(client, callback_query):
     await check_tasks_status_callback(client, callback_query)
 
 # После инициализации app:
-app.add_handler(CallbackQueryHandler(add_session_callback, filters.regex("^add_session$")))
-app.add_handler(CallbackQueryHandler(assign_session_callback, filters.regex("^assign_session$")))
-app.add_handler(CallbackQueryHandler(select_session_callback, filters.regex("^select_session:(.+)$")))
-app.add_handler(CallbackQueryHandler(assign_task_callback, filters.regex("^assign_task:(.+):(.+)$")))
-app.add_handler(CallbackQueryHandler(delete_session_callback, filters.regex("^delete_session$")))
-app.add_handler(CallbackQueryHandler(confirm_delete_callback, filters.regex("^confirm_delete:(.+)$")))
-app.add_handler(CallbackQueryHandler(delete_confirmed_callback, filters.regex("^delete_confirmed:(.+)$")))
-app.add_handler(CallbackQueryHandler(cancel_session_action_callback, filters.regex("^cancel_session_action$")))
-app.add_handler(CallbackQueryHandler(resend_code_callback, filters.regex("^resend_code:(.+)$")))
+# app.add_handler(CallbackQueryHandler(add_session_callback, filters.regex("^add_session$")))
+# app.add_handler(CallbackQueryHandler(assign_session_callback, filters.regex("^assign_session$")))
+# app.add_handler(CallbackQueryHandler(select_session_callback, filters.regex("^select_session:(.+)$")))
+# app.add_handler(CallbackQueryHandler(assign_task_callback, filters.regex("^assign_task:(.+):(.+)$")))
+# app.add_handler(CallbackQueryHandler(delete_session_callback, filters.regex("^delete_session$")))
+# app.add_handler(CallbackQueryHandler(confirm_delete_callback, filters.regex("^confirm_delete:(.+)$")))
+# app.add_handler(CallbackQueryHandler(delete_confirmed_callback, filters.regex("^delete_confirmed:(.+)$")))
+# app.add_handler(CallbackQueryHandler(cancel_session_action_callback, filters.regex("^cancel_session_action$")))
+# app.add_handler(CallbackQueryHandler(resend_code_callback, filters.regex("^resend_code:(.+)$")))
 
 # Добавляю catch-all обработчик последним
-async def catch_all_callback_handler(client, callback_query):
-    await callback_query.answer("Неизвестное действие", show_alert=True)
-app.add_handler(CallbackQueryHandler(catch_all_callback_handler))
+# async def catch_all_callback_handler(client, callback_query):
+#     await callback_query.answer("Неизвестное действие", show_alert=True)
+# app.add_handler(CallbackQueryHandler(catch_all_callback_handler))
 
 def run_bot():
     """Функция для запуска бота извне"""

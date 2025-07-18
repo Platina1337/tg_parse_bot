@@ -94,17 +94,15 @@ class TelegramForwarder:
         self._handlers = {}  # (source_channel, target_channel) -> handler
     
     async def get_userbot(self, task: str = "parsing"):
-        if self._userbot is None:
-            logger.info(f"[FORWARDER][get_userbot] _userbot is None, инициализирую...")
-            if self.session_manager:
-                # Получаем первую сессию, назначенную на нужный task
-                sessions = await self.session_manager.get_sessions_for_task(task)
-                if sessions:
-                    client = await self.session_manager.get_client(sessions[0].alias)
-                    if client:
-                        self._userbot = client
-                        logger.info(f"[FORWARDER][get_userbot] Использую сессию {sessions[0].alias} для задачи {task}")
-        return self._userbot
+        if self.session_manager:
+            sessions = await self.session_manager.get_sessions_for_task(task)
+            if sessions:
+                client = await self.session_manager.get_client(sessions[0].alias)
+                if client:
+                    logger.info(f"[FORWARDER][get_userbot] Использую сессию {sessions[0].alias} для задачи {task}, session_file: {getattr(client, 'name', None)}")
+                    return client
+        logger.error(f"[FORWARDER][get_userbot] Не удалось получить userbot для задачи {task}")
+        return None
 
     async def start(self):
         logger.info(f"[FORWARDER] Вход в start(). self._userbot: {self._userbot}")
@@ -145,18 +143,18 @@ class TelegramForwarder:
     async def start_forwarding(self, source_channel: str, target_channel: str, config: dict, callback: Optional[Callable] = None):
         """Запуск пересылки сообщений из одного канала в другой (множественные мониторинги поддерживаются)"""
         try:
-            self._userbot = await self.get_userbot(task="monitoring")
-            # Логируем путь к сессионному файлу
-            if hasattr(self._userbot, 'name'):
-                logger.info(f"[FORWARDER][MONITORING] Используется сессионный файл: {self._userbot.name}")
-            if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
+            userbot = await self.get_userbot(task="monitoring")
+            sessions = await self.session_manager.get_sessions_for_task("monitoring") if self.session_manager else []
+            alias = sessions[0].alias if sessions else 'unknown'
+            logger.info(f"[FORWARDER][MONITORING] Используется сессионный файл: {getattr(userbot, 'name', None)}, alias: {alias}, is_connected: {getattr(userbot, 'is_connected', None)}")
+            if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
                 logger.info(f"[FORWARDER] Userbot не запущен, запускаем...")
-                await self._userbot.start()
+                await userbot.start()
                 logger.info(f"[FORWARDER] Userbot успешно запущен")
             if str(source_channel).startswith("-100"):
-                channel = await self._userbot.get_chat(int(source_channel))
+                channel = await userbot.get_chat(int(source_channel))
             else:
-                channel = await self._userbot.get_chat(source_channel)
+                channel = await userbot.get_chat(source_channel)
             channel_id = channel.id
             key = (channel_id, str(target_channel))
             # --- Остановить все мониторинги, у которых target_channel не совпадает с новым ---
@@ -173,7 +171,6 @@ class TelegramForwarder:
             logger.info(f"[FORWARDER] 🔄 ЗАПУСК МОНИТОРИНГА (НЕ ПАРСИНГА!)")
             logger.info(f"[FORWARDER] Источник: {source_channel} -> Цель: {target_channel}")
             logger.info(f"[FORWARDER] Конфигурация: {config}")
-            # УДАЛЕНО: старая проверка и запуск userbot, которая была здесь
             self._channel_cache = {
                 'id': channel_id,
                 'name': channel_name,
@@ -192,17 +189,15 @@ class TelegramForwarder:
                 }
             self._monitoring_targets[key] = target_channel
             self._monitoring_tasks[key] = asyncio.create_task(self._monitoring_loop())
-            # --- Обновить handler для source_channel ---
             self._update_source_handler(channel_id)
-            
             # Настройки пересылки
             hide_sender = config.get("hide_sender", True)
             add_footer = config.get("footer_text", "")
             max_posts = config.get("max_posts", 0)
-            forward_mode = config.get("forward_mode", "copy")  # copy или forward
-            parse_mode = config.get("parse_mode", "all")  # all или hashtags
+            forward_mode = config.get("forward_mode", "copy")
+            parse_mode = config.get("parse_mode", "all")
             hashtag_filter = config.get("hashtag_filter", "")
-            text_mode = config.get("text_mode", "hashtags_only")  # hashtags_only, as_is, no_text
+            text_mode = config.get("text_mode", "hashtags_only")
             delay_seconds = config.get("delay_seconds", 0)
             paid_content_mode = config.get("paid_content_mode", "off")
             paid_content_hashtag = config.get("paid_content_hashtag")
@@ -215,20 +210,10 @@ class TelegramForwarder:
                 paid_content_stars = 0
             logger.info(f"[FORWARDER] ⚙️ paid_content_stars из config: {paid_content_stars} (тип: {type(paid_content_stars)})")
             logger.info(f"[FORWARDER] ⚙️ Весь config: {config}")
-            
             logger.info(f"[FORWARDER] ⚙️ Настройки: режим={parse_mode}, хэштег='{hashtag_filter}', лимит={max_posts}, задержка={delay_seconds}с, платные={paid_content_stars}⭐")
-            
             if not target_channel:
                 raise Exception("Не указан целевой канал для пересылки")
-            
-            # Инициализируем буферы для медиагрупп (уже сброшены выше)
-            # self._media_group_buffers[channel_id] = {}
-            # self._media_group_timeouts[channel_id] = {}
-            
-            # Отмечаем пересылку как активную
             self._forwarding_active[channel_id] = True
-            
-            # --- counters ---
             self._counters[channel_id] = self._counters.get(channel_id, {
                 'hashtag_paid_counter': 0,
                 'select_paid_counter': 0,
@@ -241,19 +226,13 @@ class TelegramForwarder:
                 self._media_group_timeouts[channel_id] = {}
             processed_groups = set()
             media_groups = self._media_group_buffers[channel_id]
-            
             logger.info(f"[FORWARDER] 🔄 Мониторинг запущен для канала {channel_name} -> {target_channel}")
-            
             forwarded_count = 0
-            
-            # --- Счётчики для режимов select/hashtag_select ---
             select_paid_counter = 0
             hashtag_paid_counter = 0
             media_group_paid_counter = 0
             media_group_hashtag_paid_counter = 0
-            
-            # Слушаем только исходный канал, НЕ целевой
-            @self._userbot.on_message(filters.chat(channel_id))
+            @userbot.on_message(filters.chat(channel_id))
             async def handle_new_message(client, message):
                 logger.info(f"[FORWARDER][HANDLER] Вызван handler для channel_id={channel_id}, message_id={getattr(message, 'id', None)}")
                 nonlocal forwarded_count, select_paid_counter, hashtag_paid_counter
@@ -1263,12 +1242,12 @@ class TelegramForwarder:
 
     async def start_forwarding_parsing(self, source_channel: str, target_channel: str, config: dict, callback: Optional[Callable] = None):
         """Запуск парсинга + пересылки (background task)"""
-        self._userbot = await self.get_userbot(task="parsing")
-        # Логируем путь к сессионному файлу
-        if hasattr(self._userbot, 'name'):
-            logger.info(f"[FORWARDER][PARSING] Используется сессионный файл: {self._userbot.name}")
-        if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
-            await self._userbot.start()
+        userbot = await self.get_userbot(task="parsing")
+        sessions = await self.session_manager.get_sessions_for_task("parsing") if self.session_manager else []
+        alias = sessions[0].alias if sessions else 'unknown'
+        logger.info(f"[FORWARDER][PARSING] Используется сессионный файл: {getattr(userbot, 'name', None)}, alias: {alias}, is_connected: {getattr(userbot, 'is_connected', None)}")
+        if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
+            await userbot.start()
         task_id = self.create_parse_forward_task(source_channel, target_channel, config)
         task_info = self._parse_forward_tasks[task_id]
         
@@ -1276,8 +1255,8 @@ class TelegramForwarder:
         async def run_parse_forward():
             try:
                 # ДОБАВЛЕНО: Проверка и запуск userbot внутри таска (на всякий случай)
-                if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
-                    await self._userbot.start()
+                if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
+                    await userbot.start()
                 logger.info(f"[FORWARDER] 🚀 ЗАПУСК ПАРСИНГА + ПЕРЕСЫЛКИ (НЕ МОНИТОРИНГА!)")
                 logger.info(f"[FORWARDER] Источник: {source_channel} -> Цель: {target_channel}")
                 logger.info(f"[FORWARDER] Конфигурация: {config}")
@@ -1286,9 +1265,9 @@ class TelegramForwarder:
                 
                 # Получаем информацию о канале
                 if str(source_channel).startswith("-100"):
-                    channel = await self._userbot.get_chat(int(source_channel))
+                    channel = await userbot.get_chat(int(source_channel))
                 else:
-                    channel = await self._userbot.get_chat(source_channel)
+                    channel = await userbot.get_chat(source_channel)
                 channel_id = channel.id
                 channel_name = channel.username or str(channel_id)
                 channel_title = getattr(channel, "title", None)
@@ -1343,7 +1322,7 @@ class TelegramForwarder:
                 all_messages = []
                 media_groups = {}
                 try:
-                    async for message in self._userbot.get_chat_history(channel_id, limit=1000):
+                    async for message in userbot.get_chat_history(channel_id, limit=1000):
                         try:
                             all_messages.append(message)
                             # Группируем сообщения по media_group_id

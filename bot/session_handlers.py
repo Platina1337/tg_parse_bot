@@ -104,10 +104,8 @@ async def add_session_callback(client, callback_query):
         await callback_query.answer(f"Ошибка: {e}", show_alert=True)
 
 async def assign_session_callback(client, callback_query):
-    """Callback for assigning a session to a task"""
     user_id = int(callback_query.from_user.id)
-    logger.info(f"[ASSIGN_SESSION_CALLBACK] user_id(from callback_query)={user_id}, ADMIN_IDS={ADMIN_IDS}")
-    
+    logger.info(f"[ASSIGN_SESSION_CALLBACK] Вызван assign_session_callback | user_id={user_id} | callback_data={callback_query.data}")
     # Check if user is admin
     if user_id not in ADMIN_IDS:
         await callback_query.answer("You don't have permission to manage sessions.", show_alert=True)
@@ -142,10 +140,8 @@ async def assign_session_callback(client, callback_query):
         await callback_query.answer(f"Error: {e}", show_alert=True)
 
 async def select_session_callback(client, callback_query):
-    """Callback for selecting a session"""
     user_id = int(callback_query.from_user.id)
-    logger.info(f"[SELECT_SESSION_CALLBACK] user_id(from callback_query)={user_id}, ADMIN_IDS={ADMIN_IDS}")
-    
+    logger.info(f"[SELECT_SESSION_CALLBACK] Вызван select_session_callback | user_id={user_id} | callback_data={callback_query.data}")
     # Check if user is admin
     if user_id not in ADMIN_IDS:
         await callback_query.answer("You don't have permission to manage sessions.", show_alert=True)
@@ -175,9 +171,8 @@ async def select_session_callback(client, callback_query):
     )
 
 async def assign_task_callback(client, callback_query):
-    """Callback for assigning a task to a session"""
     user_id = int(callback_query.from_user.id)
-    logger.info(f"[ASSIGN_TASK_CALLBACK] user_id(from callback_query)={user_id}, ADMIN_IDS={ADMIN_IDS}, callback_data={callback_query.data}")
+    logger.info(f"[ASSIGN_TASK_CALLBACK] Вызван assign_task_callback | user_id={user_id} | callback_data={callback_query.data}")
     parts = callback_query.data.split(":", 2)
     logger.info(f"[ASSIGN_TASK_CALLBACK] parts={parts}")
     

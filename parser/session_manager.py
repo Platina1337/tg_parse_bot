@@ -66,10 +66,12 @@ class SessionManager:
         session = await self.db.get_session_by_alias(alias)
         if not session:
             return {"success": False, "error": "Session not found"}
-        # Single-assignment mode: удаляем все старые назначения для этой задачи
-        all_sessions = await self.db.get_all_sessions()
-        for s in all_sessions:
-            await self.db.remove_session_assignment(s.id, task)
+        if task != 'reactions':
+            # Single-assignment mode: удаляем все старые назначения для этой задачи
+            all_sessions = await self.db.get_all_sessions()
+            for s in all_sessions:
+                await self.db.remove_session_assignment(s.id, task)
+        # Для reactions не удаляем прошлые назначения (можно несколько)
         await self.db.add_session_assignment(session.id, task)
         assignments = await self.get_assignments()
         return {"success": True, "alias": alias, "task": task, "assignments": assignments}
