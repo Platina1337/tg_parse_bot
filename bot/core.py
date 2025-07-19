@@ -14,14 +14,13 @@ from shared.models import ParseConfig, ParseMode, PostingSettings
 from bot.settings import get_user_settings, update_user_settings, clear_user_settings, get_user_templates, save_user_template, DB_PATH
 from bot.states import (
     user_states, FSM_MAIN_MENU,
-    FSM_AWAIT_MONITOR_CHANNEL, FSM_AWAIT_MONITOR_TARGET, FSM_AWAIT_MONITOR_STATUS,
     FSM_FORWARD_CHANNEL, FSM_FORWARD_TARGET, FSM_FORWARD_SETTINGS, FSM_FORWARD_HASHTAG,
     FSM_FORWARD_DELAY, FSM_FORWARD_FOOTER, FSM_FORWARD_TEXT_MODE, FSM_FORWARD_LIMIT,
     FSM_FORWARD_DIRECTION, FSM_FORWARD_MEDIA_FILTER, FSM_FORWARD_RANGE, FSM_FORWARD_RANGE_START, FSM_FORWARD_RANGE_END,
     get_main_keyboard, get_channel_history_keyboard, get_target_channel_history_keyboard,
     get_forwarding_keyboard, get_forwarding_settings_keyboard, get_parse_mode_keyboard, get_text_mode_keyboard,
     get_direction_keyboard, get_media_filter_keyboard, get_range_mode_keyboard,
-    get_monitor_settings_keyboard, posting_stats, start_forwarding_parsing_api, get_forwarding_history_stats_api, 
+    posting_stats, start_forwarding_parsing_api, get_forwarding_history_stats_api, 
     clear_forwarding_history_api, get_channel_info, get_target_channel_info
 )
 from bot.config import config
@@ -243,19 +242,7 @@ def format_forwarding_stats(stats: dict) -> str:
 🕐 Последняя активность: {stats.get('last_activity', 'N/A')}
 """
 
-async def check_monitoring_status(user_id, channel_id):
-    try:
-        async with httpx.AsyncClient() as client_api:
-            resp = await client_api.get(f"{config.PARSER_SERVICE_URL}/monitor/status/{channel_id}")
-            if resp.status_code == 200:
-                data = resp.json()
-                is_active = data.get("is_active", False)
-                started_at = data.get("started_at")
-                return f"Мониторинг {'запущен' if is_active else 'не запущен'} для канала {channel_id}." + (f"\nСтарт: {started_at}" if started_at else "")
-            else:
-                return f"Ошибка получения статуса мониторинга: {resp.text}"
-    except Exception as e:
-        return f"Ошибка при обращении к сервису мониторинга: {e}"
+
 
 async def get_actual_published_count(channel_id, target_channel_id):
     try:
@@ -291,28 +278,7 @@ def get_publish_stat_text(stats, publish_settings, published_count=None):
     )
     return stat_text
 
-def get_monitor_stat_text(stats, monitor_settings):
-    title = stats.get('channel_title') or str(stats.get('channel_id'))
-    stat_text = (
-        f"Канал: {title}\n"
-        f"ID: {stats.get('channel_id', '-') or '-'}\n"
-        f"Всего постов: {stats.get('total_posts', '-') or '-'}\n"
-        f"Спаршено: {stats.get('parsed_posts', '-') or '-'}\n"
-        f"Медиагрупп: {stats.get('parsed_media_groups', '-') or '-'}\n"
-        f"Одиночных: {stats.get('parsed_singles', '-') or '-'}\n"
-        f"ID диапазон: {stats.get('min_id', '-')} - {stats.get('max_id', '-') }\n"
-        f"Последний спаршенный: {stats.get('last_parsed_id', '-')} ({stats.get('last_parsed_date', '-')})\n"
-        f"Опубликовано: - сообщений\n"
-        f"\n"
-        f"Параметры мониторинга:\n"
-        f"Порядок: {monitor_settings.get('order', 'old_to_new')}\n"
-        f"Задержка: {monitor_settings.get('delay', 0)} сек\n"
-        f"Режим текста: {monitor_settings.get('text_mode', 'с текстом')}\n"
-        f"Приписка: {monitor_settings.get('footer', '-') or '-'}\n"
-        f"Удалять медиа: {'да' if monitor_settings.get('delete_media', True) else 'нет'}\n"
-        f"Лимит: {monitor_settings.get('max_posts', 0) or 'все'} сообщений\n"
-    )
-    return stat_text
+
 
 # --- Асинхронная инициализация БД при старте бота ---
 async def async_init():

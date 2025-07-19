@@ -181,10 +181,7 @@ async def stop_reaction_task_handler(client, callback_query):
     from bot.handlers import stop_reaction_task_callback
     await stop_reaction_task_callback(client, callback_query)
 
-@app.on_callback_query(filters.regex(r"^stop_monitoring:(.+):(.+)"))
-async def stop_monitoring_handler(client, callback_query):
-    from bot.handlers import stop_monitoring_callback
-    await stop_monitoring_callback(client, callback_query)
+
 
 @app.on_callback_query(filters.regex(r"^stop_all_tasks$"))
 async def stop_all_tasks_handler(client, callback_query):

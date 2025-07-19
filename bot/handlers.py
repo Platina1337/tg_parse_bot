@@ -14,19 +14,17 @@ from shared.models import ParseConfig, ParseMode, PostingSettings
 from bot.settings import get_user_settings, update_user_settings, clear_user_settings, get_user_templates, save_user_template, DB_PATH
 from bot.states import (
     user_states, FSM_MAIN_MENU,
-    FSM_AWAIT_MONITOR_CHANNEL, FSM_AWAIT_MONITOR_TARGET, FSM_AWAIT_MONITOR_STATUS,
     FSM_FORWARD_CHANNEL, FSM_FORWARD_TARGET, FSM_FORWARD_SETTINGS, FSM_FORWARD_HASHTAG,
     FSM_FORWARD_DELAY, FSM_FORWARD_FOOTER, FSM_FORWARD_FOOTER_LINK, FSM_FORWARD_FOOTER_LINK_TEXT, FSM_FORWARD_TEXT_MODE, FSM_FORWARD_LIMIT,
     FSM_FORWARD_DIRECTION, FSM_FORWARD_MEDIA_FILTER, FSM_FORWARD_RANGE, FSM_FORWARD_RANGE_START, FSM_FORWARD_RANGE_END,
     get_main_keyboard, get_channel_history_keyboard, get_target_channel_history_keyboard,
     get_forwarding_keyboard, get_forwarding_settings_keyboard, get_parse_mode_keyboard, get_text_mode_keyboard,
     get_direction_keyboard, get_media_filter_keyboard, get_range_mode_keyboard,
-    get_monitor_settings_keyboard, posting_stats, start_forwarding_parsing_api, get_forwarding_history_stats_api, 
+    posting_stats, start_forwarding_parsing_api, get_forwarding_history_stats_api, 
     clear_forwarding_history_api, get_channel_info, get_target_channel_info,
     get_stop_last_task_inline_keyboard, get_forwarding_inline_keyboard,
      format_channel_stats, format_forwarding_stats,
     start_forwarding_api, stop_forwarding_api, get_forwarding_stats_api, save_forwarding_config_api,
-    check_monitoring_status, get_monitor_stat_text,
     start_forwarding_parsing_api, get_forwarding_history_stats_api, clear_forwarding_history_api,
     get_channel_info, get_target_channel_info,
     FSM_REACTION_CHANNEL, FSM_REACTION_SETTINGS, FSM_REACTION_EMOJIS, FSM_REACTION_MODE, FSM_REACTION_HASHTAG, FSM_REACTION_DATE, FSM_REACTION_DATE_RANGE, FSM_REACTION_COUNT, FSM_REACTION_CONFIRM,
@@ -35,7 +33,6 @@ from bot.states import (
 from bot.config import config
 from bot.core import (
     show_main_menu, start_forwarding_api, stop_forwarding_api, get_forwarding_stats_api, save_forwarding_config_api,
-    check_monitoring_status, get_monitor_stat_text,
     start_forwarding_parsing_api, get_forwarding_history_stats_api, clear_forwarding_history_api,
     get_channel_info, get_target_channel_info
 )
@@ -130,44 +127,7 @@ async def text_handler(client: Client, message: Message):
     if state == FSM_MAIN_MENU or state is None:
         print(f"[FSM][DEBUG] MAIN_MENU | text='{text}'")
 
-        if text in ["Мониторить канал", "📡 Мониторить канал"]:
-            kb = await get_channel_history_keyboard(user_id)
-            sent = await message.reply("Введите ссылку или ID канала для мониторинга:", reply_markup=kb or ReplyKeyboardRemove())
-            if last_msg_id:
-                try:
-                    await client.delete_messages(message.chat.id, last_msg_id)
-                except Exception:
-                    pass
-            if sent is not None:
-                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_AWAIT_MONITOR_CHANNEL, "last_msg_id": sent.id}
-            else:
-                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_AWAIT_MONITOR_CHANNEL}
-            return
-        elif text in ["Остановить мониторинг", "⛔ Остановить мониторинг"]:
-            monitorings = await api_client.get_user_monitorings(user_id)
-            if not monitorings:
-                sent = await message.reply("У вас нет активных мониторингов.", reply_markup=get_main_keyboard())
-            else:
-                user_channels = {ch['id']: ch['title'] for ch in await api_client.get_user_channels(user_id)}
-                user_targets = {ch['id']: ch['title'] for ch in await api_client.get_user_target_channels(user_id)}
-                msg = "Ваши активные мониторинги:\n"
-                for m in monitorings:
-                    src_title = user_channels.get(m['channel_id'], m['channel_id'])
-                    tgt_title = user_targets.get(m['target_channel'], m['target_channel'])
-                    msg += f"\nИз {src_title} в {tgt_title} (с {m['created_at']})"
-                sent = await message.reply(msg, reply_markup=get_main_keyboard())
-            last_msg_id = user_states.get(user_id, {}).get("last_msg_id")
-            if last_msg_id:
-                try:
-                    await client.delete_messages(message.chat.id, last_msg_id)
-                except Exception:
-                    pass
-            if sent is not None:
-                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_MAIN_MENU, "last_msg_id": sent.id}
-            else:
-                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_MAIN_MENU}
-            return
-        elif text in ["📊 Статус задач"]:
+        if text in ["📊 Статус задач"]:
             await monitorings_command(client, message)
             return
         elif text in ["Пересылка ⭐", "⭐ Пересылка"]:
@@ -210,14 +170,17 @@ async def text_handler(client: Client, message: Message):
         if text == "Назад":
             await show_main_menu(client, message, "Выберите действие:")
             return
-        match = re.match(r"(.+) \(ID: (-?\d+)\)", text)
+        match = re.match(r"(.+) \(ID: (-?\d+)(?:, @(\w+))?\)", text)
         if match:
             channel_title = match.group(1)
             channel_id = match.group(2)
+            username = match.group(3)
             channel_link = channel_id
             await api_client.update_user_channel_last_used(user_id, channel_id)
             user_states[user_id]["forward_channel_id"] = int(channel_id)
             user_states[user_id]["forward_channel_title"] = channel_title
+            if username:
+                user_states[user_id]["forward_channel_username"] = username
         else:
             # --- Новый вариант: нормализация ---
             channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
@@ -228,24 +191,35 @@ async def text_handler(client: Client, message: Message):
             except (ValueError, TypeError):
                 # channel_id не приводится к int, пробуем получить через get_channel_stats
                 stats = await api_client.get_channel_stats(channel_id)
-                real_id = stats.get("channel_id")
+                real_id = stats.get("id")  # Используем id из ответа API
                 try:
                     real_id = int(real_id)
                 except (ValueError, TypeError):
-                    # Попробуем получить id из stats['id'] (pyrogram)
-                    real_id = stats.get("id")
-                    try:
-                        real_id = int(real_id)
-                    except (ValueError, TypeError):
-                        real_id = None
+                    real_id = None
+            
             if real_id is None:
                 sent = await message.reply("❌ Не удалось определить ID канала. Введите корректный username или ID.", reply_markup=ReplyKeyboardRemove())
                 if sent is not None:
                     user_states[user_id]["last_msg_id"] = sent.id
                 return
-            user_states[user_id]["forward_channel_id"] = real_id
+            
+            # Определяем, что ввел пользователь: username или ID
+            is_username = not text.startswith("-100") and not text.isdigit()
+            
+            # Сохраняем в БД правильно
+            if is_username:
+                # Пользователь ввел username, сохраняем username в поле username, а ID в поле channel_id
+                await api_client.add_user_channel(user_id, str(real_id), channel_title, text)
+                user_states[user_id]["forward_channel_id"] = real_id
+                user_states[user_id]["forward_channel_username"] = text  # username
+            else:
+                # Пользователь ввел ID, сохраняем ID в поле channel_id, а username в поле username
+                await api_client.add_user_channel(user_id, str(real_id), channel_title, channel_username)
+                user_states[user_id]["forward_channel_id"] = real_id
+                if channel_username:
+                    user_states[user_id]["forward_channel_username"] = channel_username
+            
             user_states[user_id]["forward_channel_title"] = channel_title
-            await api_client.add_user_channel(user_id, str(real_id), channel_title)
         # --- ДОБАВЛЕНО: media_filter по умолчанию ---
         if "forward_settings" not in user_states[user_id]:
             user_states[user_id]["forward_settings"] = {}
@@ -269,18 +243,44 @@ async def text_handler(client: Client, message: Message):
                 user_states[user_id]["last_msg_id"] = sent.id
             user_states[user_id]["state"] = FSM_FORWARD_CHANNEL
             return
-        match = re.match(r"(.+) \(ID: (-?\d+)\)", text)
+        match = re.match(r"(.+) \(ID: (-?\d+)(?:, @(\w+))?\)", text)
         if match:
             channel_title = match.group(1)
             channel_id = match.group(2)
+            username = match.group(3)
             user_states[user_id]["forward_target_channel"] = channel_id
             user_states[user_id]["forward_target_title"] = channel_title
+            if username:
+                user_states[user_id]["forward_target_username"] = username
             await api_client.update_user_target_channel_last_used(user_id, channel_id)
         else:
             channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
-            user_states[user_id]["forward_target_channel"] = channel_id
+            
+            # Определяем, что ввел пользователь: username или ID
+            is_username = not text.startswith("-100") and not text.isdigit()
+            
+            # Получаем реальный ID из API
+            stats = await api_client.get_channel_stats(channel_id)
+            real_id = stats.get("id", channel_id)
+            try:
+                real_id = int(real_id)
+            except (ValueError, TypeError):
+                real_id = channel_id
+            
+            # Сохраняем в БД правильно
+            if is_username:
+                # Пользователь ввел username, сохраняем username в поле username, а ID в поле channel_id
+                await api_client.add_user_target_channel(user_id, str(real_id), channel_title, text)
+                user_states[user_id]["forward_target_channel"] = real_id
+                user_states[user_id]["forward_target_username"] = text  # username
+            else:
+                # Пользователь ввел ID, сохраняем ID в поле channel_id, а username в поле username
+                await api_client.add_user_target_channel(user_id, str(real_id), channel_title, channel_username)
+                user_states[user_id]["forward_target_channel"] = real_id
+                if channel_username:
+                    user_states[user_id]["forward_target_username"] = channel_username
+            
             user_states[user_id]["forward_target_title"] = channel_title
-            await api_client.add_user_target_channel(user_id, channel_id, channel_title)
         user_states[user_id]['forward_settings'] = {
             'parse_mode': 'all',
             'hashtag_filter': None,
@@ -320,176 +320,7 @@ async def text_handler(client: Client, message: Message):
             reply_markup=get_forwarding_keyboard(channel_id, target_channel)
         )
 
-    # --- FSM: Мониторинг ---
-    if state == FSM_AWAIT_MONITOR_CHANNEL:
-        print(f"[FSM][DEBUG] FSM_AWAIT_MONITOR_CHANNEL | text='{text}'")
-        if text == "Назад":
-            await show_main_menu(client, message, "Выберите действие:")
-            return
-        match = re.match(r"(.+) \(ID: (-?\d+)\)", text)
-        if match:
-            channel_title = match.group(1)
-            channel_id = match.group(2)
-            channel_link = channel_id
-            await api_client.update_user_channel_last_used(user_id, channel_id)
-            user_states[user_id]["monitor_channel_id"] = int(channel_id)
-            user_states[user_id]["monitor_channel_title"] = channel_title
-        else:
-            # --- Новый вариант: нормализация ---
-            channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
-            user_states[user_id]["monitor_channel_id"] = channel_id
-            user_states[user_id]["monitor_channel_title"] = channel_title
-            await api_client.add_user_channel(user_id, channel_id, channel_title)
-        # Переход к выбору целевого канала
-        kb = await get_target_channel_history_keyboard(user_id)
-        sent = await message.reply("Выберите целевой канал для мониторинга:", reply_markup=kb or ReplyKeyboardRemove())
-        if sent is not None:
-            user_states[user_id]["last_msg_id"] = sent.id
-        user_states[user_id]["state"] = FSM_AWAIT_MONITOR_TARGET
-        return
 
-    if state == FSM_AWAIT_MONITOR_TARGET:
-        print(f"[FSM][DEBUG] FSM_AWAIT_MONITOR_TARGET | text='{text}'")
-        if text == "Назад":
-            kb = await get_channel_history_keyboard(user_id)
-            sent = await message.reply("Выберите канал для мониторинга:", reply_markup=kb or ReplyKeyboardRemove())
-            if sent is not None:
-                user_states[user_id]["last_msg_id"] = sent.id
-            user_states[user_id]["state"] = FSM_AWAIT_MONITOR_CHANNEL
-            return
-        match = re.match(r"(.+) \(ID: (-?\d+)\)", text)
-        if match:
-            channel_title = match.group(1)
-            channel_id = match.group(2)
-            channel_link = channel_id
-            await api_client.update_user_channel_last_used(user_id, channel_id)
-            user_states[user_id]["monitor_target_id"] = int(channel_id)
-            user_states[user_id]["monitor_target_title"] = channel_title
-        else:
-            # --- Новый вариант: нормализация ---
-            channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
-            user_states[user_id]["monitor_target_id"] = channel_id
-            user_states[user_id]["monitor_target_title"] = channel_title
-            await api_client.add_user_channel(user_id, channel_id, channel_title)
-        # Показываем статистику и меню управления мониторингом
-        try:
-            stats = await api_client.get_channel_stats(str(user_states[user_id]['monitor_channel_id']))
-            stat_text = get_monitor_stat_text(stats, user_states[user_id].get('monitor_settings', {}))
-            kb = ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton("🟢 Запустить мониторинг")],
-                    [KeyboardButton("🔴 Остановить мониторинг")],
-                    [KeyboardButton("⚙️ Настройки")],
-                    [KeyboardButton("📊 Статистика")],
-                    [KeyboardButton("🔙 Назад")],
-                ],
-                resize_keyboard=True
-            )
-            sent_stat = await message.reply(f"{stat_text}\n\nВыберите действие:", reply_markup=kb)
-            if sent_stat is not None:
-                user_states[user_id]["last_msg_id"] = sent_stat.id
-            user_states[user_id]["state"] = FSM_AWAIT_MONITOR_STATUS
-            return
-        except Exception as e:
-            sent = await message.reply(f"Ошибка при получении статистики: {e}", reply_markup=get_main_keyboard())
-            last_msg_id = user_states.get(user_id, {}).get("last_msg_id")
-            if last_msg_id:
-                try:
-                    await client.delete_messages(message.chat.id, last_msg_id)
-                except Exception:
-                    pass
-            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_MAIN_MENU, "last_msg_id": sent.id}
-            return
-        return
-
-    if state == FSM_AWAIT_MONITOR_STATUS:
-        print(f"[FSM][DEBUG] FSM_AWAIT_MONITOR_STATUS | text='{text}'")
-        if text == "🔙 Назад":
-            await show_main_menu(client, message, "Выберите действие:")
-            return
-        if text == "🟢 Запустить мониторинг":
-            # Запуск мониторинга через API
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client_api:
-                    resp = await client_api.post(
-                        f"{config.PARSER_SERVICE_URL}/monitor/start",
-                        json={
-                            "source_channel_id": user_states[user_id]["monitor_channel_id"],
-                            "target_channel_id": user_states[user_id]["monitor_target_id"],
-                            "settings": user_states[user_id].get('monitor_settings', {})
-                        }
-                    )
-                if resp.status_code == 200:
-                    sent = await message.reply("Мониторинг запущен!", reply_markup=get_main_keyboard())
-                else:
-                    sent = await message.reply(f"Ошибка запуска мониторинга: {resp.status_code} {resp.text}", reply_markup=get_main_keyboard())
-            except Exception as e:
-                sent = await message.reply(f"Ошибка при запуске мониторинга: {e}", reply_markup=get_main_keyboard())
-            try:
-                await client.delete_messages(message.chat.id, last_msg_id)
-            except Exception:
-                pass
-            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_MAIN_MENU, "last_msg_id": sent.id}
-            return
-        elif text == "🔴 Остановить мониторинг":
-            # Остановка мониторинга через API
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client_api:
-                    resp = await client_api.post(
-                        f"{config.PARSER_SERVICE_URL}/monitor/stop",
-                        json={
-                            "source_channel_id": user_states[user_id]["monitor_channel_id"],
-                            "target_channel_id": user_states[user_id]["monitor_target_id"]
-                        }
-                    )
-                if resp.status_code == 200:
-                    sent = await message.reply("Мониторинг остановлен!", reply_markup=get_main_keyboard())
-                else:
-                    sent = await message.reply(f"Ошибка остановки мониторинга: {resp.status_code} {resp.text}", reply_markup=get_main_keyboard())
-            except Exception as e:
-                sent = await message.reply(f"Ошибка при остановке мониторинга: {e}", reply_markup=get_main_keyboard())
-            try:
-                await client.delete_messages(message.chat.id, last_msg_id)
-            except Exception:
-                pass
-            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_MAIN_MENU, "last_msg_id": sent.id}
-            return
-        elif text == "⚙️ Настройки":
-            # Показать настройки мониторинга
-            settings = user_states[user_id].get('monitor_settings', {})
-            settings_text = f"Настройки мониторинга:\n\n"
-            settings_text += f"Задержка: {settings.get('delay', 0)} сек\n"
-            settings_text += f"Фильтр по хештегам: {settings.get('hashtag_filter', 'Нет')}\n"
-            settings_text += f"Добавлять приписку: {settings.get('add_footer', False)}\n"
-            settings_text += f"Приписка: {settings.get('footer_text', '')}\n"
-            sent = await message.reply(settings_text, reply_markup=get_main_keyboard())
-            try:
-                await client.delete_messages(message.chat.id, last_msg_id)
-            except Exception:
-                pass
-            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_MAIN_MENU, "last_msg_id": sent.id}
-            return
-        elif text == "📊 Статистика":
-            # Показать статистику мониторинга
-            try:
-                stats = await api_client.get_monitor_stats(user_states[user_id]['monitor_channel_id'], user_states[user_id]['monitor_target_id'])
-                stat_text = f"Статистика мониторинга:\n\n"
-                stat_text += f"Обработано сообщений: {stats.get('processed', 0)}\n"
-                stat_text += f"Переслано: {stats.get('forwarded', 0)}\n"
-                stat_text += f"Пропущено: {stats.get('skipped', 0)}\n"
-                stat_text += f"Последняя активность: {stats.get('last_activity', 'Нет')}\n"
-                sent = await message.reply(stat_text, reply_markup=get_main_keyboard())
-            except Exception as e:
-                sent = await message.reply(f"Ошибка получения статистики: {e}", reply_markup=get_main_keyboard())
-            try:
-                await client.delete_messages(message.chat.id, last_msg_id)
-            except Exception:
-                pass
-            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_MAIN_MENU, "last_msg_id": sent.id}
-            return
-        else:
-            await message.reply("Пожалуйста, выберите действие с помощью кнопок.")
-            return
 
 
 
@@ -1335,6 +1166,8 @@ async def forwarding_callback_handler(client, callback_query):
             "paid_content_hashtag": settings.get('paid_content_hashtag'),
             "paid_content_every": settings.get('paid_content_every'),
             "paid_content_chance": settings.get('paid_content_chance'),
+            "source_channel_username": user_states[user_id].get('forward_channel_username'),
+            "target_channel_username": user_states[user_id].get('forward_target_username'),
         }
         logger.info(f"[DEBUG][MONITOR] Итоговый monitor_config: {monitor_config}")
         logger.info(f"[BOT][MONITOR] Отправляю запрос на мониторинг: {monitor_config}")
@@ -1369,7 +1202,7 @@ async def forwarding_callback_handler(client, callback_query):
             'mode': publish_settings.get('mode', 'все'),
             'footer': publish_settings.get('footer', ''),
             'max_posts': publish_settings.get('max_posts', 0),
-            'parse_mode': publish_settings.get('parse_mode', 'HTML'),
+            'parse_mode': publish_settings.get('parse_mode', 'html'),
             'disable_web_page_preview': publish_settings.get('disable_web_page_preview', False),
             'disable_notification': publish_settings.get('disable_notification', False),
             'protect_content': publish_settings.get('protect_content', False),
@@ -2358,7 +2191,7 @@ async def resolve_channel(api_client, text):
     stats = await api_client.get_channel_stats(text)
     if stats and stats.get("id"):
         return stats["id"], stats.get("title", ""), stats.get("username", "")
-    return None, text, ""
+    return text, text, ""  # Возвращаем исходный текст как fallback
 
 def format_channel(cfg, channel_id_key="channel_id", title_key="channel_title", username_key="username"):
     channel_id = cfg.get(channel_id_key) or cfg.get("source_channel") or cfg.get("target_channel")
@@ -2554,13 +2387,13 @@ async def send_or_edit_status_message(message=None, callback_query=None, back_to
     logger.info(f"[STATUS_UNIFIED] Итоговое сообщение: {msg}")
     try:
         if callback_query:
-            await callback_query.edit_message_text(msg, reply_markup=keyboard, parse_mode="HTML")
+            await callback_query.edit_message_text(msg, reply_markup=keyboard, parse_mode="html")
         elif message:
-            await message.reply(msg, reply_markup=keyboard, parse_mode="HTML")
+            await message.reply(msg, reply_markup=keyboard, parse_mode="html")
     except MessageNotModified:
         logger.warning("[STATUS_UNIFIED] MESSAGE_NOT_MODIFIED: текст не изменился")
     except Exception as e:
-        logger.error(f"[STATUS_UNIFIED] Ошибка при отправке/редактировании с parse_mode=HTML: {e}")
+        logger.error(f"[STATUS_UNIFIED] Ошибка при отправке/редактировании с parse_mode=html: {e}")
         try:
             if callback_query:
                 await callback_query.edit_message_text(msg, reply_markup=keyboard)

@@ -5,7 +5,12 @@ from typing import ClassVar, List
 
 # Определяем, какой .env файл использовать
 env_file = os.getenv("ENV_FILE", ".env")
-load_dotenv(env_file)
+# Загружаем .env файл только если он существует
+if os.path.exists(env_file):
+    load_dotenv(env_file)
+else:
+    # Если .env файл не найден, загружаем переменные окружения из системы
+    pass
 
 class BotConfig(BaseSettings):
     # Telegram API credentials

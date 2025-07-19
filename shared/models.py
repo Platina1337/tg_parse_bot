@@ -104,7 +104,7 @@ class PostingSettings(BaseModel):
     mode: Optional[str] = None       # Режим публикации ("все", "media", "text")
     footer: Optional[str] = None     # Приписка
     max_posts: Optional[int] = None  # Лимит сообщений
-    parse_mode: str = "HTML"  # Режим форматирования текста
+    parse_mode: str = "html"  # Режим форматирования текста
     disable_web_page_preview: bool = False
     disable_notification: bool = False
     protect_content: bool = False
@@ -145,7 +145,7 @@ class PostingConfig(BaseModel):
     mode: Optional[str] = None
     footer: Optional[str] = None
     max_posts: Optional[int] = None
-    parse_mode: str = "HTML"  # Режим форматирования текста
+    parse_mode: str = "html"  # Режим форматирования текста
     disable_web_page_preview: bool = False
     disable_notification: bool = False
     protect_content: bool = False

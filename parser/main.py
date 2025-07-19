@@ -79,14 +79,14 @@ class ForwardingConfigRequest(BaseModel):
 class ChannelRequest(BaseModel):
     channel_id: str
     channel_title: str
+    username: Optional[str] = None
 
 class TargetChannelRequest(BaseModel):
     channel_id: str
     channel_title: str
+    username: Optional[str] = None
 
-class MonitoringRequest(BaseModel):
-    channel_id: str
-    target_channel: str
+
 
 class PostingTemplateRequest(BaseModel):
     name: str
@@ -116,7 +116,7 @@ async def startup_event():
     await db.init()
     # Сбросить все мониторинги в неактивные (на случай падения/рестарта)
     async with aiosqlite.connect('parser.db') as conn:
-        await conn.execute("UPDATE user_monitorings SET is_active = FALSE")
+
         await conn.execute("UPDATE parse_configs SET is_active = FALSE")
         await conn.commit()
     logger.info("Parser service started")
@@ -218,7 +218,7 @@ async def get_channel_last_message(channel_id: str):
         try:
             # Получаем историю сообщений (только 1 сообщение, самое новое)
             messages = []
-            async for message in forwarder.userbot.get_chat_history(channel_id_typed, limit=1):
+            async for message in userbot.get_chat_history(channel_id_typed, limit=1):
                 messages.append(message)
                 break  # Берем только первое (самое новое)
             
@@ -390,7 +390,7 @@ async def get_channel_stats(channel_id: str):
         try:
             # Получаем историю сообщений (только 1 сообщение, самое новое)
             messages = []
-            async for message in forwarder.userbot.get_chat_history(channel_id_typed, limit=1):
+            async for message in userbot.get_chat_history(channel_id_typed, limit=1):
                 messages.append(message)
                 break  # Берем только первое (самое новое)
             
@@ -422,14 +422,16 @@ async def get_channel_stats(channel_id: str):
         # Сохраняем информацию о канале в БД
         logger.info(f"[API] Сохраняем информацию о канале в БД")
         try:
+            # Используем правильный ID канала
+            correct_channel_id = str(chat.id) if hasattr(chat, 'id') else str(channel_id_typed)
             await db.conn.execute(
                 """INSERT OR REPLACE INTO channel_info 
                    (channel_id, channel_title, username, total_posts, is_public, last_updated, last_message_id) 
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (str(channel_id_typed), channel_title, username, total_posts, is_public, datetime.now().isoformat(), last_message_id)
+                (correct_channel_id, channel_title, username, total_posts, is_public, datetime.now().isoformat(), last_message_id)
             )
             await db.conn.commit()
-            logger.info(f"[API] Сохранена информация о канале в БД")
+            logger.info(f"[API] Сохранена информация о канале в БД с ID: {correct_channel_id}")
         except Exception as e:
             logger.warning(f"[API] Не удалось сохранить информацию о канале в БД: {e}")
         
@@ -437,7 +439,7 @@ async def get_channel_stats(channel_id: str):
         
         return {
             "status": "success",
-            "channel_id": channel_id_typed,
+            "channel_id": str(chat.id) if hasattr(chat, 'id') else str(channel_id_typed),  # Используем ID из chat объекта
             "channel_title": channel_title,
             "username": username,
             "total_posts": total_posts,
@@ -608,7 +610,7 @@ async def save_forwarding_config(config: ForwardingConfigRequest):
         global forwarder
         if forwarder is None:
             forwarder = TelegramForwarder(db_instance=db)
-        userbot = forwarder.userbot
+        userbot = await forwarder.get_userbot()
         new_config = config.dict()
         for field in ["source_channel_id", "target_channel_id"]:
             val = new_config[field]
@@ -773,12 +775,24 @@ async def add_user_channel(user_id: int, request: ChannelRequest):
     try:
         forwarder = get_or_create_forwarder()
         try:
-            chat = await forwarder.userbot.get_chat(request.channel_id)
+            userbot = await forwarder.get_userbot()
+            chat = await userbot.get_chat(request.channel_id)
             channel_title = getattr(chat, 'title', None) or request.channel_title
+            username = getattr(chat, 'username', None)
         except Exception as e:
             logger.warning(f"[API][add_user_channel] Не удалось получить канал {request.channel_id}: {e}")
             raise HTTPException(status_code=400, detail="Канал не найден или недоступен")
-        await db.add_user_channel(user_id, str(chat.id), channel_title)
+        
+        # Определяем, что передал клиент: username или ID
+        is_username = not request.channel_id.startswith("-100") and not request.channel_id.isdigit()
+        
+        if is_username:
+            # Клиент передал username, сохраняем username в поле username, а ID в поле channel_id
+            await db.add_user_channel(user_id, str(chat.id), channel_title, request.channel_id)
+        else:
+            # Клиент передал ID, сохраняем ID в поле channel_id, а username в поле username
+            await db.add_user_channel(user_id, str(chat.id), channel_title, username)
+        
         return {"status": "success"}
     except HTTPException:
         raise
@@ -822,12 +836,24 @@ async def add_user_target_channel(user_id: int, request: TargetChannelRequest):
     try:
         forwarder = get_or_create_forwarder()
         try:
-            chat = await forwarder.userbot.get_chat(request.channel_id)
+            userbot = await forwarder.get_userbot()
+            chat = await userbot.get_chat(request.channel_id)
             channel_title = getattr(chat, 'title', None) or request.channel_title
+            username = getattr(chat, 'username', None)
         except Exception as e:
             logger.warning(f"[API][add_user_target_channel] Не удалось получить канал {request.channel_id}: {e}")
             raise HTTPException(status_code=400, detail="Канал не найден или недоступен")
-        await db.add_user_target_channel(user_id, str(chat.id), channel_title)
+        
+        # Определяем, что передал клиент: username или ID
+        is_username = not request.channel_id.startswith("-100") and not request.channel_id.isdigit()
+        
+        if is_username:
+            # Клиент передал username, сохраняем username в поле username, а ID в поле channel_id
+            await db.add_user_target_channel(user_id, str(chat.id), channel_title, request.channel_id)
+        else:
+            # Клиент передал ID, сохраняем ID в поле channel_id, а username в поле username
+            await db.add_user_target_channel(user_id, str(chat.id), channel_title, username)
+        
         return {"status": "success"}
     except HTTPException:
         raise
@@ -855,35 +881,7 @@ async def remove_user_target_channel(user_id: int, channel_id: str):
         logger.error(f"Error removing user target channel: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/user/monitorings/{user_id}")
-async def get_user_monitorings(user_id: int):
-    """Получить активные мониторинги пользователя"""
-    try:
-        monitorings = await db.get_active_monitorings_by_user(user_id)
-        return {"status": "success", "monitorings": monitorings}
-    except Exception as e:
-        logger.error(f"Error getting user monitorings: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/user/monitorings/{user_id}")
-async def add_user_monitoring(user_id: int, request: MonitoringRequest):
-    """Добавить мониторинг пользователя"""
-    try:
-        await db.add_user_monitoring(user_id, request.channel_id, request.target_channel)
-        return {"status": "success"}
-    except Exception as e:
-        logger.error(f"Error adding user monitoring: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/user/monitorings/{user_id}")
-async def deactivate_user_monitoring(user_id: int, request: MonitoringRequest):
-    """Деактивировать мониторинг пользователя"""
-    try:
-        await db.deactivate_user_monitoring(user_id, request.channel_id, request.target_channel)
-        return {"status": "success"}
-    except Exception as e:
-        logger.error(f"Error deactivating user monitoring: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/user/posting-templates/{user_id}")
 async def get_user_posting_templates(user_id: int):
@@ -976,24 +974,7 @@ async def delete_navigation_message_id(channel_id: str):
         logger.error(f"Error deleting navigation message ID: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/monitor/stats/{channel_id}/{target_channel}")
-async def get_monitor_stats(channel_id: int, target_channel: str):
-    """Получить статистику мониторинга"""
-    try:
-        # Здесь можно добавить логику получения статистики мониторинга
-        # Пока возвращаем базовую статистику
-        return {
-            "status": "success",
-            "stats": {
-                "processed": 0,
-                "forwarded": 0,
-                "skipped": 0,
-                "last_activity": "Нет"
-            }
-        }
-    except Exception as e:
-        logger.error(f"Error getting monitor stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+
 
 # --- Эндпоинты для пересылки ---
 

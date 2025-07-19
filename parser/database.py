@@ -62,6 +62,7 @@ class Database:
                         user_id INTEGER,
                         channel_id TEXT,
                         channel_title TEXT,
+                        username TEXT,
                         last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (user_id, channel_id)
                     )
@@ -73,23 +74,13 @@ class Database:
                         user_id INTEGER,
                         channel_id TEXT,
                         channel_title TEXT,
+                        username TEXT,
                         last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (user_id, channel_id)
                     )
                 """)
                 
-                # Таблица для хранения активных мониторингов
-                await cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS user_monitorings (
-                        user_id INTEGER,
-                        channel_id TEXT,
-                        target_channel TEXT,
-                        config TEXT, -- JSON с настройками
-                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        PRIMARY KEY (user_id, channel_id, target_channel)
-                    )
-                """)
+
                 
                 # Таблица для хранения опубликованных постов
                 await cursor.execute("""
@@ -169,7 +160,7 @@ class Database:
                 await cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_groups_channel ON media_groups(channel_id)")
                 await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_channels_user ON user_channels(user_id)")
                 await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_target_channels_user ON user_target_channels(user_id)")
-                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_monitorings_user ON user_monitorings(user_id)")
+
 
             # Проверяем, нужно ли добавить поле last_message_id в таблицу channel_info
             async with self.conn.execute("PRAGMA table_info(channel_info)") as cursor:
@@ -177,6 +168,22 @@ class Database:
                 if "last_message_id" not in columns:
                     logger.info("Добавляем столбец last_message_id в таблицу channel_info")
                     await self.conn.execute("ALTER TABLE channel_info ADD COLUMN last_message_id INTEGER")
+                    await self.conn.commit()
+
+            # Проверяем, нужно ли добавить поле username в таблицу user_channels
+            async with self.conn.execute("PRAGMA table_info(user_channels)") as cursor:
+                columns = [row[1] async for row in cursor]
+                if "username" not in columns:
+                    logger.info("Добавляем столбец username в таблицу user_channels")
+                    await self.conn.execute("ALTER TABLE user_channels ADD COLUMN username TEXT")
+                    await self.conn.commit()
+
+            # Проверяем, нужно ли добавить поле username в таблицу user_target_channels
+            async with self.conn.execute("PRAGMA table_info(user_target_channels)") as cursor:
+                columns = [row[1] async for row in cursor]
+                if "username" not in columns:
+                    logger.info("Добавляем столбец username в таблицу user_target_channels")
+                    await self.conn.execute("ALTER TABLE user_target_channels ADD COLUMN username TEXT")
                     await self.conn.commit()
 
             # Предзаполняем кэш для часто используемых каналов
@@ -447,17 +454,17 @@ class Database:
             raise
 
     async def get_user_channels(self, user_id: int) -> list:
-        """Получить историю каналов пользователя (список каналов с id и title, отсортировано по последнему использованию)"""
+        """Получить историю каналов пользователя (список каналов с id, title и username, отсортировано по последнему использованию)"""
         logger.debug(f"[get_user_channels] user_id={user_id}")
         try:
             if self.conn is None:
                 await self.init()
             async with self.conn.execute(
-                "SELECT channel_id, channel_title FROM user_channels WHERE user_id = ? ORDER BY last_used DESC",
+                "SELECT channel_id, channel_title, username FROM user_channels WHERE user_id = ? ORDER BY last_used DESC",
                 (user_id,)
             ) as cursor:
                 result = [
-                    {"id": row[0], "title": row[1]} async for row in cursor
+                    {"id": row[0], "title": row[1], "username": row[2]} async for row in cursor
                 ]
                 logger.debug(f"[get_user_channels] result={result}")
                 return result
@@ -465,14 +472,14 @@ class Database:
             logger.error(f"[get_user_channels] Ошибка: {e}")
             raise
 
-    async def add_user_channel(self, user_id: int, channel_id: str, channel_title: str):
-        """Добавить канал в историю пользователя или обновить его название и время использования"""
-        logger.debug(f"[add_user_channel] user_id={user_id}, channel_id={channel_id}, channel_title={channel_title}")
+    async def add_user_channel(self, user_id: int, channel_id: str, channel_title: str, username: str = None):
+        """Добавить канал в историю пользователя или обновить его название, username и время использования"""
+        logger.debug(f"[add_user_channel] user_id={user_id}, channel_id={channel_id}, channel_title={channel_title}, username={username}")
         try:
             await self.conn.execute(
-                "INSERT INTO user_channels (user_id, channel_id, channel_title, last_used) VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
-                "ON CONFLICT(user_id, channel_id) DO UPDATE SET channel_title=excluded.channel_title, last_used=CURRENT_TIMESTAMP",
-                (user_id, channel_id, channel_title)
+                "INSERT INTO user_channels (user_id, channel_id, channel_title, username, last_used) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(user_id, channel_id) DO UPDATE SET channel_title=excluded.channel_title, username=excluded.username, last_used=CURRENT_TIMESTAMP",
+                (user_id, channel_id, channel_title, username)
             )
             await self.conn.commit()
             logger.debug("[add_user_channel] Коммит выполнен")
@@ -510,26 +517,26 @@ class Database:
 
     async def get_user_target_channels(self, user_id: int) -> list:
         """
-        Получить историю целевых каналов пользователя (список каналов с id и title, отсортировано по последнему использованию)
+        Получить историю целевых каналов пользователя (список каналов с id, title и username, отсортировано по последнему использованию)
         """
         if self.conn is None:
             await self.init()
         async with self.conn.execute(
-            "SELECT channel_id, channel_title FROM user_target_channels WHERE user_id = ? ORDER BY last_used DESC",
+            "SELECT channel_id, channel_title, username FROM user_target_channels WHERE user_id = ? ORDER BY last_used DESC",
             (user_id,)
         ) as cursor:
             return [
-                {"id": row[0], "title": row[1]} async for row in cursor
+                {"id": row[0], "title": row[1], "username": row[2]} async for row in cursor
             ]
 
-    async def add_user_target_channel(self, user_id: int, channel_id: str, channel_title: str):
+    async def add_user_target_channel(self, user_id: int, channel_id: str, channel_title: str, username: str = None):
         """
-        Добавить целевой канал в историю пользователя или обновить его название и время использования
+        Добавить целевой канал в историю пользователя или обновить его название, username и время использования
         """
         await self.conn.execute(
-            "INSERT INTO user_target_channels (user_id, channel_id, channel_title, last_used) VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(user_id, channel_id) DO UPDATE SET channel_title=excluded.channel_title, last_used=CURRENT_TIMESTAMP",
-            (user_id, channel_id, channel_title)
+            "INSERT INTO user_target_channels (user_id, channel_id, channel_title, username, last_used) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(user_id, channel_id) DO UPDATE SET channel_title=excluded.channel_title, username=excluded.username, last_used=CURRENT_TIMESTAMP",
+            (user_id, channel_id, channel_title, username)
         )
         await self.conn.commit()
 
@@ -553,51 +560,9 @@ class Database:
         )
         await self.conn.commit()
 
-    async def add_user_monitoring(self, user_id: int, channel_id: str, target_channel: str):
-        """
-        Добавить мониторинг пользователя (если такого нет или если был неактивен — активировать заново)
-        """
-        await self.conn.execute(
-            "INSERT INTO user_monitorings (user_id, channel_id, target_channel, is_active, created_at) VALUES (?, ?, ?, TRUE, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(user_id, channel_id, target_channel) DO UPDATE SET is_active=TRUE, created_at=CURRENT_TIMESTAMP",
-            (user_id, channel_id, target_channel)
-        )
-        await self.conn.commit()
 
-    async def deactivate_user_monitoring(self, user_id: int, channel_id: str, target_channel: str):
-        """
-        Деактивировать мониторинг пользователя
-        """
-        await self.conn.execute(
-            "UPDATE user_monitorings SET is_active = FALSE WHERE user_id = ? AND channel_id = ? AND target_channel = ?",
-            (user_id, channel_id, target_channel)
-        )
-        await self.conn.commit()
 
-    async def is_monitoring_exists(self, user_id: int, channel_id: str, target_channel: str) -> bool:
-        """
-        Проверить, существует ли уже активный мониторинг для пары (user_id, channel_id, target_channel)
-        """
-        async with self.conn.execute(
-            "SELECT 1 FROM user_monitorings WHERE user_id = ? AND channel_id = ? AND target_channel = ? AND is_active = TRUE",
-            (user_id, channel_id, target_channel)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return bool(row)
 
-    async def get_active_monitorings_by_user(self, user_id: int) -> list:
-        """
-        Получить список активных мониторингов пользователя
-        """
-        if self.conn is None:
-            await self.init()
-        async with self.conn.execute(
-            "SELECT channel_id, target_channel, created_at FROM user_monitorings WHERE user_id = ? AND is_active = TRUE",
-            (user_id,)
-        ) as cursor:
-            return [
-                {"channel_id": row[0], "target_channel": row[1], "created_at": row[2]} async for row in cursor
-            ]
 
     async def is_message_published(self, source_channel_id: int, message_id: int, target_channel_id: int) -> bool:
         """Проверить, публиковалось ли сообщение в указанный канал"""
@@ -987,7 +952,7 @@ class Database:
                 imported += 1
         return imported
 
-    # --- Методы для работы с назначениями задач на сессии ---
+    # --- Методы для работы с назначениями задач на сессиями ---
     async def add_session_assignment(self, session_id: int, task: str):
         await self.conn.execute(
             "INSERT OR IGNORE INTO session_assignments (session_id, task) VALUES (?, ?)",

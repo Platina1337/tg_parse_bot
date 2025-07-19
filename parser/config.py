@@ -2,7 +2,13 @@ from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 import os
 
-load_dotenv()
+# Загружаем .env файл только если он существует
+env_file = ".env"
+if os.path.exists(env_file):
+    load_dotenv(env_file)
+else:
+    # Если .env файл не найден, загружаем переменные окружения из системы
+    pass
 
 class ParserConfig(BaseSettings):
     # Telegram API credentials для userbot

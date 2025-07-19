@@ -5,7 +5,8 @@ from pyrogram import Client
 from pyrogram.types import Message, CallbackQuery, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from bot.states import (
     user_states, FSM_REACTION_CHANNEL, FSM_REACTION_SETTINGS, FSM_REACTION_CONFIRM, FSM_MAIN_MENU,
-    get_reaction_settings_keyboard, get_reaction_inline_keyboard
+    get_reaction_settings_keyboard, get_reaction_inline_keyboard,
+    get_unique_channels_keyboard
 )
 from bot.api_client import api_client
 
@@ -19,7 +20,8 @@ async def start_reaction_master(client: Client, message: Message):
         "emojis": ["👍", "❤️", "🔥"],
         "delay": 1
     }
-    sent = await message.reply("Введите ID или username канала для массовых реакций на посты:", reply_markup=ReplyKeyboardRemove())
+    kb = await get_unique_channels_keyboard(user_id)  # используем новую клавиатуру
+    sent = await message.reply("Введите ID или username канала для массовых реакций на посты:", reply_markup=kb or ReplyKeyboardRemove())
     user_states[user_id]["last_msg_id"] = sent.id if sent else None
 
 async def process_reaction_fsm(client: Client, message: Message):
@@ -28,9 +30,16 @@ async def process_reaction_fsm(client: Client, message: Message):
     state = user_states[user_id].get("state")
     logging.info(f"[FSM][REACTION] process_reaction_fsm called for user {user_id}, state={state}, text={text!r}")
     if state == FSM_REACTION_CHANNEL:
-        logging.info(f"[FSM][REACTION] resolve_channel: input={text!r}")
-        channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
-        logging.info(f"[FSM][REACTION] resolved: channel_id={channel_id!r}, channel_title={channel_title!r}, channel_username={channel_username!r}")
+        # --- Добавлено: поддержка формата 'Название (ID: -100..., @username)' ---
+        match = re.match(r"(.+) \(ID: (-?\d+)(?:, @(\w+))?\)", text)
+        if match:
+            channel_id = match.group(2)
+            channel_title = match.group(1)
+            channel_username = match.group(3)
+            logging.info(f"[FSM][REACTION] parsed from button: channel_id={channel_id}, channel_title={channel_title}, username={channel_username}")
+        else:
+            channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
+            logging.info(f"[FSM][REACTION] resolved: channel_id={channel_id!r}, channel_title={channel_title!r}, channel_username={channel_username!r}")
         if not channel_id or channel_id in ("None", "null", ""):
             sent = await message.reply("❌ Не удалось определить ID канала. Введите корректный username или ID.")
             user_states[user_id]["last_msg_id"] = sent.id if sent else None
@@ -251,6 +260,16 @@ async def reaction_callback_handler(client, callback_query: CallbackQuery):
         )
         user_states[user_id]["state"] = FSM_REACTION_SETTINGS
         return
+    if data == "reaction_back":
+        # Возврат к выбору канала, настройки reaction_settings сохраняются
+        user_states[user_id]["state"] = FSM_REACTION_CHANNEL
+        kb = await get_unique_channels_keyboard(user_id)
+        await callback_query.answer()
+        await callback_query.message.edit_text(
+            "Введите ID или username канала для массовых реакций на посты:",
+            reply_markup=kb or ReplyKeyboardRemove()
+        )
+        return
     await callback_query.answer("Неизвестное действие", show_alert=True)
 
 # --- Вспомогательная функция для resolve_channel ---
@@ -266,9 +285,9 @@ def format_channel_stats(stats):
     if not stats:
         return "❌ Не удалось получить статистику"
     
-    subscribers = stats.get("subscribers", "N/A")
-    last_message_id = stats.get("last_message_id", "None")
-    parsed_count = stats.get("parsed_count", 0)
+    subscribers = stats.get("members_count", "N/A")  # Исправлено: members_count вместо subscribers
+    last_message_id = stats.get("last_message_id", "N/A")  # Исправлено: N/A вместо None
+    parsed_count = stats.get("parsed_posts", 0)  # Исправлено: parsed_posts вместо parsed_count
     description = stats.get("description", "N/A")
     
     return f"👥 Подписчиков: {subscribers}\n🆔 Последний ID сообщения: {last_message_id}\n📝 Спаршено: {parsed_count}\n📄 Описание: {description}"

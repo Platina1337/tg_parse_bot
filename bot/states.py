@@ -17,9 +17,6 @@ user_states = {}
 
 # --- FSM: этапы ---
 FSM_MAIN_MENU = "main_menu"
-FSM_AWAIT_MONITOR_CHANNEL = "await_monitor_channel"
-FSM_AWAIT_MONITOR_TARGET = "await_monitor_target"
-FSM_AWAIT_MONITOR_STATUS = "await_monitor_status"
 FSM_NONE = None
 
 # Новые состояния для пересылки
@@ -59,10 +56,10 @@ FSM_NAVIGATION_CONFIRM = "navigation_confirm"
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📡 Мониторить канал")],
-            [KeyboardButton("⛔ Остановить мониторинг"), KeyboardButton("🧭 Навигация по хэштегам")],
+            [KeyboardButton("🧭 Навигация по хэштегам")],
             [KeyboardButton("📊 Статус задач")],
             [KeyboardButton("⭐ Пересылка")],
+            [KeyboardButton("⭐ Реакции")],
         ],
         resize_keyboard=True
     )
@@ -74,7 +71,16 @@ async def get_channel_history_keyboard(user_id):
     if not channels:
         print(f"[DEBUG] Нет каналов в истории для user_id={user_id}")
         return None
-    buttons = [[KeyboardButton(f"{ch['title']} (ID: {ch['id']})")] for ch in channels]
+    buttons = []
+    for ch in channels:
+        title = ch.get('title', '')
+        channel_id = ch.get('id', '')
+        username = ch.get('username', '')
+        if username:
+            btn_text = f"{title} (ID: {channel_id}, @{username})"
+        else:
+            btn_text = f"{title} (ID: {channel_id})"
+        buttons.append([KeyboardButton(btn_text)])
     buttons.append([KeyboardButton("Назад")])
     print(f"[DEBUG] Клавиатура для user_id={user_id}: {[ch['title'] for ch in channels]}")
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -86,7 +92,16 @@ async def get_target_channel_history_keyboard(user_id):
     if not channels:
         print(f"[DEBUG] Нет целевых каналов в истории для user_id={user_id}")
         return None
-    buttons = [[KeyboardButton(f"{ch['title']} (ID: {ch['id']})")] for ch in channels]
+    buttons = []
+    for ch in channels:
+        title = ch.get('title', '')
+        channel_id = ch.get('id', '')
+        username = ch.get('username', '')
+        if username:
+            btn_text = f"{title} (ID: {channel_id}, @{username})"
+        else:
+            btn_text = f"{title} (ID: {channel_id})"
+        buttons.append([KeyboardButton(btn_text)])
     buttons.append([KeyboardButton("Назад")])
     print(f"[DEBUG] Клавиатура целевых каналов для user_id={user_id}: {[ch['title'] for ch in channels]}")
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -171,17 +186,7 @@ def get_range_mode_keyboard():
 
 
 
-# --- Клавиатура для параметров мониторинга ---
-def get_monitor_settings_keyboard(monitor_settings):
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton('Режим текста')],
-            [KeyboardButton('Добавить приписку'), KeyboardButton('Удалять медиа')],
-            [KeyboardButton('Лимит сообщений')],
-            [KeyboardButton('Назад')],
-        ],
-        resize_keyboard=True
-    )
+
 
 # --- Вспомогательные функции для пересылки ---
 def format_channel_stats(stats: dict) -> str:
@@ -271,41 +276,7 @@ def format_forwarding_stats(stats: dict) -> str:
 
 
 
-# --- Вспомогательная функция для формирования текста мониторинга ---
-def get_monitor_stat_text(stats, monitor_settings):
-    title = stats.get('channel_title') or str(stats.get('channel_id'))
-    stat_text = (
-        f"Канал: {title}\n"
-        f"ID: {stats.get('channel_id', '-') or '-'}\n"
-        f"👥 Подписчиков: {stats.get('members_count', 'N/A')}\n"
-        f"🆔 Последний ID сообщения: {stats.get('last_message_id', 'N/A')}\n"
-        f"📝 Спаршено: {stats.get('parsed_posts', 'N/A')}\n"
-        f"📄 Описание: {stats.get('description', 'N/A')[:100] if stats.get('description') else 'N/A'}...\n"
-        f"\n"
-        f"Параметры мониторинга:\n"
-        f"Порядок: {monitor_settings.get('order', 'old_to_new')}\n"
-        f"Задержка: {monitor_settings.get('delay', 0)} сек\n"
-        f"Режим текста: {monitor_settings.get('text_mode', 'с текстом')}\n"
-        f"Приписка: {monitor_settings.get('footer', '-') or '-'}\n"
-        f"Удалять медиа: {'да' if monitor_settings.get('delete_media', True) else 'нет'}\n"
-        f"Лимит: {monitor_settings.get('max_posts', 0) or 'все'} сообщений\n"
-    )
-    return stat_text
 
-# --- Проверка статуса мониторинга ---
-async def check_monitoring_status(user_id, channel_id):
-    try:
-        async with httpx.AsyncClient() as client_api:
-            resp = await client_api.get(f"{config.PARSER_SERVICE_URL}/monitor/status/{channel_id}")
-            if resp.status_code == 200:
-                data = resp.json()
-                is_active = data.get("is_active", False)
-                started_at = data.get("started_at")
-                return f"Мониторинг {'запущен' if is_active else 'не запущен'} для канала {channel_id}." + (f"\nСтарт: {started_at}" if started_at else "")
-            else:
-                return f"Ошибка получения статуса мониторинга: {resp.text}"
-    except Exception as e:
-        return f"Ошибка при обращении к сервису мониторинга: {e}"
 
 # --- API функции для пересылки ---
 async def start_forwarding_api(user_id: int) -> bool:
@@ -478,3 +449,23 @@ def get_reaction_inline_keyboard(channel_id=None, last_task_id=None):
     buttons.append([InlineKeyboardButton("📊 Статус задач", callback_data="check_reaction_tasks_status")])
     buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="reaction_back")])
     return InlineKeyboardMarkup(buttons) 
+
+# --- Клавиатура с уникальными каналами пользователя (user_channels + user_target_channels без дублей) ---
+async def get_unique_channels_keyboard(user_id):
+    user_channels = await api_client.get_user_channels(user_id)
+    target_channels = await api_client.get_user_target_channels(user_id)
+    all_channels = {str(ch['id']): ch for ch in user_channels}
+    for ch in target_channels:
+        all_channels[str(ch['id'])] = ch  # если уже есть — не добавит дубликат
+    buttons = []
+    for ch in all_channels.values():
+        title = ch.get('title') or ch.get('username') or f"ID: {ch['id']}"
+        channel_id = ch['id']
+        username = ch.get('username', '')
+        if username:
+            btn_text = f"{title} (ID: {channel_id}, @{username})"
+        else:
+            btn_text = f"{title} (ID: {channel_id})"
+        buttons.append([KeyboardButton(btn_text)])
+    buttons.append([KeyboardButton("Назад")])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True) 

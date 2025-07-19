@@ -72,9 +72,9 @@ class ParserAPIClient:
         response = await self._make_request("GET", f"/user/channels/{user_id}")
         return response.get("channels", [])
     
-    async def add_user_channel(self, user_id: int, channel_id: str, channel_title: str) -> bool:
+    async def add_user_channel(self, user_id: int, channel_id: str, channel_title: str, username: str = None) -> bool:
         """Добавить канал в историю пользователя"""
-        data = {"channel_id": channel_id, "channel_title": channel_title}
+        data = {"channel_id": channel_id, "channel_title": channel_title, "username": username}
         await self._make_request("POST", f"/user/channels/{user_id}", json=data)
         return True
     
@@ -95,9 +95,9 @@ class ParserAPIClient:
         response = await self._make_request("GET", f"/user/target-channels/{user_id}")
         return response.get("channels", [])
     
-    async def add_user_target_channel(self, user_id: int, channel_id: str, channel_title: str) -> bool:
+    async def add_user_target_channel(self, user_id: int, channel_id: str, channel_title: str, username: str = None) -> bool:
         """Добавить целевой канал в историю пользователя"""
-        data = {"channel_id": channel_id, "channel_title": channel_title}
+        data = {"channel_id": channel_id, "channel_title": channel_title, "username": username}
         await self._make_request("POST", f"/user/target-channels/{user_id}", json=data)
         return True
     
@@ -113,22 +113,7 @@ class ParserAPIClient:
     
     # --- Методы для работы с мониторингами ---
     
-    async def get_user_monitorings(self, user_id: int) -> List[Dict]:
-        """Получить активные мониторинги пользователя"""
-        response = await self._make_request("GET", f"/user/monitorings/{user_id}")
-        return response.get("monitorings", [])
-    
-    async def add_user_monitoring(self, user_id: int, channel_id: str, target_channel: str) -> bool:
-        """Добавить мониторинг пользователя"""
-        data = {"channel_id": channel_id, "target_channel": target_channel}
-        await self._make_request("POST", f"/user/monitorings/{user_id}", json=data)
-        return True
-    
-    async def deactivate_user_monitoring(self, user_id: int, channel_id: str, target_channel: str) -> bool:
-        """Деактивировать мониторинг пользователя"""
-        data = {"channel_id": channel_id, "target_channel": target_channel}
-        await self._make_request("DELETE", f"/user/monitorings/{user_id}", json=data)
-        return True
+
     
     # --- Методы для работы с шаблонами публикации ---
     
@@ -220,6 +205,8 @@ class ParserAPIClient:
         try:
             response = await self._make_request("GET", f"/channel/stats/{channel_id}")
             logger.info(f"[get_channel_stats] Ответ от parser: {response}")
+            logger.info(f"[get_channel_stats] Тип ответа: {type(response)}")
+            logger.info(f"[get_channel_stats] Ключи в ответе: {list(response.keys()) if isinstance(response, dict) else 'не словарь'}")
             
             # Если в ответе нет необходимых полей, создаем их с дефолтными значениями
             if not isinstance(response, dict):
@@ -228,15 +215,17 @@ class ParserAPIClient:
                 
             # Обеспечиваем наличие всех необходимых полей
             result = {
-                "id": channel_id,
+                "id": response.get("channel_id", channel_id),  # Используем channel_id из ответа
                 "title": response.get("channel_title", f"Канал {channel_id}"),
-                "username": response.get("channel_username", ""),
+                "username": response.get("username", ""),  # Исправлено: было channel_username
                 "members_count": response.get("members_count", "N/A"),
                 "last_message_id": response.get("last_message_id", "N/A"),
                 "parsed_posts": response.get("parsed_posts", "0"),
                 "description": response.get("description", "")
             }
             logger.info(f"[get_channel_stats] Возвращаем: {result}")
+            logger.info(f"[get_channel_stats] last_message_id из API: {response.get('last_message_id')}")
+            logger.info(f"[get_channel_stats] last_message_id в результате: {result.get('last_message_id')}")
             return result
         except Exception as e:
             logger.error(f"[get_channel_stats] Ошибка: {e}")
@@ -255,10 +244,7 @@ class ParserAPIClient:
         response = await self._make_request("GET", f"/channel/hashtags/{channel_id}")
         return response.get("hashtags", [])
     
-    async def get_monitor_stats(self, channel_id: int, target_channel: str) -> Dict:
-        """Получить статистику мониторинга"""
-        response = await self._make_request("GET", f"/monitor/stats/{channel_id}/{target_channel}")
-        return response.get("stats", {})
+
 
     async def get_monitoring_status(self) -> dict:
         """
@@ -310,17 +296,7 @@ class ParserAPIClient:
             response.raise_for_status()
             return response.json()
             
-    async def start_monitoring(self, channel_id: str, target_channel: str, config: dict) -> dict:
-        """Запустить мониторинг канала"""
-        monitor_request = {
-            "channel_link": str(channel_id),
-            "config": {
-                "user_id": config.get("user_id"),
-                "settings": config
-            }
-        }
-        response = await self._make_request("POST", "/monitor/start", json=monitor_request)
-        return response
+
 
     # --- Methods for working with sessions ---
     

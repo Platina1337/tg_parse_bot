@@ -81,17 +81,23 @@ async def navigation_text_handler(client: Client, message: Message):
             from bot.core import show_main_menu
             await show_main_menu(client, message, "Выберите действие:")
             return
-        match = re.match(r"(.+) \(ID: (-?\d+)\)", text)
+        match = re.match(r"(.+) \(ID: (-?\d+)(?:, @(\w+))?\)", text)
         if match:
             channel_id = match.group(2)
-            async with httpx.AsyncClient() as api_client:
-                stats_url = f"{config.PARSER_SERVICE_URL}/channel/stats/{channel_id}"
-                stats_resp = await api_client.get(stats_url)
-                stats_data = stats_resp.json()
-                username = stats_data.get("username")
-                is_public = stats_data.get("is_public")
-                if is_public and username:
-                    channel_id = username
+            username = match.group(3)
+            if username:
+                # Если есть username в кнопке, используем его
+                channel_id = username
+            else:
+                # Иначе пытаемся получить username из API
+                async with httpx.AsyncClient() as api_client:
+                    stats_url = f"{config.PARSER_SERVICE_URL}/channel/stats/{channel_id}"
+                    stats_resp = await api_client.get(stats_url)
+                    stats_data = stats_resp.json()
+                    api_username = stats_data.get("username")
+                    is_public = stats_data.get("is_public")
+                    if is_public and api_username:
+                        channel_id = api_username
         else:
             channel_id = text.strip()
         user_states[user_id]["navigation_channel_id"] = str(channel_id)
