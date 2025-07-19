@@ -83,6 +83,8 @@ async def safe_edit_callback_message(callback_query, text: str, reply_markup=Non
 
 # --- Обработчик команды /start ---
 async def start_command(client: Client, message: Message):
+    logger.info(f"[START_COMMAND] Получена команда /start от пользователя {message.from_user.id}")
+    
     # Устанавливаем команды меню при первом использовании
     try:
         commands = [
@@ -90,13 +92,33 @@ async def start_command(client: Client, message: Message):
             BotCommand("reactions", "⭐ Управление реакциями"),
             BotCommand("sessions", "🔐 Управление сессиями"),
             BotCommand("monitorings", "📊 Статус задач"),
+            BotCommand("public_groups", "📢 Публичные группы"),
         ]
         await client.set_bot_commands(commands)
-        logger.info("Команды меню установлены при команде /start")
+        logger.info("✅ Команды меню установлены при команде /start")
     except Exception as e:
-        logger.error(f"Ошибка при установке команд меню: {e}")
+        logger.error(f"❌ Ошибка при установке команд меню: {e}")
     
     await show_main_menu(client, message, "Привет! Я бот для управления парсером Telegram-каналов.\n\nВыберите действие:")
+
+# --- Обработчик команды /setup_commands ---
+async def setup_commands_command(client: Client, message: Message):
+    """Установка команд меню"""
+    logger.info(f"[SETUP_COMMANDS] Получена команда /setup_commands от пользователя {message.from_user.id}")
+    try:
+        commands = [
+            BotCommand("start", "🏠 Главное меню"),
+            BotCommand("reactions", "⭐ Управление реакциями"),
+            BotCommand("sessions", "🔐 Управление сессиями"),
+            BotCommand("monitorings", "📊 Статус задач"),
+            BotCommand("public_groups", "📢 Публичные группы"),
+        ]
+        await client.set_bot_commands(commands)
+        await message.reply("✅ Команды меню установлены!")
+        logger.info("✅ Команды меню установлены при команде /setup_commands")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка при установке команд: {e}")
+        logger.error(f"❌ Ошибка при установке команд меню: {e}")
 
 # --- Обработчик текстовых сообщений ---
 async def text_handler(client: Client, message: Message):
@@ -110,6 +132,11 @@ async def text_handler(client: Client, message: Message):
     print(f"[FSM][DEBUG][ENTER] user_id={user_id} | old_state={old_state} | text='{text}'")
     print(f"[FSM][DEBUG] user_states[{user_id}] на входе: {user_states[user_id]}")
     
+    # --- FSM: обработка публичных групп ---
+    from bot.public_groups_manager import handle_public_groups_text
+    if await handle_public_groups_text(client, message):
+        return  # Если обработано — не продолжаем дальше
+
     # --- FSM: обработка сессий ---
     # Убираем дублирующий вызов handle_session_text_input, так как он уже вызывается в bot_main.py
     # from bot.session_handlers import handle_session_text_input
@@ -150,6 +177,12 @@ async def text_handler(client: Client, message: Message):
             from bot.navigation_manager import navigation_menu_handler
             await navigation_menu_handler(client, message)
             return
+        elif text in ["📢 Публичные группы"]:
+            # Обработка перенесена в public_groups_manager.py
+            from bot.public_groups_manager import start_public_groups_manager
+            await start_public_groups_manager(client, message)
+            return
+
         elif text in ["Реакции ⭐", "⭐ Реакции"]:
             # Обработка перенесена в reaction_master.py
             from bot.reaction_master import start_reaction_master
@@ -2193,6 +2226,13 @@ async def resolve_channel(api_client, text):
         return stats["id"], stats.get("title", ""), stats.get("username", "")
     return text, text, ""  # Возвращаем исходный текст как fallback
 
+# --- Функция для нормализации группы ---
+async def resolve_group(api_client, text):
+    stats = await api_client.get_channel_stats(text)
+    if stats and stats.get("id"):
+        return stats["id"], stats.get("title", ""), stats.get("username", "")
+    return text, text, ""  # Возвращаем исходный текст как fallback
+
 def format_channel(cfg, channel_id_key="channel_id", title_key="channel_title", username_key="username"):
     channel_id = cfg.get(channel_id_key) or cfg.get("source_channel") or cfg.get("target_channel")
     title = cfg.get(title_key) or ""
@@ -2215,6 +2255,14 @@ async def get_channel_info_map(user_id):
         info[str(ch.get('id'))] = {'title': ch.get('title'), 'username': ch.get('username')}
     for ch in target_channels:
         info[str(ch.get('id'))] = {'title': ch.get('title'), 'username': ch.get('username')}
+    return info
+
+async def get_group_info_map(user_id):
+    """Возвращает dict: group_id -> {'title': ..., 'username': ...} для user_groups"""
+    user_groups = await api_client.get_user_groups(user_id)
+    info = {}
+    for group in user_groups:
+        info[str(group.get('group_id'))] = {'title': group.get('group_title'), 'username': group.get('username')}
     return info
 
 def format_channel_display(channel_id, info_map):
@@ -2557,6 +2605,7 @@ async def process_callback_query(client, callback_query):
     if data == "check_reaction_tasks_status":
         await check_reaction_tasks_status_callback(client, callback_query)
         return True
+
     # ... можно добавить другие кастомные обработчики ...
     # Если не обработано — fallback: вызываем forwarding_callback_handler
     await forwarding_callback_handler(client, callback_query)

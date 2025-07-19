@@ -17,7 +17,7 @@ async def start_reaction_master(client: Client, message: Message):
     user_states[user_id]["state"] = FSM_REACTION_CHANNEL
     # По умолчанию выставляем эмодзи и задержку
     user_states[user_id]["reaction_settings"] = {
-        "emojis": ["👍", "❤️", "🔥"],
+        "emojis": ["😍", "❤️"],
         "delay": 1
     }
     kb = await get_unique_channels_keyboard(user_id)  # используем новую клавиатуру
@@ -157,11 +157,11 @@ async def reaction_callback_handler(client, callback_query: CallbackQuery):
         return
     if data == "reaction_emojis":
         await callback_query.answer()
-        current_emojis = reaction_settings.get('emojis', ["👍", "❤️", "🔥"])
+        current_emojis = reaction_settings.get('emojis', ["😍", "❤️"])
         if not current_emojis:
-            current_emojis = ["👍", "❤️", "🔥"]
+            current_emojis = ["😍", "❤️"]
         await callback_query.message.edit_text(
-            f"Текущие эмодзи: {', '.join(current_emojis)}\n\nВведите эмодзи через пробел (например: 👍 ❤️ 🔥):",
+            f"Текущие эмодзи: {', '.join(current_emojis)}\n\nВведите эмодзи через пробел (например: 😍 ❤️):",
             reply_markup=get_reaction_settings_keyboard()
         )
         user_states[user_id]["reaction_state"] = "emojis_input"

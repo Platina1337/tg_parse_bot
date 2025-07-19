@@ -881,6 +881,74 @@ async def remove_user_target_channel(user_id: int, channel_id: str):
         logger.error(f"Error removing user target channel: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- Эндпоинты для групп пользователей ---
+
+class GroupRequest(BaseModel):
+    group_id: str
+    group_title: str
+    username: Optional[str] = None
+
+@app.get("/user/groups/{user_id}")
+async def get_user_groups(user_id: int):
+    """Получить историю групп пользователя"""
+    try:
+        groups = await db.get_user_groups(user_id)
+        return {"status": "success", "groups": groups}
+    except Exception as e:
+        logger.error(f"Error getting user groups: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/user/groups/{user_id}")
+async def add_user_group(user_id: int, request: GroupRequest):
+    """Добавить группу в историю пользователя (только если группа существует)"""
+    try:
+        forwarder = get_or_create_forwarder()
+        try:
+            userbot = await forwarder.get_userbot()
+            chat = await userbot.get_chat(request.group_id)
+            group_title = getattr(chat, 'title', None) or request.group_title
+            username = getattr(chat, 'username', None)
+        except Exception as e:
+            logger.warning(f"[API][add_user_group] Не удалось получить группу {request.group_id}: {e}")
+            raise HTTPException(status_code=400, detail="Группа не найдена или недоступна")
+        
+        # Определяем, что передал клиент: username или ID
+        is_username = not request.group_id.startswith("-100") and not request.group_id.isdigit()
+        
+        if is_username:
+            # Клиент передал username, сохраняем username в поле username, а ID в поле group_id
+            await db.add_user_group(user_id, str(chat.id), group_title, request.group_id)
+        else:
+            # Клиент передал ID, сохраняем ID в поле group_id, а username в поле username
+            await db.add_user_group(user_id, str(chat.id), group_title, username)
+        
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding user group: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/user/groups/{user_id}/{group_id}")
+async def update_user_group_last_used(user_id: int, group_id: str):
+    """Обновить время последнего использования группы"""
+    try:
+        await db.update_user_group_last_used(user_id, group_id)
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Error updating user group: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/user/groups/{user_id}/{group_id}")
+async def remove_user_group(user_id: int, group_id: str):
+    """Удалить группу из истории пользователя"""
+    try:
+        await db.remove_user_group(user_id, group_id)
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Error removing user group: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/user/posting-templates/{user_id}")
@@ -1787,6 +1855,88 @@ async def get_all_reaction_tasks():
         "success": True,
         "tasks": list(reaction_tasks.values())
     }
+
+# --- API для публичных групп ---
+
+class PublicGroupsRequest(BaseModel):
+    source_channel: str
+    target_group: str
+    user_id: int
+    settings: dict
+
+@app.post("/public_groups/start")
+async def start_public_groups_forwarding(request: PublicGroupsRequest):
+    """Запуск пересылки в публичные группы"""
+    try:
+        forwarder = get_or_create_forwarder()
+        userbot = await forwarder.get_userbot()
+        
+        from parser.public_groups_forwarder import PublicGroupsForwarder
+        public_forwarder = PublicGroupsForwarder(userbot, db)
+        
+        result = await public_forwarder.start_forwarding(
+            request.source_channel,
+            request.target_group,
+            request.user_id,
+            request.settings
+        )
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error starting public groups forwarding: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/public_groups/stop")
+async def stop_public_groups_forwarding(request: dict):
+    """Остановка пересылки в публичные группы"""
+    try:
+        task_id = request.get("task_id")
+        if not task_id:
+            raise HTTPException(status_code=400, detail="task_id is required")
+        
+        forwarder = get_or_create_forwarder()
+        userbot = await forwarder.get_userbot()
+        
+        from parser.public_groups_forwarder import PublicGroupsForwarder
+        public_forwarder = PublicGroupsForwarder(userbot, db)
+        
+        result = await public_forwarder.stop_forwarding(task_id)
+        return result
+    except Exception as e:
+        logger.error(f"Error stopping public groups forwarding: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/public_groups/status/{task_id}")
+async def get_public_groups_status(task_id: str):
+    """Получить статус задачи пересылки в публичные группы"""
+    try:
+        forwarder = get_or_create_forwarder()
+        userbot = await forwarder.get_userbot()
+        
+        from parser.public_groups_forwarder import PublicGroupsForwarder
+        public_forwarder = PublicGroupsForwarder(userbot, db)
+        
+        result = await public_forwarder.get_status(task_id)
+        return result
+    except Exception as e:
+        logger.error(f"Error getting public groups status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/public_groups/all_tasks")
+async def get_all_public_groups_tasks():
+    """Получить все задачи пересылки в публичные группы"""
+    try:
+        forwarder = get_or_create_forwarder()
+        userbot = await forwarder.get_userbot()
+        
+        from parser.public_groups_forwarder import PublicGroupsForwarder
+        public_forwarder = PublicGroupsForwarder(userbot, db)
+        
+        result = await public_forwarder.get_all_tasks()
+        return result
+    except Exception as e:
+        logger.error(f"Error getting public groups tasks: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

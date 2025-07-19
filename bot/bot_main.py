@@ -63,6 +63,8 @@ app = Client(
     bot_token=config.BOT_TOKEN
 )
 
+# Удаляем неправильный декоратор on_start
+
 # Регистрация обработчиков
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
@@ -82,6 +84,26 @@ async def sessions_command_handler(client, message):
 @app.on_message(filters.command("reactions"))
 async def reactions_command_handler(client, message):
     await start_reaction_master(client, message)
+
+@app.on_message(filters.command("monitorings"))
+async def monitorings_command_handler(client, message):
+    """Handler for /monitorings command for checking task status"""
+    from bot.handlers import monitorings_command
+    await monitorings_command(client, message)
+
+@app.on_message(filters.command("public_groups"))
+async def public_groups_command_handler(client, message):
+    """Handler for /public_groups command for managing public groups forwarding"""
+    from bot.public_groups_manager import start_public_groups_manager
+    await start_public_groups_manager(client, message)
+
+
+
+@app.on_message(filters.command("setup_commands"))
+async def setup_commands_handler(client, message):
+    """Handler for /setup_commands command for forcing menu setup"""
+    from bot.handlers import setup_commands_command
+    await setup_commands_command(client, message)
 
 @app.on_message(filters.text & filters.private)
 async def text_message_handler(client, message):
@@ -109,6 +131,13 @@ async def text_message_handler(client, message):
         logger.info(f"[TEXT_HANDLER] Handling reaction FSM for user {user_id}")
         await process_reaction_fsm(client, message)
         return
+    elif state and state.startswith("public_groups_"):
+        logger.info(f"[TEXT_HANDLER] Handling public groups FSM for user {user_id}")
+        from bot.public_groups_manager import handle_public_groups_text
+        handled = await handle_public_groups_text(client, message)
+        if handled:
+            return
+
     else:
         logger.info(f"[TEXT_HANDLER] Calling text_handler for user {user_id}")
         await text_handler(client, message)
@@ -268,6 +297,12 @@ async def cancel_reaction_handler(client, callback_query):
     from bot.reaction_handlers import cancel_reaction_callback
     await cancel_reaction_callback(client, callback_query)
 
+# Обработчики для публичных групп
+@app.on_callback_query(filters.regex("^public_"))
+async def public_groups_callback_handler(client, callback_query):
+    from bot.public_groups_manager import handle_public_groups_callback
+    await handle_public_groups_callback(client, callback_query)
+
 @app.on_callback_query(filters.regex("^check_tasks_status$"))
 async def check_tasks_status_handler(client, callback_query):
     await check_tasks_status_callback(client, callback_query)
@@ -311,6 +346,23 @@ async def monitorings_handler(client, message):
 # async def catch_all_callback_handler(client, callback_query):
 #     await callback_query.answer("Неизвестное действие", show_alert=True)
 # app.add_handler(CallbackQueryHandler(catch_all_callback_handler))
+
+async def setup_bot_commands():
+    """Установка команд меню при запуске бота"""
+    try:
+        commands = [
+            BotCommand("start", "🏠 Главное меню"),
+            BotCommand("reactions", "⭐ Управление реакциями"),
+            BotCommand("sessions", "🔐 Управление сессиями"),
+            BotCommand("monitorings", "📊 Статус задач"),
+            BotCommand("public_groups", "📢 Публичные группы"),
+        ]
+        await app.set_bot_commands(commands)
+        logger.info("✅ Команды меню установлены при запуске бота")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при установке команд меню: {e}")
+
+
 
 def run_bot():
     """Функция для запуска бота извне"""

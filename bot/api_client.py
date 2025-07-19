@@ -111,6 +111,29 @@ class ParserAPIClient:
         await self._make_request("DELETE", f"/user/target-channels/{user_id}/{channel_id}")
         return True
     
+    # --- Методы для работы с группами пользователей ---
+    
+    async def get_user_groups(self, user_id: int) -> List[Dict]:
+        """Получить историю групп пользователя"""
+        response = await self._make_request("GET", f"/user/groups/{user_id}")
+        return response.get("groups", [])
+    
+    async def add_user_group(self, user_id: int, group_id: str, group_title: str, username: str = None) -> bool:
+        """Добавить группу в историю пользователя"""
+        data = {"group_id": group_id, "group_title": group_title, "username": username}
+        await self._make_request("POST", f"/user/groups/{user_id}", json=data)
+        return True
+    
+    async def update_user_group_last_used(self, user_id: int, group_id: str) -> bool:
+        """Обновить время последнего использования группы"""
+        await self._make_request("PUT", f"/user/groups/{user_id}/{group_id}")
+        return True
+    
+    async def remove_user_group(self, user_id: int, group_id: str) -> bool:
+        """Удалить группу из истории пользователя"""
+        await self._make_request("DELETE", f"/user/groups/{user_id}/{group_id}")
+        return True
+    
     # --- Методы для работы с мониторингами ---
     
 
@@ -243,6 +266,14 @@ class ParserAPIClient:
         """Получить хэштеги канала"""
         response = await self._make_request("GET", f"/channel/hashtags/{channel_id}")
         return response.get("hashtags", [])
+    
+    async def resolve_group(self, text: str) -> tuple:
+        """Разрешить группу по ID или username"""
+        # Используем ту же логику что и для каналов
+        stats = await self.get_channel_stats(text)
+        if stats and stats.get("id"):
+            return stats["id"], stats.get("title", ""), stats.get("username", "")
+        return text, text, ""  # Возвращаем исходный текст как fallback
     
 
 
@@ -453,6 +484,32 @@ class ParserAPIClient:
             response = await client.get(f"{self.base_url}/reactions/all_tasks")
             response.raise_for_status()
             return response.json()
+
+    # --- Methods for working with public groups ---
+    
+    async def start_public_groups_forwarding(self, source_channel: str, target_group: str, 
+                                           user_id: int, settings: dict) -> dict:
+        """Запустить пересылку в публичные группы"""
+        data = {
+            "source_channel": source_channel,
+            "target_group": target_group,
+            "user_id": user_id,
+            "settings": settings
+        }
+        return await self._make_request("POST", "/public_groups/start", json=data)
+    
+    async def stop_public_groups_forwarding(self, task_id: str) -> dict:
+        """Остановить пересылку в публичные группы"""
+        data = {"task_id": task_id}
+        return await self._make_request("POST", "/public_groups/stop", json=data)
+    
+    async def get_public_groups_status(self, task_id: str) -> dict:
+        """Получить статус задачи пересылки в публичные группы"""
+        return await self._make_request("GET", f"/public_groups/status/{task_id}")
+    
+    async def get_all_public_groups_tasks(self) -> dict:
+        """Получить все задачи пересылки в публичные группы"""
+        return await self._make_request("GET", "/public_groups/all_tasks")
 
 # Глобальный экземпляр API клиента
 api_client = ParserAPIClient() 

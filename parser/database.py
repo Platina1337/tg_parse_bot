@@ -80,6 +80,18 @@ class Database:
                     )
                 """)
                 
+                # Таблица для хранения истории групп пользователя
+                await cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_groups (
+                        user_id INTEGER,
+                        group_id TEXT,
+                        group_title TEXT,
+                        username TEXT,
+                        last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (user_id, group_id)
+                    )
+                """)
+                
 
                 
                 # Таблица для хранения опубликованных постов
@@ -160,6 +172,7 @@ class Database:
                 await cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_groups_channel ON media_groups(channel_id)")
                 await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_channels_user ON user_channels(user_id)")
                 await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_target_channels_user ON user_target_channels(user_id)")
+                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_groups_user ON user_groups(user_id)")
 
 
             # Проверяем, нужно ли добавить поле last_message_id в таблицу channel_info
@@ -559,6 +572,64 @@ class Database:
             (user_id, channel_id)
         )
         await self.conn.commit()
+
+    # Методы для работы с группами пользователей
+    async def get_user_groups(self, user_id: int) -> list:
+        """Получение списка групп пользователя"""
+        try:
+            async with self.conn.execute(
+                "SELECT group_id, group_title, username, last_used FROM user_groups WHERE user_id = ? ORDER BY last_used DESC",
+                (user_id,)
+            ) as cursor:
+                groups = []
+                async for row in cursor:
+                    groups.append({
+                        'group_id': row[0],
+                        'group_title': row[1],
+                        'username': row[2],
+                        'last_used': row[3]
+                    })
+                return groups
+        except Exception as e:
+            logger.error(f"[DB] Ошибка при получении групп пользователя: {e}")
+            return []
+
+    async def add_user_group(self, user_id: int, group_id: str, group_title: str, username: str = None):
+        """Добавление группы пользователя"""
+        try:
+            await self.conn.execute("""
+                INSERT OR REPLACE INTO user_groups (user_id, group_id, group_title, username, last_used)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (user_id, group_id, group_title, username))
+            await self.conn.commit()
+            logger.info(f"[DB] Добавлена группа {group_id} ({group_title}) для пользователя {user_id}")
+        except Exception as e:
+            logger.error(f"[DB] Ошибка при добавлении группы: {e}")
+            raise
+
+    async def update_user_group_last_used(self, user_id: int, group_id: str):
+        """Обновление времени последнего использования группы"""
+        try:
+            await self.conn.execute(
+                "UPDATE user_groups SET last_used = CURRENT_TIMESTAMP WHERE user_id = ? AND group_id = ?",
+                (user_id, group_id)
+            )
+            await self.conn.commit()
+        except Exception as e:
+            logger.error(f"[DB] Ошибка при обновлении времени использования группы: {e}")
+
+    async def remove_user_group(self, user_id: int, group_id: str):
+        """Удаление группы пользователя"""
+        try:
+            await self.conn.execute(
+                "DELETE FROM user_groups WHERE user_id = ? AND group_id = ?",
+                (user_id, group_id)
+            )
+            await self.conn.commit()
+            logger.info(f"[DB] Удалена группа {group_id} для пользователя {user_id}")
+        except Exception as e:
+            logger.error(f"[DB] Ошибка при удалении группы: {e}")
+            raise
 
 
 

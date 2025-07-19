@@ -59,6 +59,7 @@ def get_main_keyboard():
             [KeyboardButton("🧭 Навигация по хэштегам")],
             [KeyboardButton("📊 Статус задач")],
             [KeyboardButton("⭐ Пересылка")],
+            [KeyboardButton("📢 Публичные группы")],
             [KeyboardButton("⭐ Реакции")],
         ],
         resize_keyboard=True
