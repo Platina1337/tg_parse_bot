@@ -592,7 +592,9 @@ class TelegramForwarder:
         try:
             # Проверяем доступность чата для python-telegram-bot
             try:
-                await self.tg_bot.get_chat(chat_id)
+                # Преобразуем chat_id в строку для Bot API
+                chat_id_str = str(chat_id)
+                await self.tg_bot.get_chat(chat_id_str)
                 logger.info(f"[FORWARDER] ✅ Чат {chat_id} доступен для python-telegram-bot")
             except Exception as e:
                 if "Chat not found" in str(e) or "chat not found" in str(e):
@@ -626,7 +628,7 @@ class TelegramForwarder:
             contains_html = "<a href=" in caption or "<b>" in caption or "<i>" in caption or "<code>" in caption
             
             result = await self.tg_bot.send_paid_media(
-                chat_id=chat_id,
+                chat_id=str(chat_id),  # Преобразуем в строку для Bot API
                 star_count=stars,
                 media=media,
                 caption=caption,
@@ -1103,7 +1105,9 @@ class TelegramForwarder:
                     logger.info(f"[FORWARDER] 🎯 Отправляем платную медиагруппу: {paid_content_stars} звезд")
                     # Проверяем доступность чата для python-telegram-bot
                     try:
-                        await self.tg_bot.get_chat(target_channel)
+                        # Преобразуем target_channel в строку для Bot API
+                        target_channel_str = str(target_channel)
+                        await self.tg_bot.get_chat(target_channel_str)
                     except Exception as e:
                         if "Chat not found" in str(e) or "chat not found" in str(e):
                             logger.warning(f"[FORWARDER] python-telegram-bot не может найти чат {target_channel}, используем Pyrogram")
@@ -1199,7 +1203,7 @@ class TelegramForwarder:
                                 contains_html = "<a href=" in group_caption or "<b>" in group_caption or "<i>" in group_caption or "<code>" in group_caption
                                 
                                 result =                                 await self.tg_bot.send_paid_media(
-                                    chat_id=target_channel,
+                                    chat_id=str(target_channel),  # Преобразуем в строку для Bot API
                                     star_count=paid_content_stars,
                                     media=tg_media,
                                     caption=group_caption,
@@ -1817,7 +1821,9 @@ class TelegramForwarder:
         if not self.tg_bot:
             return False
         try:
-            admins = await self.tg_bot.get_chat_administrators(channel_id)
+            # Преобразуем channel_id в строку для Bot API
+            channel_id_str = str(channel_id)
+            admins = await self.tg_bot.get_chat_administrators(channel_id_str)
             me = await self.tg_bot.get_me()
             for admin in admins:
                 if admin.user.id == me.id:

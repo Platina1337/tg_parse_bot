@@ -103,7 +103,7 @@ async def start_forwarding_api(user_id: int) -> bool:
         payload = {
             'user_id': user_id,
             'source_channel_id': channel_id,
-            'target_channel_id': target_channel,
+            'target_channel_id': str(target_channel),  # Преобразуем в строку
             'parse_mode': forward_settings.get('parse_mode', 'all'),
             'hashtag_filter': forward_settings.get('hashtag_filter'),
             'delay_seconds': forward_settings.get('delay_seconds', 0),
@@ -194,7 +194,7 @@ async def save_forwarding_config_api(user_id: int) -> bool:
         config_data = {
             "user_id": user_id,
             "source_channel_id": channel_id,
-            "target_channel_id": target_channel,
+            "target_channel_id": str(target_channel),  # Преобразуем в строку
             "parse_mode": forward_settings.get('parse_mode', 'all'),
             "hashtag_filter": forward_settings.get('hashtag_filter'),
             "delay_seconds": forward_settings.get('delay_seconds', 0),
