@@ -8,7 +8,7 @@ from typing import Dict, Optional
 import httpx
 import textwrap
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove, InputMediaPhoto, InputMediaVideo, ReplyKeyboardMarkup, KeyboardButton, CallbackQuery
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove, InputMediaPhoto, InputMediaVideo, ReplyKeyboardMarkup, KeyboardButton, CallbackQuery, BotCommand
 from pyrogram.errors import MessageNotModified, ChatAdminRequired, PeerIdInvalid, ChannelPrivate
 from shared.models import ParseConfig, ParseMode, PostingSettings
 from bot.settings import get_user_settings, update_user_settings, clear_user_settings, get_user_templates, save_user_template, DB_PATH
@@ -86,6 +86,19 @@ async def safe_edit_callback_message(callback_query, text: str, reply_markup=Non
 
 # --- Обработчик команды /start ---
 async def start_command(client: Client, message: Message):
+    # Устанавливаем команды меню при первом использовании
+    try:
+        commands = [
+            BotCommand("start", "🏠 Главное меню"),
+            BotCommand("reactions", "⭐ Управление реакциями"),
+            BotCommand("sessions", "🔐 Управление сессиями"),
+            BotCommand("monitorings", "📊 Статус задач"),
+        ]
+        await client.set_bot_commands(commands)
+        logger.info("Команды меню установлены при команде /start")
+    except Exception as e:
+        logger.error(f"Ошибка при установке команд меню: {e}")
+    
     await show_main_menu(client, message, "Привет! Я бот для управления парсером Telegram-каналов.\n\nВыберите действие:")
 
 # --- Обработчик текстовых сообщений ---
@@ -2386,7 +2399,7 @@ def format_channel_display(channel_id, info_map):
             return f"@{username} [ID: {channel_id}]"
     return f"ID: {channel_id}"
 
-async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings, tasks, updated=False):
+async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings, tasks, reaction_tasks, updated=False, back_to="forward_back_to_stats"):
     info_map = await get_channel_info_map(user_id)
     def safe(val):
         if val is None or val == "N/A":
@@ -2454,16 +2467,60 @@ async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings,
             msg += "\n"
             if status == "running" and task_id:
                 buttons.append([InlineKeyboardButton(f"⏹️ Остановить задачу {idx}", callback_data=f"stop_task:{task_id}")])
+    
+    # Задачи реакций
+    if reaction_tasks:
+        msg += "<b>💫 Задачи реакций:</b>\n"
+        for idx, task in enumerate(reaction_tasks, 1):
+            task_id = task.get("task_id")
+            chat_id = task.get("chat_id")
+            emojis = task.get("emojis", [])
+            mode = task.get("mode")
+            count = task.get("count")
+            status = task.get("status", "unknown")
+            started_at = safe(task.get("started_at"))
+            completed_at = safe(task.get("completed_at"))
+            error = safe(task.get("error"))
+            status_emoji = {
+                "running": "🟢",
+                "completed": "✅",
+                "stopped": "⏹️",
+                "error": "❌"
+            }.get(status, "❓")
+            msg += f"<b>{idx}. Задача реакций {safe(task_id)[:15]}...</b>\n"
+            msg += f"   📺 <b>Канал:</b> {safe(chat_id)}\n"
+            msg += f"   😊 <b>Эмодзи:</b> {', '.join(emojis) if emojis else '—'}\n"
+            msg += f"   🎯 <b>Режим:</b> {safe(mode)}\n"
+            if count:
+                msg += f"   📊 <b>Количество:</b> {safe(count)}\n"
+            msg += f"   {status_emoji} <b>Статус:</b> {status}\n"
+            msg += f"   🕐 <b>Запущена:</b> {started_at}\n"
+            if completed_at and completed_at != "—":
+                msg += f"   ✅ <b>Завершена:</b> {completed_at}\n"
+            if error and error != "—":
+                msg += f"   ❌ <b>Ошибка:</b> {error[:50]}...\n"
+            msg += "\n"
+            if status == "running" and task_id:
+                buttons.append([InlineKeyboardButton(f"⏹️ Остановить реакцию {idx}", callback_data=f"stop_reaction_task:{task_id}")])
+    
     # Кнопка остановить все
-    if (monitorings and any(m.get("active") and m.get("task_running") and m.get("channel_id") is not None and m.get("target_channel") is not None for m in monitorings)) or (tasks and any(t.get("status") == "running" and t.get("task_id") for t in tasks)):
+    has_running_tasks = (
+        (monitorings and any(m.get("active") and m.get("task_running") and m.get("channel_id") is not None and m.get("target_channel") is not None for m in monitorings)) or 
+        (tasks and any(t.get("status") == "running" and t.get("task_id") for t in tasks)) or
+        (reaction_tasks and any(t.get("status") == "running" and t.get("task_id") for t in reaction_tasks))
+    )
+    if has_running_tasks:
         buttons.append([InlineKeyboardButton("⏹️ Остановить все", callback_data="stop_all_tasks")])
     # Кнопки управления
-    buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="check_tasks_status")])
-    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_stats")])
+    if back_to == "reaction_back_to_stats":
+        buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="check_reaction_tasks_status")])
+    else:
+        buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="check_tasks_status")])
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data=back_to)])
     keyboard = InlineKeyboardMarkup(buttons)
     return msg, keyboard
 
-async def send_or_edit_status_message(message=None, callback_query=None):
+async def send_or_edit_status_message(message=None, callback_query=None, back_to="forward_back_to_stats", context="forwarding"):
     # Получаем user_id
     user_id = None
     if callback_query:
@@ -2476,11 +2533,14 @@ async def send_or_edit_status_message(message=None, callback_query=None):
     tasks_data = await api_client.get_all_tasks()
     tasks = tasks_data.get("tasks", [])
     logger.info(f"[STATUS_UNIFIED] Получено tasks: {tasks}")
+    reaction_tasks_data = await api_client.get_all_reaction_tasks()
+    reaction_tasks = reaction_tasks_data.get("tasks", [])
+    logger.info(f"[STATUS_UNIFIED] Получено reaction_tasks: {reaction_tasks}")
     updated = bool(callback_query)
-    if not monitorings and not tasks:
+    if not monitorings and not tasks and not reaction_tasks:
         text = "📊 Нет активных задач и мониторингов."
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_stats")]
+            [InlineKeyboardButton("🔙 Назад", callback_data=back_to)]
         ])
         if callback_query:
             try:
@@ -2490,7 +2550,7 @@ async def send_or_edit_status_message(message=None, callback_query=None):
         elif message:
             await message.reply(text, reply_markup=keyboard)
         return
-    msg, keyboard = await build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings, tasks, updated=updated)
+    msg, keyboard = await build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings, tasks, reaction_tasks, updated=updated, back_to=back_to)
     logger.info(f"[STATUS_UNIFIED] Итоговое сообщение: {msg}")
     try:
         if callback_query:
@@ -2511,16 +2571,24 @@ async def send_or_edit_status_message(message=None, callback_query=None):
         except Exception as e2:
             logger.error(f"[STATUS_UNIFIED] Ошибка при отправке/редактировании без parse_mode: {e2}")
 
+# Отдельная функция для статуса задач реакций
+async def send_or_edit_reaction_status_message(message=None, callback_query=None):
+    """Отдельная функция для статуса задач реакций с правильной кнопкой назад"""
+    await send_or_edit_status_message(message=message, callback_query=callback_query, back_to="reaction_back_to_stats", context="reactions")
+
 # Команда из клавиатуры
 async def monitorings_command(client: Client, message: Message):
     await send_or_edit_status_message(message=message)
 
-# Inline-кнопка
+# Inline-кнопка для статуса задач пересылки
 async def check_tasks_status_callback(client: Client, callback_query):
     await send_or_edit_status_message(callback_query=callback_query)
 
-# Добавляю обработку stop_task:<task_id> прямо здесь
-@Client.on_callback_query(filters.regex("^stop_task:"))
+# Inline-кнопка для статуса задач реакций
+async def check_reaction_tasks_status_callback(client: Client, callback_query):
+    await send_or_edit_reaction_status_message(callback_query=callback_query)
+
+# Обработчик остановки задач парсинг+пересылки
 async def stop_task_callback(client: Client, callback_query):
     try:
         data = callback_query.data
@@ -2536,8 +2604,23 @@ async def stop_task_callback(client: Client, callback_query):
         logger.error(f"Ошибка при остановке задачи: {e}")
         await callback_query.answer("❌ Ошибка при остановке задачи")
 
+# Обработчик остановки задач реакций
+async def stop_reaction_task_callback(client: Client, callback_query):
+    try:
+        data = callback_query.data
+        if data.startswith("stop_reaction_task:"):
+            task_id = data.split(":", 1)[1]
+            result = await api_client.stop_reaction_task(task_id)
+            if result.get("success"):
+                await callback_query.answer("✅ Задача реакций остановлена!")
+                await check_reaction_tasks_status_callback(client, callback_query)
+            else:
+                await callback_query.answer("❌ Ошибка при остановке задачи реакций")
+    except Exception as e:
+        logger.error(f"Ошибка при остановке задачи реакций: {e}")
+        await callback_query.answer("❌ Ошибка при остановке задачи реакций")
+
 # Обработчик остановки мониторинга
-@Client.on_callback_query(filters.regex(r"^stop_monitoring:(.+):(.+)"))
 async def stop_monitoring_callback(client, callback_query):
     parts = callback_query.data.split(":", 2)
     channel_id = parts[1]
@@ -2557,7 +2640,6 @@ async def stop_monitoring_callback(client, callback_query):
     await send_or_edit_status_message(callback_query=callback_query)
 
 # Обработчик остановки всех задач и мониторингов
-@Client.on_callback_query(filters.regex(r"^stop_all_tasks$"))
 async def stop_all_tasks_callback(client, callback_query):
     user_id = callback_query.from_user.id
     errors = []
@@ -2580,7 +2662,7 @@ async def stop_all_tasks_callback(client, callback_query):
         except Exception as e:
             logger.error(f"[STOP_ALL_TASKS] Ошибка: {e}")
             errors.append(str(e))
-    # Остановить все задачи
+    # Остановить все задачи парсинг+пересылки
     tasks_data = await api_client.get_all_tasks()
     tasks = tasks_data.get("tasks", [])
     for t in tasks:
@@ -2592,10 +2674,24 @@ async def stop_all_tasks_callback(client, callback_query):
             except Exception as e:
                 logger.error(f"[STOP_ALL_TASKS] Ошибка: {e}")
                 errors.append(str(e))
+    # Остановить все задачи реакций
+    reaction_tasks_data = await api_client.get_all_reaction_tasks()
+    reaction_tasks = reaction_tasks_data.get("tasks", [])
+    for t in reaction_tasks:
+        task_id = t.get("task_id")
+        if task_id:
+            try:
+                resp = await api_client.stop_reaction_task(task_id)
+                logger.info(f"[STOP_ALL_TASKS] stop_reaction_task {task_id}: {resp}")
+            except Exception as e:
+                logger.error(f"[STOP_ALL_TASKS] Ошибка: {e}")
+                errors.append(str(e))
     if errors:
         await callback_query.answer(f"❌ Ошибки: {'; '.join(errors)[:50]}")
     else:
         await callback_query.answer("✅ Все задачи и мониторинги остановлены!")
+    # Определяем, откуда был вызван статус задач, и используем соответствующую функцию
+    # По умолчанию используем обычный статус задач
     await send_or_edit_status_message(callback_query=callback_query)
 
 async def process_callback_query(client, callback_query):
@@ -2623,6 +2719,10 @@ async def process_callback_query(client, callback_query):
     # check_tasks_status
     if data == "check_tasks_status":
         await check_tasks_status_callback(client, callback_query)
+        return True
+    # check_reaction_tasks_status
+    if data == "check_reaction_tasks_status":
+        await check_reaction_tasks_status_callback(client, callback_query)
         return True
     # ... можно добавить другие кастомные обработчики ...
     # Если не обработано — fallback: вызываем forwarding_callback_handler

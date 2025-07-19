@@ -16,9 +16,10 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from pyrogram import Client, filters
 from pyrogram.errors import RPCError
+from pyrogram.types import BotCommand
 from bot.config import config
 from bot.states import user_states
-from bot.handlers import start_command, text_handler, forwarding_callback_handler, monitorings_command, check_tasks_status_callback, process_callback_query
+from bot.handlers import start_command, text_handler, forwarding_callback_handler, monitorings_command, check_tasks_status_callback
 from bot.navigation_manager import navigation_menu_handler, navigation_text_handler
 import bot.handlers  # Для регистрации всех callback-обработчиков
 from bot.session_handlers import (
@@ -51,6 +52,8 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
 
 # Инициализация клиента Pyrogram
 app = Client(
@@ -165,23 +168,136 @@ async def add_reaction_callback_decorator(client, callback_query):
     from bot.session_handlers import add_reaction_callback
     await add_reaction_callback(client, callback_query)
 
-@app.on_callback_query(filters.regex(r"^reaction_"))
+
+
+# Обработчики для задач и мониторингов
+@app.on_callback_query(filters.regex("^stop_task:"))
+async def stop_task_handler(client, callback_query):
+    from bot.handlers import stop_task_callback
+    await stop_task_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^stop_reaction_task:"))
+async def stop_reaction_task_handler(client, callback_query):
+    from bot.handlers import stop_reaction_task_callback
+    await stop_reaction_task_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex(r"^stop_monitoring:(.+):(.+)"))
+async def stop_monitoring_handler(client, callback_query):
+    from bot.handlers import stop_monitoring_callback
+    await stop_monitoring_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex(r"^stop_all_tasks$"))
+async def stop_all_tasks_handler(client, callback_query):
+    from bot.handlers import stop_all_tasks_callback
+    await stop_all_tasks_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^forward_back_to_stats$"))
+async def forward_back_to_stats_handler(client, callback_query):
+    await forwarding_callback_handler(client, callback_query)
+
+@app.on_callback_query(filters.regex("^reaction_back_to_stats$"))
+async def reaction_back_to_stats_handler(client, callback_query):
+    await reaction_callback_handler(client, callback_query)
+
+# Обработчики для пагинации и медиа
+@app.on_callback_query(filters.regex("^page_"))
+async def page_handler(client, callback_query):
+    await forwarding_callback_handler(client, callback_query)
+
+@app.on_callback_query(filters.regex("^showmedia_"))
+async def showmedia_handler(client, callback_query):
+    await forwarding_callback_handler(client, callback_query)
+
+@app.on_callback_query(filters.regex("^close_pagination$"))
+async def close_pagination_handler(client, callback_query):
+    await forwarding_callback_handler(client, callback_query)
+
+@app.on_callback_query(filters.regex("^publish_now$"))
+async def publish_now_handler(client, callback_query):
+    await forwarding_callback_handler(client, callback_query)
+
+@app.on_callback_query(filters.regex("^noop$"))
+async def noop_handler(client, callback_query):
+    await callback_query.answer()
+
+# Обработчики для реакций из reaction_handlers.py
+@app.on_callback_query(filters.regex("^view_sessions$"))
+async def view_sessions_handler(client, callback_query):
+    from bot.reaction_handlers import view_sessions_callback
+    await view_sessions_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^assign_reaction_session$"))
+async def assign_reaction_session_handler(client, callback_query):
+    from bot.reaction_handlers import assign_reaction_session_callback
+    await assign_reaction_session_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^toggle_reaction_session:(.+)$"))
+async def toggle_reaction_session_handler(client, callback_query):
+    from bot.reaction_handlers import toggle_reaction_session_callback
+    await toggle_reaction_session_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^back_to_sessions$"))
+async def back_to_sessions_handler(client, callback_query):
+    from bot.reaction_handlers import back_to_sessions_callback
+    await back_to_sessions_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^back_to_reactions$"))
+async def back_to_reactions_handler(client, callback_query):
+    from bot.reaction_handlers import back_to_reactions_callback
+    await back_to_reactions_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^select_reaction:(.+)$"))
+async def select_reaction_handler(client, callback_query):
+    from bot.reaction_handlers import select_reaction_callback
+    await select_reaction_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^use_default_session$"))
+async def use_default_session_handler(client, callback_query):
+    from bot.reaction_handlers import use_default_session_callback
+    await use_default_session_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^confirm_reaction$"))
+async def confirm_reaction_handler(client, callback_query):
+    from bot.reaction_handlers import confirm_reaction_callback
+    await confirm_reaction_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^confirm_reaction_default$"))
+async def confirm_reaction_default_handler(client, callback_query):
+    from bot.reaction_handlers import confirm_reaction_default_callback
+    await confirm_reaction_default_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^cancel_reaction$"))
+async def cancel_reaction_handler(client, callback_query):
+    from bot.reaction_handlers import cancel_reaction_callback
+    await cancel_reaction_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^check_tasks_status$"))
+async def check_tasks_status_handler(client, callback_query):
+    await check_tasks_status_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^check_reaction_tasks_status$"))
+async def check_reaction_tasks_status_handler(client, callback_query):
+    from bot.handlers import check_reaction_tasks_status_callback
+    await check_reaction_tasks_status_callback(client, callback_query)
+
+# Обработчики для кнопок из states.py
+@app.on_callback_query(filters.regex("^forward_"))
+async def forward_callback_handler(client, callback_query):
+    await forwarding_callback_handler(client, callback_query)
+
+@app.on_callback_query(filters.regex("^reaction_"))
 async def reaction_callback_handler_decorator(client, callback_query):
     await reaction_callback_handler(client, callback_query)
 
-# Универсальный обработчик для всех остальных callback_data
+# Универсальный обработчик для всех остальных callback_data (должен быть последним)
 @app.on_callback_query()
 async def universal_callback_handler(client, callback_query):
-    logger.info(f"[UNIVERSAL_CALLBACK_HANDLER] Вызван universal_callback_handler | user_id={callback_query.from_user.id} | callback_data={callback_query.data}")
+    logger.info(f"[UNIVERSAL_CALLBACK_HANDLER] Неизвестное действие | user_id={callback_query.from_user.id} | callback_data={callback_query.data}")
     await callback_query.answer("Неизвестное действие", show_alert=True)
 
 @app.on_message(filters.command("monitorings"))
 async def monitorings_handler(client, message):
     await monitorings_command(client, message)
-
-@app.on_callback_query(filters.regex("^check_tasks_status$"))
-async def check_tasks_status_handler(client, callback_query):
-    await check_tasks_status_callback(client, callback_query)
 
 # После инициализации app:
 # app.add_handler(CallbackQueryHandler(add_session_callback, filters.regex("^add_session$")))
@@ -202,6 +318,7 @@ async def check_tasks_status_handler(client, callback_query):
 def run_bot():
     """Функция для запуска бота извне"""
     try:
+        # Запускаем бота стандартным способом Pyrogram
         app.run()
     except KeyboardInterrupt:
         logger.info("Программа завершена пользователем")

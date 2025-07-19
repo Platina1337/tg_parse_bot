@@ -457,5 +457,26 @@ class ParserAPIClient:
                 logger.error(f"[API][MASS_REACTIONS] Ошибка: {e}")
                 return {"success": False, "error": str(e)}
 
+    async def get_reaction_task_status(self, task_id: str) -> dict:
+        """Получить статус задачи реакций."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(f"{self.base_url}/reactions/task_status/{task_id}")
+            response.raise_for_status()
+            return response.json()
+
+    async def stop_reaction_task(self, task_id: str) -> dict:
+        """Остановить задачу реакций."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(f"{self.base_url}/reactions/stop_task/{task_id}")
+            response.raise_for_status()
+            return response.json()
+
+    async def get_all_reaction_tasks(self) -> dict:
+        """Получить список всех задач реакций."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(f"{self.base_url}/reactions/all_tasks")
+            response.raise_for_status()
+            return response.json()
+
 # Глобальный экземпляр API клиента
 api_client = ParserAPIClient() 

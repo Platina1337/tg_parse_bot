@@ -105,6 +105,9 @@ forwarder = None
 session_manager = None
 reaction_manager = None
 
+# Хранение задач реакций
+reaction_tasks = {}
+
 @app.on_event("startup")
 async def startup_event():
     """Действия при запуске сервиса"""
@@ -1519,7 +1522,7 @@ async def get_available_reactions():
 @app.post("/reactions/mass_add")
 async def mass_add_reactions(request: Request, background_tasks: BackgroundTasks):
     import logging
-    global session_manager, reaction_manager
+    global session_manager, reaction_manager, reaction_tasks
     sessions = await session_manager.get_sessions_for_task("reactions")
     if not sessions:
         logging.error("[MASS_REACTIONS] Нет ни одной сессии, назначенной на reactions")
@@ -1544,25 +1547,52 @@ async def mass_add_reactions(request: Request, background_tasks: BackgroundTasks
     if not emojis:
         return JSONResponse({"success": False, "error": "Не указаны эмодзи для реакций"})
     
+    # Создаем task_id
+    task_id = f"mass_reactions_{chat_id}_{int(time.time())}"
+    
+    # Сохраняем информацию о задаче
+    reaction_tasks[task_id] = {
+        "task_id": task_id,
+        "chat_id": chat_id,
+        "emojis": emojis,
+        "mode": mode,
+        "count": count,
+        "date": date,
+        "date_from": date_from,
+        "date_to": date_to,
+        "hashtag": hashtag,
+        "delay": delay,
+        "status": "running",
+        "started_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "error": None,
+        "results": []
+    }
+    
     # Запускаем массовые реакции в фоне
-    background_tasks.add_task(execute_mass_reactions, chat_id, emojis, mode, count, date, date_from, date_to, hashtag, delay)
+    background_tasks.add_task(execute_mass_reactions, task_id, chat_id, emojis, mode, count, date, date_from, date_to, hashtag, delay)
     
     return JSONResponse({
         "success": True,
         "message": "Массовые реакции запущены в фоновом режиме",
-        "task_id": f"mass_reactions_{chat_id}_{int(time.time())}"
+        "task_id": task_id
     })
 
 
-async def execute_mass_reactions(chat_id, emojis, mode, count, date, date_from, date_to, hashtag, delay):
+async def execute_mass_reactions(task_id, chat_id, emojis, mode, count, date, date_from, date_to, hashtag, delay):
     """Выполнение массовых реакций в фоновом режиме"""
     import logging
     import random
-    global session_manager, reaction_manager
+    global session_manager, reaction_manager, reaction_tasks
     
     sessions = await session_manager.get_sessions_for_task("reactions")
     if not sessions:
         logging.error("[MASS_REACTIONS] Нет ни одной сессии, назначенной на reactions")
+        # Обновляем статус задачи при ошибке
+        if task_id in reaction_tasks:
+            reaction_tasks[task_id]["status"] = "error"
+            reaction_tasks[task_id]["error"] = "Нет ни одной сессии, назначенной на reactions"
+            reaction_tasks[task_id]["completed_at"] = datetime.now().isoformat()
         return
     
     all_results = []
@@ -1711,6 +1741,71 @@ async def execute_mass_reactions(chat_id, emojis, mode, count, date, date_from, 
         })
     
     logging.info(f"[MASS_REACTIONS] === ЗАВЕРШЕНО === Результаты: {all_results}")
+    
+    # Обновляем статус задачи
+    if task_id in reaction_tasks:
+        # Проверяем, есть ли ошибки во всех сессиях
+        all_errors = []
+        for result in all_results:
+            if result.get("errors"):
+                all_errors.extend(result["errors"])
+        
+        if all_errors and len(all_errors) == len(all_results):
+            # Все сессии завершились с ошибками
+            reaction_tasks[task_id]["status"] = "error"
+            reaction_tasks[task_id]["error"] = "; ".join(all_errors[:3])  # Берем первые 3 ошибки
+        else:
+            reaction_tasks[task_id]["status"] = "completed"
+        
+        reaction_tasks[task_id]["completed_at"] = datetime.now().isoformat()
+        reaction_tasks[task_id]["results"] = all_results
+        logging.info(f"[MASS_REACTIONS] Статус задачи {task_id} обновлен на '{reaction_tasks[task_id]['status']}'")
+
+# API эндпоинты для работы с задачами реакций
+@app.get("/reactions/task_status/{task_id}")
+async def get_reaction_task_status(task_id: str):
+    """Получить статус задачи реакций"""
+    global reaction_tasks
+    if task_id not in reaction_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    task_info = reaction_tasks[task_id]
+    return {
+        "success": True,
+        "task": task_info
+    }
+
+@app.post("/reactions/stop_task/{task_id}")
+async def stop_reaction_task(task_id: str):
+    """Остановить задачу реакций"""
+    global reaction_tasks
+    if task_id not in reaction_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    task_info = reaction_tasks[task_id]
+    if task_info["status"] == "running":
+        task_info["status"] = "stopped"
+        task_info["completed_at"] = datetime.now().isoformat()
+        return {
+            "success": True,
+            "message": "Task stopped successfully",
+            "task_id": task_id
+        }
+    else:
+        return {
+            "success": False,
+            "message": "Task is not running",
+            "task_id": task_id
+        }
+
+@app.get("/reactions/all_tasks")
+async def get_all_reaction_tasks():
+    """Получить список всех задач реакций"""
+    global reaction_tasks
+    return {
+        "success": True,
+        "tasks": list(reaction_tasks.values())
+    }
 
 if __name__ == "__main__":
     import uvicorn
