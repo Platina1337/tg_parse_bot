@@ -8,7 +8,7 @@ from typing import Dict, Optional
 import httpx
 import textwrap
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove, InputMediaPhoto, InputMediaVideo, ReplyKeyboardMarkup, KeyboardButton
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove, InputMediaPhoto, InputMediaVideo, ReplyKeyboardMarkup, KeyboardButton, CallbackQuery
 from pyrogram.errors import MessageNotModified, ChatAdminRequired, PeerIdInvalid, ChannelPrivate
 from shared.models import ParseConfig, ParseMode, PostingSettings
 from bot.settings import get_user_settings, update_user_settings, clear_user_settings, get_user_templates, save_user_template, DB_PATH
@@ -28,7 +28,9 @@ from bot.states import (
     start_forwarding_api, stop_forwarding_api, get_forwarding_stats_api, save_forwarding_config_api,
     check_monitoring_status, get_monitor_stat_text,
     start_forwarding_parsing_api, get_forwarding_history_stats_api, clear_forwarding_history_api,
-    get_channel_info, get_target_channel_info
+    get_channel_info, get_target_channel_info,
+    FSM_REACTION_CHANNEL, FSM_REACTION_SETTINGS, FSM_REACTION_EMOJIS, FSM_REACTION_MODE, FSM_REACTION_HASHTAG, FSM_REACTION_DATE, FSM_REACTION_DATE_RANGE, FSM_REACTION_COUNT, FSM_REACTION_CONFIRM,
+    get_reaction_settings_keyboard, get_reaction_inline_keyboard,
 )
 from bot.config import config
 from bot.core import (
@@ -174,6 +176,11 @@ async def text_handler(client: Client, message: Message):
         elif text in ["Навигация по хэштегам", "🧭 Навигация по хэштегам"]:
             from bot.navigation_manager import navigation_menu_handler
             await navigation_menu_handler(client, message)
+            return
+        elif text in ["Реакции ⭐", "⭐ Реакции"]:
+            # Обработка перенесена в reaction_master.py
+            from bot.reaction_master import start_reaction_master
+            await start_reaction_master(client, message)
             return
         else:
             await show_main_menu(client, message, "Пожалуйста, выберите действие из меню:")
@@ -1093,8 +1100,13 @@ async def text_handler(client: Client, message: Message):
         return
 
     # Проверяем состояния сессий и реакций
-    if state and (state.startswith("session_") or state.startswith("reaction_")):
+    if state and state.startswith("session_"):
         # Эти состояния обрабатываются в других обработчиках
+        return
+    elif state and state.startswith("reaction_"):
+        # Обработка реакций перенесена в reaction_master.py
+        from bot.reaction_master import process_reaction_fsm
+        await process_reaction_fsm(client, message)
         return
     
     # Если этап не определён
@@ -2329,21 +2341,11 @@ async def check_userbot_admin_rights(client, channel_id):
         return False
 
 # --- Функция для нормализации канала ---
-async def resolve_channel(api_client, channel_input):
-    """
-    Принимает username (с @ или без) или id, возвращает (id, title, username)
-    """
-    # Убрать @ если есть
-    if isinstance(channel_input, str) and channel_input.startswith("@"): 
-        channel_input = channel_input[1:]
-    try:
-        stats = await api_client.get_channel_stats(channel_input)
-        channel_id = stats.get('channel_id')
-        channel_title = stats.get('channel_title') or str(channel_input)
-        channel_username = stats.get('username')
-        return str(channel_id), channel_title, channel_username
-    except Exception as e:
-        return str(channel_input), str(channel_input), None
+async def resolve_channel(api_client, text):
+    stats = await api_client.get_channel_stats(text)
+    if stats and stats.get("id"):
+        return stats["id"], stats.get("title", ""), stats.get("username", "")
+    return None, text, ""
 
 def format_channel(cfg, channel_id_key="channel_id", title_key="channel_title", username_key="username"):
     channel_id = cfg.get(channel_id_key) or cfg.get("source_channel") or cfg.get("target_channel")
@@ -2626,3 +2628,10 @@ async def process_callback_query(client, callback_query):
     # Если не обработано — fallback: вызываем forwarding_callback_handler
     await forwarding_callback_handler(client, callback_query)
     return True
+
+
+
+
+
+# Обработка реакций перенесена в reaction_master.py
+

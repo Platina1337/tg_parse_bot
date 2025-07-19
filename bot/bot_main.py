@@ -38,6 +38,7 @@ from bot.reaction_handlers import (
     reactions_command,
     handle_reaction_text_input
 )
+from bot.reaction_master import start_reaction_master, process_reaction_fsm, reaction_callback_handler
 from pyrogram.handlers import CallbackQueryHandler
 
 # Настройка логирования
@@ -77,8 +78,7 @@ async def sessions_command_handler(client, message):
 
 @app.on_message(filters.command("reactions"))
 async def reactions_command_handler(client, message):
-    """Handler for /reactions command for adding reactions with multiple accounts"""
-    await reactions_command(client, message)
+    await start_reaction_master(client, message)
 
 @app.on_message(filters.text & filters.private)
 async def text_message_handler(client, message):
@@ -103,14 +103,8 @@ async def text_message_handler(client, message):
         logger.info(f"[TEXT_HANDLER] Session not handled, returning for user {user_id}")
         return
     elif state and state.startswith("reaction_"):
-        # Handle reaction management text input
-        logger.info(f"[TEXT_HANDLER] Handling reaction for user {user_id}")
-        handled = await handle_reaction_text_input(client, message)
-        if handled:
-            logger.info(f"[TEXT_HANDLER] Reaction handled for user {user_id}")
-            return
-        # Don't call text_handler if reaction input was handled
-        logger.info(f"[TEXT_HANDLER] Reaction not handled, returning for user {user_id}")
+        logger.info(f"[TEXT_HANDLER] Handling reaction FSM for user {user_id}")
+        await process_reaction_fsm(client, message)
         return
     else:
         logger.info(f"[TEXT_HANDLER] Calling text_handler for user {user_id}")
@@ -170,6 +164,10 @@ async def resend_code_callback_decorator(client, callback_query):
 async def add_reaction_callback_decorator(client, callback_query):
     from bot.session_handlers import add_reaction_callback
     await add_reaction_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex(r"^reaction_"))
+async def reaction_callback_handler_decorator(client, callback_query):
+    await reaction_callback_handler(client, callback_query)
 
 # Универсальный обработчик для всех остальных callback_data
 @app.on_callback_query()

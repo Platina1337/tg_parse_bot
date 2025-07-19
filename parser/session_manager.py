@@ -283,12 +283,19 @@ class SessionManager:
         for alias, client in self.clients.items():
             try:
                 if client.is_connected:
-                    await client.stop()
-                    results[alias] = "success"
+                    try:
+                        await client.stop()
+                        results[alias] = "success"
+                    except asyncio.CancelledError:
+                        results[alias] = "cancelled"
+                        # Не логируем как ошибку, это штатная ситуация при shutdown
+                    except Exception as e:
+                        logger.error(f"Error stopping session {alias}: {e}")
+                        results[alias] = f"error: {str(e)}"
                 else:
                     results[alias] = "already_stopped"
             except Exception as e:
-                logger.error(f"Error stopping session {alias}: {e}")
+                logger.error(f"Error in stop_all for {alias}: {e}")
                 results[alias] = f"error: {str(e)}"
         return results
     

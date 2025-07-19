@@ -39,6 +39,17 @@ FSM_FORWARD_RANGE = "forward_range"
 FSM_FORWARD_RANGE_START = "forward_range_start"
 FSM_FORWARD_RANGE_END = "forward_range_end"
 
+# Новые состояния для реакций
+FSM_REACTION_CHANNEL = "reaction_channel"
+FSM_REACTION_SETTINGS = "reaction_settings"
+FSM_REACTION_EMOJIS = "reaction_emojis"
+FSM_REACTION_MODE = "reaction_mode"
+FSM_REACTION_HASHTAG = "reaction_hashtag"
+FSM_REACTION_DATE = "reaction_date"
+FSM_REACTION_DATE_RANGE = "reaction_date_range"
+FSM_REACTION_COUNT = "reaction_count"
+FSM_REACTION_CONFIRM = "reaction_confirm"
+
 # --- Новые состояния для навигации по хэштегам ---
 FSM_NAVIGATION_MENU = "navigation_menu"
 FSM_NAVIGATION_AWAIT_CHANNEL = "navigation_await_channel"
@@ -439,4 +450,31 @@ def get_forwarding_inline_keyboard(channel_id=None, target_channel=None, last_ta
         buttons.append([InlineKeyboardButton("⏹️ Остановить задачу", callback_data=f"stop_task:{last_task_id}")])
     buttons.append([InlineKeyboardButton("📊 Статус задач", callback_data="check_tasks_status")])
     buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="forward_back")])
+    return InlineKeyboardMarkup(buttons) 
+
+def get_reaction_settings_keyboard():
+    """Клавиатура настроек массовых реакций"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("😀 Эмодзи", callback_data="reaction_emojis"),
+            InlineKeyboardButton("⚙️ Режим", callback_data="reaction_mode")
+        ],
+        [
+            InlineKeyboardButton("⏱️ Задержка", callback_data="reaction_delay")
+        ],
+        [
+            InlineKeyboardButton("💾 Сохранить", callback_data="reaction_save"),
+            InlineKeyboardButton("🔙 Назад", callback_data="reaction_back_to_stats")
+        ]
+    ])
+
+def get_reaction_inline_keyboard(channel_id=None, last_task_id=None):
+    buttons = [
+        [InlineKeyboardButton("▶️ Запустить", callback_data="reaction_start")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="reaction_settings")],
+    ]
+    if last_task_id:
+        buttons.append([InlineKeyboardButton("⏹️ Остановить задачу", callback_data=f"stop_reaction_task:{last_task_id}")])
+    buttons.append([InlineKeyboardButton("📊 Статус задач", callback_data="check_reaction_tasks_status")])
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="reaction_back")])
     return InlineKeyboardMarkup(buttons) 

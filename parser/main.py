@@ -4,12 +4,13 @@ import json
 import re
 import asyncio
 import traceback
+import time
 from typing import List, Optional
 from datetime import datetime, timedelta
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Body
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Body, APIRouter, Request
 from pydantic import BaseModel
 import logging
 from dotenv import load_dotenv
@@ -1454,6 +1455,52 @@ async def add_multiple_reactions(request: MultipleReactionsRequest):
     
     return result
 
+@app.post("/reactions/add_to_posts")
+async def add_reactions_to_posts(request: Request):
+    """Add reactions to posts (media groups) instead of individual messages"""
+    global reaction_manager, session_manager
+    
+    if not reaction_manager:
+        raise HTTPException(status_code=500, detail="Reaction manager not initialized")
+    
+    try:
+        data = await request.json()
+        chat_id = data.get("chat_id")
+        reaction = data.get("reaction")
+        session_names = data.get("session_names")
+        limit = data.get("limit", 50)  # Количество постов для обработки
+        
+        if not chat_id or not reaction:
+            raise HTTPException(status_code=400, detail="chat_id и reaction обязательны")
+        
+        # Получаем сообщения из канала
+        sessions = await session_manager.get_sessions_for_task("reactions")
+        if not sessions:
+            raise HTTPException(status_code=400, detail="Нет сессий для реакций")
+        
+        # Используем первую сессию для получения сообщений
+        userbot = await session_manager.get_client(sessions[0].alias)
+        if not userbot.is_connected:
+            await userbot.start()
+        
+        messages = []
+        async for msg in userbot.get_chat_history(chat_id, limit=limit * 10):  # Берем больше сообщений для группировки
+            messages.append(msg)
+        
+        # Добавляем реакции к постам
+        result = await reaction_manager.add_reaction_to_posts(
+            chat_id=chat_id,
+            messages=messages,
+            reaction=reaction,
+            session_names=session_names
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error adding reactions to posts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/reactions/available")
 async def get_available_reactions():
     """Get list of available reactions"""
@@ -1468,6 +1515,202 @@ async def get_available_reactions():
         "success": True,
         "reactions": reactions
     }
+
+@app.post("/reactions/mass_add")
+async def mass_add_reactions(request: Request, background_tasks: BackgroundTasks):
+    import logging
+    global session_manager, reaction_manager
+    sessions = await session_manager.get_sessions_for_task("reactions")
+    if not sessions:
+        logging.error("[MASS_REACTIONS] Нет ни одной сессии, назначенной на reactions")
+        return JSONResponse({"success": False, "error": "Нет ни одной сессии, назначенной на reactions"})
+    
+    data = await request.json()
+    chat_id = data.get("chat_id")
+    emojis = data.get("emojis", [])
+    mode = data.get("mode")
+    count = data.get("count")
+    date = data.get("date")
+    date_from = data.get("date_from")
+    date_to = data.get("date_to")
+    hashtag = data.get("hashtag")
+    delay = data.get("delay", 1)
+    
+    # Дополнительное логирование для отладки
+    logging.info(f"[MASS_REACTIONS] === НАЧАЛО ОБРАБОТКИ ===")
+    logging.info(f"[MASS_REACTIONS] Получены данные: chat_id={chat_id}, emojis={emojis}, mode={mode}, count={count}, delay={delay}")
+    logging.info(f"[MASS_REACTIONS] Тип emojis: {type(emojis)}, длина: {len(emojis) if emojis else 0}")
+    
+    if not emojis:
+        return JSONResponse({"success": False, "error": "Не указаны эмодзи для реакций"})
+    
+    # Запускаем массовые реакции в фоне
+    background_tasks.add_task(execute_mass_reactions, chat_id, emojis, mode, count, date, date_from, date_to, hashtag, delay)
+    
+    return JSONResponse({
+        "success": True,
+        "message": "Массовые реакции запущены в фоновом режиме",
+        "task_id": f"mass_reactions_{chat_id}_{int(time.time())}"
+    })
+
+
+async def execute_mass_reactions(chat_id, emojis, mode, count, date, date_from, date_to, hashtag, delay):
+    """Выполнение массовых реакций в фоновом режиме"""
+    import logging
+    import random
+    global session_manager, reaction_manager
+    
+    sessions = await session_manager.get_sessions_for_task("reactions")
+    if not sessions:
+        logging.error("[MASS_REACTIONS] Нет ни одной сессии, назначенной на reactions")
+        return
+    
+    all_results = []
+    
+    for session in sessions:
+        alias = session.alias
+        userbot = await session_manager.get_client(alias)
+        logging.info(f"[MASS_REACTIONS] Используется userbot: alias={alias}, name={getattr(userbot, 'name', None)}, phone={getattr(userbot, 'phone_number', None)}")
+        
+        errors = []
+        total_posts = 0
+        reacted_posts = 0
+        
+        try:
+            if not userbot.is_connected:
+                await userbot.start()
+            
+            # Проверяем premium
+            is_premium = False
+            try:
+                me = await userbot.get_me()
+                logging.info(f"[MASS_REACTIONS] Аккаунт: {me.first_name} (@{me.username})")
+            except Exception as e:
+                logging.warning(f"[MASS_REACTIONS] Не удалось определить premium для {alias}: {e}")
+            
+            # Получаем сообщения
+            messages = []
+            logging.info(f"[MASS_REACTIONS] chat_id={chat_id}, mode={mode}, count={count}, emojis={emojis}, delay={delay}, is_premium={is_premium}")
+            
+            # Берем больше сообщений для поиска постов
+            limit_for_search = max(count * 3, 100) if count else 2000  # Берем минимум в 3 раза больше или 100 сообщений
+            
+            if mode == "from_last":
+                async for msg in userbot.get_chat_history(chat_id, limit=limit_for_search):
+                    messages.append(msg)
+            elif mode == "last_n":
+                async for msg in userbot.get_chat_history(chat_id, limit=limit_for_search):
+                    messages.append(msg)
+            else:
+                async for msg in userbot.get_chat_history(chat_id, limit=limit_for_search):
+                    messages.append(msg)
+            
+            logging.info(f"[MASS_REACTIONS] Найдено сообщений: {len(messages)}")
+            if not messages:
+                logging.warning(f"[MASS_REACTIONS] В канале {chat_id} нет сообщений!")
+                all_results.append({
+                    "alias": alias,
+                    "phone": getattr(userbot, 'phone_number', None),
+                    "total_posts": 0,
+                    "reacted_posts": 0,
+                    "errors": ["Нет сообщений в канале"],
+                })
+                continue
+            
+            # Подсчитываем количество постов заранее для информации
+            media_groups_found = set()
+            individual_posts_found = 0
+            
+            for msg in messages:
+                if hasattr(msg, 'media_group_id') and msg.media_group_id is not None:
+                    media_groups_found.add(msg.media_group_id)
+                else:
+                    individual_posts_found += 1
+            
+            total_posts_available = len(media_groups_found) + individual_posts_found
+            logging.info(f"[MASS_REACTIONS] Найдено постов: {total_posts_available} (медиагрупп: {len(media_groups_found)}, отдельных: {individual_posts_found})")
+            logging.info(f"[MASS_REACTIONS] Цель: обработать {count or 'все'} постов")
+            
+            # НЕ ограничиваем количество сообщений заранее - будем искать посты среди всех сообщений
+            logging.info(f"[MASS_REACTIONS] Будем искать посты среди {len(messages)} сообщений")
+            
+            # Простая логика: идем по сообщениям и обрабатываем каждый пост
+            processed_media_groups = set()  # Уже обработанные медиагруппы
+            reacted_posts = 0
+            
+            logging.info(f"[MASS_REACTIONS] Начинаем обработку {len(messages)} сообщений")
+            
+            for i, message in enumerate(messages):
+                if count and reacted_posts >= count:
+                    logging.info(f"[MASS_REACTIONS] Достигнут лимит {count} постов - останавливаемся")
+                    break
+                
+                # Логируем прогресс каждые 10 сообщений
+                if i % 10 == 0 and i > 0:
+                    logging.info(f"[MASS_REACTIONS] Просмотрено {i}/{len(messages)} сообщений, найдено {reacted_posts} постов")
+                    
+                try:
+                    # Проверяем, является ли сообщение частью медиагруппы
+                    if hasattr(message, 'media_group_id') and message.media_group_id is not None:
+                        # Это медиагруппа
+                        if message.media_group_id in processed_media_groups:
+                            logging.info(f"[MASS_REACTIONS] Пропускаем сообщение {message.id} - медиагруппа {message.media_group_id} уже обработана")
+                            continue
+                        
+                        # Обрабатываем медиагруппу
+                        logging.info(f"[MASS_REACTIONS] Обрабатываем пост {reacted_posts + 1}/{count or '∞'}: медиагруппа {message.media_group_id} (сообщение {message.id})")
+                        emoji = random.choice(emojis)
+                        result = await userbot.send_reaction(chat_id, message.id, emoji)
+                        logging.info(f"[MASS_REACTIONS] Поставлена реакция {emoji} на медиагруппу {message.media_group_id} (сообщение {message.id})")
+                        processed_media_groups.add(message.media_group_id)
+                        reacted_posts += 1
+                        
+                    else:
+                        # Это отдельное сообщение
+                        logging.info(f"[MASS_REACTIONS] Обрабатываем пост {reacted_posts + 1}/{count or '∞'}: отдельное сообщение {message.id}")
+                        emoji = random.choice(emojis)
+                        result = await userbot.send_reaction(chat_id, message.id, emoji)
+                        logging.info(f"[MASS_REACTIONS] Поставлена реакция {emoji} на сообщение {message.id}")
+                        reacted_posts += 1
+                    
+                    logging.info(f"[MASS_REACTIONS] Прогресс: {reacted_posts} постов обработано")
+                    
+                    # Задержка между постами
+                    if delay > 0 and i < len(messages) - 1:
+                        logging.info(f"[MASS_REACTIONS] Задержка {delay} сек перед следующим постом")
+                        await asyncio.sleep(delay)
+                        
+                except Exception as e:
+                    logging.error(f"[MASS_REACTIONS] Ошибка при обработке сообщения {message.id}: {e}")
+                    errors.append(str(e))
+            
+            total_posts = reacted_posts
+            
+            if count and reacted_posts < count:
+                logging.warning(f"[MASS_REACTIONS] Найдено только {reacted_posts} постов из запрошенных {count}")
+                logging.info(f"[MASS_REACTIONS] Просмотрено {len(messages)} сообщений, но постов недостаточно")
+            else:
+                logging.info(f"[MASS_REACTIONS] Успешно обработано {reacted_posts} постов")
+            
+            logging.info(f"[MASS_REACTIONS] Завершена обработка сессии {alias}: {reacted_posts}/{total_posts} постов обработано")
+            
+        except Exception as e:
+            logging.error(f"[MASS_REACTIONS] Глобальная ошибка для сессии {alias}: {e}")
+            errors.append(str(e))
+        finally:
+            if userbot.is_connected:
+                await userbot.stop()
+                logging.info(f"[MASS_REACTIONS] Сессия {alias} остановлена после массовой реакции")
+        
+        all_results.append({
+            "alias": alias,
+            "phone": getattr(userbot, 'phone_number', None),
+            "total_posts": total_posts,
+            "reacted_posts": reacted_posts,
+            "errors": errors,
+        })
+    
+    logging.info(f"[MASS_REACTIONS] === ЗАВЕРШЕНО === Результаты: {all_results}")
 
 if __name__ == "__main__":
     import uvicorn

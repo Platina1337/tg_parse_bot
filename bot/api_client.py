@@ -433,5 +433,29 @@ class ParserAPIClient:
         """Get list of available reactions"""
         return await self._make_request("GET", "/reactions/available")
 
+    async def start_mass_reactions(self, channel_id, settings):
+        """Запуск массовых реакций через API парсера"""
+        url = f"{self.base_url}/reactions/mass_add"
+        payload = {"chat_id": channel_id, **settings}
+        # Явно добавляем delay, если есть
+        if "delay" in settings:
+            payload["delay"] = settings["delay"]
+        logger.info(f"[API][MASS_REACTIONS] Отправляем payload: {payload}")
+        
+        # Увеличиваем timeout для массовых реакций (5 минут)
+        timeout = httpx.Timeout(300.0)  # 5 минут
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                resp = await client.post(url, json=payload)
+                result = resp.json()
+                logger.info(f"[API][MASS_REACTIONS] Получен ответ: {result}")
+                return result
+            except httpx.TimeoutException:
+                logger.error(f"[API][MASS_REACTIONS] Timeout - операция заняла слишком много времени")
+                return {"success": False, "error": "Timeout - операция заняла слишком много времени"}
+            except Exception as e:
+                logger.error(f"[API][MASS_REACTIONS] Ошибка: {e}")
+                return {"success": False, "error": str(e)}
+
 # Глобальный экземпляр API клиента
 api_client = ParserAPIClient() 
