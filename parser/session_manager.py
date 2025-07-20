@@ -29,9 +29,10 @@ class SessionManager:
         sessions = await self.db.get_all_sessions()
         for session in sessions:
             if session.is_active:
-                # Используем абсолютный путь к файлу сессии
-                session_path = os.path.abspath(session.session_path)
-                self.clients[session.alias] = Client(
+                # Используем только alias для имени файла сессии
+                alias = os.path.basename(session.alias if hasattr(session, 'alias') else session.session_path)
+                session_path = os.path.join(self.session_dir, alias)
+                self.clients[alias] = Client(
                     name=session_path,
                     api_id=session.api_id,
                     api_hash=session.api_hash,
@@ -39,10 +40,10 @@ class SessionManager:
                 )
 
     async def add_account(self, alias: str, api_id: int, api_hash: str, phone: str) -> Dict[str, Any]:
-        # Формируем абсолютный путь к файлу сессии
+        # Формируем путь к файлу сессии только по alias
         session_dir_abs = os.path.abspath(self.session_dir)
         os.makedirs(session_dir_abs, exist_ok=True)
-        session_path = os.path.join(session_dir_abs, alias)
+        session_path = alias  # сохраняем только alias
         session = SessionMeta(
             id=0,
             alias=alias,
@@ -94,14 +95,16 @@ class SessionManager:
             session = await self.db.get_session_by_alias(alias)
             if session:
                 session_dir_abs = os.path.abspath(self.session_dir)
+                # Используем только alias для имени файла сессии
+                alias_clean = os.path.basename(session.alias if hasattr(session, 'alias') else session.session_path)
                 client = Client(
-                    name=session.session_path,
+                    name=os.path.join(session_dir_abs, alias_clean),
                     api_id=session.api_id,
                     api_hash=session.api_hash,
                     workdir=session_dir_abs,
                     phone_number=session.phone
                 )
-                self.clients[alias] = client
+                self.clients[alias_clean] = client
         return self.clients.get(alias)
 
     async def send_code(self, alias: str, phone: str) -> Dict[str, Any]:
