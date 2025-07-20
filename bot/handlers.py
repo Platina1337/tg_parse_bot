@@ -2280,7 +2280,7 @@ def format_channel_display(channel_id, info_map):
             return f"@{username} [ID: {channel_id}]"
     return f"ID: {channel_id}"
 
-async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings, tasks, reaction_tasks, updated=False, back_to="forward_back_to_stats"):
+async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings, tasks, reaction_tasks, public_groups_tasks=None, updated=False, back_to="forward_back_to_stats"):
     info_map = await get_channel_info_map(user_id)
     def safe(val):
         if val is None or val == "N/A":
@@ -2384,11 +2384,39 @@ async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings,
             if status == "running" and task_id:
                 buttons.append([InlineKeyboardButton(f"⏹️ Остановить реакцию {idx}", callback_data=f"stop_reaction_task:{task_id}")])
     
+    # Задачи публичных групп
+    if public_groups_tasks:
+        msg += "<b>📢 Пересылка в публичные группы:</b>\n"
+        for idx, task in enumerate(public_groups_tasks, 1):
+            source = safe(task.get("source_channel"))
+            target = safe(task.get("target_group"))
+            status = task.get("status", "unknown")
+            forwarded = safe(task.get("forwarded_count", 0))
+            settings = task.get("settings", {}) or {}
+            views_limit = safe(settings.get("views_limit"))
+            posts_count = safe(settings.get("posts_count"))
+            status_emoji = {
+                "running": "🟢",
+                "completed": "✅",
+                "stopped": "⏹️",
+                "error": "❌"
+            }.get(status, "❓")
+            msg += (
+                f"{idx}. <b>Источник:</b> {source}\n"
+                f"   <b>Цель:</b> {target}\n"
+                f"   {status_emoji} <b>Статус:</b> {status}\n"
+                f"   📤 <b>Переслано:</b> {forwarded}\n"
+                f"   👁️ <b>Лимит просмотров:</b> {views_limit}\n"
+                f"   🔢 <b>Диапазон:</b> {posts_count}\n"
+                "\n"
+            )
+    
     # Кнопка остановить все
     has_running_tasks = (
         (monitorings and any(m.get("active") and m.get("task_running") and m.get("channel_id") is not None and m.get("target_channel") is not None for m in monitorings)) or 
         (tasks and any(t.get("status") == "running" and t.get("task_id") for t in tasks)) or
-        (reaction_tasks and any(t.get("status") == "running" and t.get("task_id") for t in reaction_tasks))
+        (reaction_tasks and any(t.get("status") == "running" and t.get("task_id") for t in reaction_tasks)) or
+        (public_groups_tasks and any(t.get("status") == "running" for t in public_groups_tasks))
     )
     if has_running_tasks:
         buttons.append([InlineKeyboardButton("⏹️ Остановить все", callback_data="stop_all_tasks")])
@@ -2417,8 +2445,11 @@ async def send_or_edit_status_message(message=None, callback_query=None, back_to
     reaction_tasks_data = await api_client.get_all_reaction_tasks()
     reaction_tasks = reaction_tasks_data.get("tasks", [])
     logger.info(f"[STATUS_UNIFIED] Получено reaction_tasks: {reaction_tasks}")
+    public_groups_tasks_data = await api_client.get_all_public_groups_tasks()
+    public_groups_tasks = public_groups_tasks_data.get("tasks", [])
+    logger.info(f"[STATUS_UNIFIED] Получено public_groups_tasks: {public_groups_tasks}")
     updated = bool(callback_query)
-    if not monitorings and not tasks and not reaction_tasks:
+    if not monitorings and not tasks and not reaction_tasks and not public_groups_tasks:
         text = "📊 Нет активных задач и мониторингов."
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 Назад", callback_data=back_to)]
@@ -2431,7 +2462,8 @@ async def send_or_edit_status_message(message=None, callback_query=None, back_to
         elif message:
             await message.reply(text, reply_markup=keyboard)
         return
-    msg, keyboard = await build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings, tasks, reaction_tasks, updated=updated, back_to=back_to)
+    msg, keyboard = await build_tasks_monitorings_status_text_and_keyboard(
+        user_id, monitorings, tasks, reaction_tasks, public_groups_tasks, updated=updated, back_to=back_to)
     logger.info(f"[STATUS_UNIFIED] Итоговое сообщение: {msg}")
     try:
         if callback_query:

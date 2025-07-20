@@ -25,6 +25,11 @@ FSM_PUBLIC_GROUPS_SOURCE = "public_groups_source"
 FSM_PUBLIC_GROUPS_TARGET = "public_groups_target"
 FSM_PUBLIC_GROUPS_SETTINGS = "public_groups_settings"
 
+# Новые FSM состояния для настроек публичных групп
+FSM_PUBLIC_GROUPS_POSTS_COUNT = "public_groups_posts_count"
+FSM_PUBLIC_GROUPS_VIEWS_LIMIT = "public_groups_views_limit"
+FSM_PUBLIC_GROUPS_DELAY = "public_groups_delay"
+
 async def start_public_groups_manager(client: Client, message: Message):
     """Запуск менеджера публичных групп"""
     user_id = message.from_user.id
@@ -44,20 +49,21 @@ async def start_public_groups_manager(client: Client, message: Message):
         user_states[user_id]["last_msg_id"] = sent.id
 
 async def handle_public_groups_text(client: Client, message: Message) -> bool:
-    """Обработчик текстовых сообщений для менеджера публичных групп"""
     user_id = message.from_user.id
     text = message.text.strip()
     state = user_states.get(user_id, {}).get('state')
-    
+
     # Обработка состояний публичных групп
     if state and state.startswith('public_groups_'):
+        # Делегирование на обработку ввода настроек
+        if state in [FSM_PUBLIC_GROUPS_POSTS_COUNT, FSM_PUBLIC_GROUPS_VIEWS_LIMIT, FSM_PUBLIC_GROUPS_DELAY]:
+            return await handle_settings_input(client, message)
         if state == FSM_PUBLIC_GROUPS_SOURCE:
             return await handle_source_selection(client, message)
         elif state == FSM_PUBLIC_GROUPS_TARGET:
             return await handle_target_selection(client, message)
         elif state == FSM_PUBLIC_GROUPS_SETTINGS:
-            return await handle_settings_input(client, message)
-    
+            return False
     return False
 
 async def handle_source_selection(client: Client, message: Message) -> bool:
@@ -138,7 +144,7 @@ async def handle_target_selection(client: Client, message: Message) -> bool:
                 await api_client.update_user_group_last_used(user_id, str(group_id))
                 
                 # Показываем настройки
-                await show_public_groups_settings(client, message)
+                await show_public_groups_settings(client, message, user_id)
                 return True
     except Exception as e:
         logger.error(f"[PUBLIC_GROUPS] Ошибка при поиске группы: {e}")
@@ -185,7 +191,7 @@ async def handle_target_selection(client: Client, message: Message) -> bool:
             )
         
         # Показываем настройки
-        await show_public_groups_settings(client, message)
+        await show_public_groups_settings(client, message, user_id)
         return True
         
     except Exception as e:
@@ -196,18 +202,57 @@ async def handle_target_selection(client: Client, message: Message) -> bool:
         return True
 
 async def handle_settings_input(client: Client, message: Message) -> bool:
-    """Обработка ввода настроек"""
     user_id = message.from_user.id
     text = message.text.strip()
-    
-    if text == "Назад":
-        await show_public_groups_selection(client, message)
+    state = user_states.get(user_id, {}).get('state')
+
+    if 'public_settings' not in user_states[user_id]:
+        user_states[user_id]['public_settings'] = {}
+    settings = user_states[user_id]['public_settings']
+
+    if state == FSM_PUBLIC_GROUPS_POSTS_COUNT:
+        try:
+            count = int(text)
+            if count <= 0:
+                await message.reply("Введите положительное число!")
+                return True
+            settings['posts_count'] = count
+            await message.reply(f"✅ Количество последних постов для анализа установлено: {count}")
+        except Exception:
+            await message.reply("Введите число!")
+            return True
+        user_states[user_id]['state'] = FSM_PUBLIC_GROUPS_SETTINGS
+        await show_public_groups_settings(client, message, user_id)
         return True
-    
-    # Здесь можно добавить обработку различных настроек
-    # Пока просто показываем меню настроек
-    await show_public_groups_settings(client, message)
-    return True
+    elif state == FSM_PUBLIC_GROUPS_VIEWS_LIMIT:
+        try:
+            limit = int(text)
+            if limit <= 0:
+                await message.reply("Введите положительное число!")
+                return True
+            settings['views_limit'] = limit
+            await message.reply(f"✅ Лимит просмотров установлен: {limit}")
+        except Exception:
+            await message.reply("Введите число!")
+            return True
+        user_states[user_id]['state'] = FSM_PUBLIC_GROUPS_SETTINGS
+        await show_public_groups_settings(client, message, user_id)
+        return True
+    elif state == FSM_PUBLIC_GROUPS_DELAY:
+        try:
+            delay = int(text)
+            if delay < 0:
+                await message.reply("Введите неотрицательное число!")
+                return True
+            settings['delay_seconds'] = delay
+            await message.reply(f"✅ Задержка между пересылками установлена: {delay} сек")
+        except Exception:
+            await message.reply("Введите число!")
+            return True
+        user_states[user_id]['state'] = FSM_PUBLIC_GROUPS_SETTINGS
+        await show_public_groups_settings(client, message, user_id)
+        return True
+    return False
 
 async def show_public_groups_selection(client: Client, message: Message):
     """Показать выбор групп"""
@@ -307,27 +352,43 @@ async def show_public_groups_selection(client: Client, message: Message):
             user_states[user_id]["last_msg_id"] = sent.id
         user_states[user_id]["state"] = FSM_PUBLIC_GROUPS_TARGET
 
-async def show_public_groups_settings(client: Client, message: Message):
+async def show_public_groups_settings(client, message, user_id):
     """Показать настройки для публичных групп"""
-    user_id = message.from_user.id
-    
-    source_title = user_states[user_id].get("public_source_title", "Неизвестно")
-    target_name = user_states[user_id].get("public_target_name", "Неизвестно")
-    
-    kb = get_public_groups_settings_keyboard()
+    if user_id not in user_states:
+        user_states[user_id] = {}
+    user = user_states.get(user_id, {})
+    source_title = user.get("public_source_title", "Неизвестно")
+    target_name = user.get("public_target_name", "Неизвестно")
+    settings = user.get('public_settings', {})
+    posts_count = settings.get('posts_count', 20)
+    views_limit = settings.get('views_limit', 50)
+    delay_seconds = settings.get('delay_seconds', 0)
+    one_from_group = settings.get('forward_one_from_group', False)
+    print(f"[DEBUG] show_public_groups_settings user_id={user_id}, settings={settings}")
+    kb = get_public_groups_settings_keyboard(user_id)
     text = f"""
 ⚙️ **Настройки пересылки в публичные группы**
 
 📤 Источник: {source_title}
 📢 Цель: {target_name}
 
+🔢 Кол-во последних постов: {posts_count}
+👁️ Лимит просмотров: {views_limit}
+⏱️ Задержка: {delay_seconds} сек
+📷 Только одно из медиагруппы: {'ВКЛ' if one_from_group else 'ВЫКЛ'}
+
 Выберите настройки:
 """
-    
-    sent = await message.reply(text, reply_markup=kb)
-    
-    if sent is not None:
-        user_states[user_id]["last_msg_id"] = sent.id
+    # Если это callback, используем edit_message_text, иначе reply
+    if hasattr(message, 'message_id') and hasattr(message, 'chat'):
+        try:
+            await message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await message.reply(text, reply_markup=kb)
+    else:
+        sent = await message.reply(text, reply_markup=kb)
+        if sent is not None:
+            user_states[user_id]["last_msg_id"] = sent.id
     user_states[user_id]["state"] = FSM_PUBLIC_GROUPS_SETTINGS
 
 async def get_source_channel_keyboard(user_id: int) -> Optional[ReplyKeyboardMarkup]:
@@ -353,11 +414,23 @@ async def get_source_channel_keyboard(user_id: int) -> Optional[ReplyKeyboardMar
 
 
 
-def get_public_groups_settings_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура настроек для публичных групп"""
+def get_public_groups_settings_keyboard(user_id) -> InlineKeyboardMarkup:
+    settings = user_states[user_id].get('public_settings', {})
+    one_from_group = settings.get('forward_one_from_group', False)
+    print(f"[DEBUG] get_public_groups_settings_keyboard user_id={user_id}, settings={settings}")
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📊 Статистика", callback_data="public_stats"),
+            InlineKeyboardButton(f"🔢 Кол-во последних постов", callback_data="public_posts_count"),
+            InlineKeyboardButton(f"👁️ Лимит просмотров", callback_data="public_views_limit")
+        ],
+        [
+            InlineKeyboardButton(f"⏱️ Задержка", callback_data="public_delay"),
+        ],
+        [
+            InlineKeyboardButton(f"📷 Только одно из медиагруппы: {'ВКЛ' if one_from_group else 'ВЫКЛ'}", callback_data="public_one_from_group_toggle"),
+        ],
+        [
+            InlineKeyboardButton(f"📊 Статистика", callback_data="public_stats"),
             InlineKeyboardButton("⚙️ Настройки", callback_data="public_settings")
         ],
         [
@@ -374,6 +447,7 @@ def get_public_groups_settings_keyboard() -> InlineKeyboardMarkup:
 async def handle_public_groups_callback(client: Client, callback_query) -> bool:
     """Обработчик callback для менеджера публичных групп"""
     data = callback_query.data
+    user_id = callback_query.from_user.id
     
     if not data.startswith('public_'):
         return False
@@ -388,6 +462,32 @@ async def handle_public_groups_callback(client: Client, callback_query) -> bool:
         await stop_public_forwarding(client, callback_query)
     elif data == "public_back":
         await go_back_to_public_groups(client, callback_query)
+    elif data == "public_posts_count":
+        user_id = callback_query.from_user.id
+        user_states[user_id]["state"] = FSM_PUBLIC_GROUPS_POSTS_COUNT
+        await callback_query.message.reply("Введите количество последних постов для анализа (например, 20):")
+    elif data == "public_views_limit":
+        user_id = callback_query.from_user.id
+        user_states[user_id]["state"] = FSM_PUBLIC_GROUPS_VIEWS_LIMIT
+        await callback_query.message.reply("Введите лимит просмотров (например, 50):")
+    elif data == "public_delay":
+        user_id = callback_query.from_user.id
+        user_states[user_id]["state"] = FSM_PUBLIC_GROUPS_DELAY
+        await callback_query.message.reply("Введите задержку между пересылками в секундах (например, 60):")
+    elif data == "public_one_from_group_toggle":
+        user_id = callback_query.from_user.id
+        if user_id not in user_states:
+            user_states[user_id] = {}
+        settings = user_states[user_id].setdefault('public_settings', {})
+        settings['forward_one_from_group'] = not settings.get('forward_one_from_group', False)
+        if "public_source_title" not in user_states[user_id]:
+            user_states[user_id]["public_source_title"] = "Неизвестно"
+        if "public_target_name" not in user_states[user_id]:
+            user_states[user_id]["public_target_name"] = "Неизвестно"
+        print(f"[DEBUG] TOGGLE one_from_group user_id={user_id}, settings={user_states[user_id]['public_settings']}")
+        await show_public_groups_settings(client, callback_query.message, user_id)
+        await callback_query.answer(f"Только одно из медиагруппы: {'ВКЛ' if settings['forward_one_from_group'] else 'ВЫКЛ'}")
+        return True
     
     return True
 
@@ -457,20 +557,27 @@ async def start_public_forwarding(client: Client, callback_query):
         return
     
     try:
-        # Настройки по умолчанию
-        settings = {
-            "max_posts": 10,
-            "delay_seconds": 0,
+        # Получаем настройки пользователя
+        settings = user_states[user_id].get('public_settings', {})
+        posts_count = settings.get('posts_count', 20)
+        views_limit = settings.get('views_limit', 50)
+        delay_seconds = settings.get('delay_seconds', 0)
+        forward_one_from_group = settings.get('forward_one_from_group', False)
+        # Собираем настройки для API
+        api_settings = {
+            "posts_count": posts_count,
+            "views_limit": views_limit,
+            "delay_seconds": delay_seconds,
             "media_filter": "all",
-            "footer_text": ""
+            "footer_text": "",
+            "forward_one_from_group": forward_one_from_group
         }
-        
         # Запускаем пересылку через API
         result = await api_client.start_public_groups_forwarding(
             str(source_id),
             target_id,
             user_id,
-            settings
+            api_settings
         )
         
         if result.get("status") == "success":

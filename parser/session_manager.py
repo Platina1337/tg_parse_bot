@@ -62,7 +62,7 @@ class SessionManager:
     async def assign_task(self, alias: str, task: str) -> Dict[str, Any]:
         # Блокируем назначение forwarding как задачи
         if task == 'forwarding':
-            return {"success": False, "error": "Назначение задачи 'forwarding' больше не поддерживается. Используйте 'monitoring' или 'parsing'."}
+            return {"success": False, "error": "Назначение задачи 'forwarding' больше не поддерживается. Используйте 'monitoring', 'parsing' или 'public_groups'."}
         session = await self.db.get_session_by_alias(alias)
         if not session:
             return {"success": False, "error": "Session not found"}

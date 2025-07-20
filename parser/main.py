@@ -1868,11 +1868,8 @@ class PublicGroupsRequest(BaseModel):
 async def start_public_groups_forwarding(request: PublicGroupsRequest):
     """Запуск пересылки в публичные группы"""
     try:
-        forwarder = get_or_create_forwarder()
-        userbot = await forwarder.get_userbot()
-        
         from parser.public_groups_forwarder import PublicGroupsForwarder
-        public_forwarder = PublicGroupsForwarder(userbot, db)
+        public_forwarder = PublicGroupsForwarder(db, session_manager)
         
         result = await public_forwarder.start_forwarding(
             request.source_channel,
@@ -1894,11 +1891,8 @@ async def stop_public_groups_forwarding(request: dict):
         if not task_id:
             raise HTTPException(status_code=400, detail="task_id is required")
         
-        forwarder = get_or_create_forwarder()
-        userbot = await forwarder.get_userbot()
-        
         from parser.public_groups_forwarder import PublicGroupsForwarder
-        public_forwarder = PublicGroupsForwarder(userbot, db)
+        public_forwarder = PublicGroupsForwarder(db, session_manager)
         
         result = await public_forwarder.stop_forwarding(task_id)
         return result
@@ -1910,11 +1904,8 @@ async def stop_public_groups_forwarding(request: dict):
 async def get_public_groups_status(task_id: str):
     """Получить статус задачи пересылки в публичные группы"""
     try:
-        forwarder = get_or_create_forwarder()
-        userbot = await forwarder.get_userbot()
-        
         from parser.public_groups_forwarder import PublicGroupsForwarder
-        public_forwarder = PublicGroupsForwarder(userbot, db)
+        public_forwarder = PublicGroupsForwarder(db, session_manager)
         
         result = await public_forwarder.get_status(task_id)
         return result
@@ -1926,11 +1917,8 @@ async def get_public_groups_status(task_id: str):
 async def get_all_public_groups_tasks():
     """Получить все задачи пересылки в публичные группы"""
     try:
-        forwarder = get_or_create_forwarder()
-        userbot = await forwarder.get_userbot()
-        
         from parser.public_groups_forwarder import PublicGroupsForwarder
-        public_forwarder = PublicGroupsForwarder(userbot, db)
+        public_forwarder = PublicGroupsForwarder(db, session_manager)
         
         result = await public_forwarder.get_all_tasks()
         return result

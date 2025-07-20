@@ -1040,6 +1040,16 @@ class TelegramForwarder:
             }
 
     async def forward_media_group(self, channel_id, group_id, target_channel, text_mode, add_footer, forward_mode, hide_sender, max_posts, callback=None, paid_content_stars=0, group_messages=None, config=None):
+        # --- ДОБАВЛЕНО: Проверка и инициализация userbot ---
+        if not self._userbot or not getattr(self._userbot, 'is_connected', False):
+            logger.warning("[FORWARDER] userbot не инициализирован или не подключён, пробую получить и запустить...")
+            self._userbot = await self.get_userbot(task="parsing")
+            if self._userbot and not getattr(self._userbot, 'is_connected', False):
+                await self._userbot.start()
+            if not self._userbot or not getattr(self._userbot, 'is_connected', False):
+                logger.error("[FORWARDER] Не удалось инициализировать userbot для пересылки медиагруппы!")
+                return
+        # --- конец добавленного блока ---
         logger.info(f"[FORWARDER] 🔍 forward_media_group: paid_content_stars={paid_content_stars} (тип: {type(paid_content_stars)})")
         logger.info(f"[FORWARDER][DEBUG] Используемая приписка для медиагруппы (add_footer): {add_footer!r}")
         if group_messages is not None:

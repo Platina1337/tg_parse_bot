@@ -161,7 +161,8 @@ async def select_session_callback(client, callback_query):
             InlineKeyboardButton("Monitoring", callback_data=f"assign_task:monitoring:{session_name}")
         ],
         [
-            InlineKeyboardButton("Reactions", callback_data=f"assign_task:reactions:{session_name}")
+            InlineKeyboardButton("Reactions", callback_data=f"assign_task:reactions:{session_name}"),
+            InlineKeyboardButton("Public Groups", callback_data=f"assign_task:public_groups:{session_name}")
         ],
         [InlineKeyboardButton("Cancel", callback_data="cancel_session_action")]
     ])
