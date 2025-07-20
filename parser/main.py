@@ -122,7 +122,7 @@ async def startup_event():
     logger.info("Parser service started")
     
     # Initialize session manager (DB-backed)
-    session_manager = SessionManager(db=db, session_dir="sessions")
+    session_manager = SessionManager(db=db, session_dir=os.path.abspath("sessions"))
     await session_manager.import_sessions_from_files()
     await session_manager.load_clients()
     

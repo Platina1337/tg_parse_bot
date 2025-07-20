@@ -31,7 +31,9 @@ class SessionManager:
             if session.is_active:
                 # Используем только alias для имени файла сессии
                 alias = os.path.basename(session.alias if hasattr(session, 'alias') else session.session_path)
-                session_path = os.path.join(self.session_dir, alias)
+                # Используем абсолютный путь для session_dir
+                session_dir_abs = os.path.abspath(self.session_dir)
+                session_path = os.path.join(session_dir_abs, alias)
                 self.clients[alias] = Client(
                     name=session_path,
                     api_id=session.api_id,
