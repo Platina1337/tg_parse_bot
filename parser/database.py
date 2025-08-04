@@ -183,6 +183,57 @@ class Database:
                     await self.conn.execute("ALTER TABLE channel_info ADD COLUMN last_message_id INTEGER")
                     await self.conn.commit()
 
+            # Обновляем структуру таблицы channel_info для новых полей
+            async with self.conn.execute("PRAGMA table_info(channel_info)") as cursor:
+                columns = [row[1] async for row in cursor]
+                
+                # Переименовываем channel_id в id для консистентности
+                if "channel_id" in columns and "id" not in columns:
+                    logger.info("Обновляем структуру таблицы channel_info")
+                    await self.conn.execute("""
+                        CREATE TABLE IF NOT EXISTS channel_info_new (
+                            id TEXT PRIMARY KEY,
+                            title TEXT,
+                            username TEXT,
+                            description TEXT,
+                            members_count INTEGER DEFAULT 0,
+                            type TEXT DEFAULT 'unknown',
+                            total_posts INTEGER DEFAULT 0,
+                            is_public BOOLEAN DEFAULT FALSE,
+                            last_message_id INTEGER,
+                            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    # Копируем данные из старой таблицы
+                    await self.conn.execute("""
+                        INSERT INTO channel_info_new (id, title, username, total_posts, is_public, last_message_id, last_updated)
+                        SELECT channel_id, channel_title, username, total_posts, is_public, last_message_id, last_updated
+                        FROM channel_info
+                    """)
+                    
+                    # Удаляем старую таблицу и переименовываем новую
+                    await self.conn.execute("DROP TABLE channel_info")
+                    await self.conn.execute("ALTER TABLE channel_info_new RENAME TO channel_info")
+                    await self.conn.commit()
+                    logger.info("Структура таблицы channel_info обновлена")
+                
+                # Добавляем недостающие поля в существующую таблицу
+                else:
+                    if "description" not in columns:
+                        logger.info("Добавляем столбец description в таблицу channel_info")
+                        await self.conn.execute("ALTER TABLE channel_info ADD COLUMN description TEXT")
+                    
+                    if "members_count" not in columns:
+                        logger.info("Добавляем столбец members_count в таблицу channel_info")
+                        await self.conn.execute("ALTER TABLE channel_info ADD COLUMN members_count INTEGER DEFAULT 0")
+                    
+                    if "type" not in columns:
+                        logger.info("Добавляем столбец type в таблицу channel_info")
+                        await self.conn.execute("ALTER TABLE channel_info ADD COLUMN type TEXT DEFAULT 'unknown'")
+                    
+                    await self.conn.commit()
+
             # Проверяем, нужно ли добавить поле username в таблицу user_channels
             async with self.conn.execute("PRAGMA table_info(user_channels)") as cursor:
                 columns = [row[1] async for row in cursor]
@@ -1064,3 +1115,47 @@ class Database:
             rows = await cursor.fetchall()
             columns = [column[0] for column in cursor.description]
             return [SessionMeta(**dict(zip(columns, row))) for row in rows]
+
+    async def get_channel_info(self, channel_id) -> Optional[Dict]:
+        """Получить информацию о канале из БД"""
+        try:
+            async with self.conn.execute(
+                "SELECT id, title, username, description, members_count, type FROM channel_info WHERE id = ?",
+                (str(channel_id),)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return {
+                        'id': int(row[0]) if row[0].lstrip('-').isdigit() else row[0],
+                        'title': row[1],
+                        'username': row[2] or '',
+                        'description': row[3] or '',
+                        'members_count': row[4] or 0,
+                        'type': row[5] or 'unknown'
+                    }
+                return None
+        except Exception as e:
+            logger.error(f"Ошибка получения информации о канале {channel_id}: {e}")
+            return None
+
+    async def save_channel_info(self, channel_data: Dict):
+        """Сохранить информацию о канале в БД"""
+        try:
+            await self.conn.execute(
+                """INSERT OR REPLACE INTO channel_info 
+                   (id, title, username, description, members_count, type, last_updated) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(channel_data['id']),
+                    channel_data.get('title', ''),
+                    channel_data.get('username', ''),
+                    channel_data.get('description', ''),
+                    channel_data.get('members_count', 0),
+                    channel_data.get('type', 'unknown'),
+                    datetime.now().isoformat()
+                )
+            )
+            await self.conn.commit()
+            logger.info(f"Сохранена информация о канале {channel_data['id']} в БД")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения информации о канале: {e}")

@@ -1,6 +1,6 @@
 import re
 from fastapi import APIRouter, HTTPException
-from parser.config import config
+from .config import config
 import os
 import logging
 from pyrogram.errors import PeerIdInvalid

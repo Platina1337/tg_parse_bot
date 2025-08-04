@@ -4,9 +4,9 @@ from typing import Dict, List, Optional, Any, Tuple
 import asyncio
 from pyrogram import Client
 from pyrogram.errors import AuthKeyUnregistered, AuthKeyDuplicated, SessionPasswordNeeded, PhoneCodeInvalid
-from parser.database import Database
+from .database import Database
 from shared.models import SessionMeta
-from parser.config import config
+from .config import config
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +241,15 @@ class SessionManager:
     async def get_client(self, alias: str) -> Optional[Client]:
         if alias not in self.clients:
             await self.load_clients()
-        return self.clients.get(alias)
+        client = self.clients.get(alias)
+        if client and not client.is_connected:
+            try:
+                await client.start()
+                logger.info(f"[SESSION_MANAGER] Запущена сессия {alias}")
+            except Exception as e:
+                logger.error(f"[SESSION_MANAGER] Ошибка запуска сессии {alias}: {e}")
+                return None
+        return client
     
     async def start_session(self, alias: str) -> bool:
         """Start a specific session"""

@@ -47,6 +47,13 @@ FSM_REACTION_DATE_RANGE = "reaction_date_range"
 FSM_REACTION_COUNT = "reaction_count"
 FSM_REACTION_CONFIRM = "reaction_confirm"
 
+# Новые состояния для редактирования текста
+FSM_TEXT_EDIT_CHANNEL = "text_edit_channel"
+FSM_TEXT_EDIT_LINK_TEXT = "text_edit_link_text"
+FSM_TEXT_EDIT_LINK_URL = "text_edit_link_url"
+FSM_TEXT_EDIT_LIMIT = "text_edit_limit"
+FSM_TEXT_EDIT_CONFIRM = "text_edit_confirm"
+
 # --- Новые состояния для навигации по хэштегам ---
 FSM_NAVIGATION_MENU = "navigation_menu"
 FSM_NAVIGATION_AWAIT_CHANNEL = "navigation_await_channel"
@@ -61,6 +68,7 @@ def get_main_keyboard():
             [KeyboardButton("⭐ Пересылка")],
             [KeyboardButton("📢 Публичные группы")],
             [KeyboardButton("⭐ Реакции")],
+            [KeyboardButton("✏️ Редактирование текста")],
         ],
         resize_keyboard=True
     )
@@ -469,4 +477,28 @@ async def get_unique_channels_keyboard(user_id):
             btn_text = f"{title} (ID: {channel_id})"
         buttons.append([KeyboardButton(btn_text)])
     buttons.append([KeyboardButton("Назад")])
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True) 
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+# --- Функции для редактирования текста ---
+
+def get_text_edit_menu_keyboard():
+    """Клавиатура меню редактирования текста"""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🆕 Запустить редактирование")],
+            [KeyboardButton("📊 Статус задач редактирования")],
+            [KeyboardButton("⏹️ Остановить задачу")],
+            [KeyboardButton("🔙 Назад в главное меню")],
+        ],
+        resize_keyboard=True
+    )
+
+def get_text_edit_confirmation_keyboard():
+    """Клавиатура подтверждения запуска редактирования"""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("✅ Запустить"), KeyboardButton("❌ Отмена")],
+            [KeyboardButton("🔙 Назад")],
+        ],
+        resize_keyboard=True
+    ) 

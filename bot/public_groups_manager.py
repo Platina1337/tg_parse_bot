@@ -88,13 +88,17 @@ async def handle_source_selection(client: Client, message: Message) -> bool:
             user_states[user_id]["public_source_username"] = username
     else:
         # Пользователь ввел новый канал
-        channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
+        channel_info = await resolve_channel(api_client, text)
         
-        if not channel_id:
+        if channel_info is None:
             sent = await message.reply("❌ Не удалось определить канал. Введите корректный username или ID.")
             if sent is not None:
                 user_states[user_id]["last_msg_id"] = sent.id
             return True
+        
+        channel_id = channel_info["id"]
+        channel_title = channel_info["title"]
+        channel_username = channel_info.get("username", "")
         
         user_states[user_id]["public_source_id"] = int(channel_id)
         user_states[user_id]["public_source_title"] = channel_title
@@ -152,13 +156,17 @@ async def handle_target_selection(client: Client, message: Message) -> bool:
     # Если группа не найдена в истории, пробуем добавить новую
     try:
         # Разрешаем группу (получаем ID, title, username)
-        group_id, group_title, username = await resolve_group(api_client, text)
+        group_info = await resolve_group(api_client, text)
         
-        if not group_id:
+        if group_info is None:
             sent = await message.reply("❌ Не удалось найти группу. Проверьте ID или username группы.")
             if sent is not None:
                 user_states[user_id]["last_msg_id"] = sent.id
             return True
+        
+        group_id = group_info["id"]
+        group_title = group_info["title"]
+        username = group_info.get("username", "")
         
         # Добавляем группу в базу данных
         await api_client.add_user_group(user_id, str(group_id), group_title, username)

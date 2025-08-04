@@ -3,8 +3,8 @@ import asyncio
 from typing import Dict, List, Optional
 from pyrogram import Client
 from pyrogram.types import Message
-from parser.database import Database
-from parser.config import config
+from .database import Database
+from .config import config
 from shared.models import SessionMeta
 
 logger = logging.getLogger(__name__)
@@ -169,6 +169,7 @@ class PublicGroupsForwarder:
                 logger.info(f"[PUBLIC_FORWARDER] К пересылке выбран post message_id={min_post[0].id} с views={min_views}")
                 try:
                     if forward_one_from_group or len(min_post) == 1:
+                        # Одиночное сообщение - пересылаем как есть
                         m = min_post[0]
                         await userbot.forward_messages(
                             chat_id=target_group,
@@ -177,13 +178,14 @@ class PublicGroupsForwarder:
                         )
                         logger.info(f"[PUBLIC_FORWARDER] Переслан одиночный пост {m.id} в {target_group}")
                     else:
-                        for m in sorted(min_post, key=lambda x: x.id):
-                            await userbot.forward_messages(
-                                chat_id=target_group,
-                                from_chat_id=source_channel,
-                                message_ids=[m.id]
-                            )
-                        logger.info(f"[PUBLIC_FORWARDER] Переслана медиагруппа {[m.id for m in min_post]} в {target_group}")
+                        # Медиагруппа - пересылаем все сообщения одним вызовом
+                        message_ids = [m.id for m in sorted(min_post, key=lambda x: x.id)]
+                        await userbot.forward_messages(
+                            chat_id=target_group,
+                            from_chat_id=source_channel,
+                            message_ids=message_ids
+                        )
+                        logger.info(f"[PUBLIC_FORWARDER] Переслана медиагруппа одним вызовом: {message_ids} в {target_group}")
                     task_info["forwarded_count"] += 1
                     logger.info(f"[PUBLIC_FORWARDER] Жду {delay_seconds} сек перед следующей итерацией...")
                 except Exception as e:

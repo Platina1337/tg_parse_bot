@@ -99,7 +99,7 @@ async def start_forwarding_api(user_id: int) -> bool:
         forward_settings = user_states[user_id]['forward_settings']
         # Дефолтная приписка-гиперссылка
         if not forward_settings.get('footer_text'):
-            forward_settings['footer_text'] = '🌐 <a href="https://t.me/TESAMSH/4026">TSSH_Fans</a>'
+            forward_settings['footer_text'] = '🌐 <a href="https://t.me/TESAMSH/4026">_TSSH_Fans_</a>\n\n<a href="https://t.me/+ybzXQhwkAio4ZGYy">Приватный канал / Подписаться</a>'
         payload = {
             'user_id': user_id,
             'source_channel_id': channel_id,
@@ -116,6 +116,10 @@ async def start_forwarding_api(user_id: int) -> bool:
             'paid_content_hashtag': forward_settings.get('paid_content_hashtag'),
             'paid_content_every': forward_settings.get('paid_content_every'),
             'paid_content_chance': forward_settings.get('paid_content_chance'),
+            # Добавляем поля для гиперссылки в приписке
+            'footer_link': forward_settings.get('footer_link'),
+            'footer_link_text': forward_settings.get('footer_link_text'),
+            'footer_full_link': forward_settings.get('footer_full_link', False),
         }
         print(f"[DEBUG][FORWARD] payload для /forwarding/start: {payload}")
         async with httpx.AsyncClient() as client:

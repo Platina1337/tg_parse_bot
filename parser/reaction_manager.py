@@ -1,6 +1,6 @@
 import logging
 from typing import Dict, List, Optional, Any
-from parser.session_manager import SessionManager
+from .session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
 

@@ -267,13 +267,13 @@ class ParserAPIClient:
         response = await self._make_request("GET", f"/channel/hashtags/{channel_id}")
         return response.get("hashtags", [])
     
-    async def resolve_group(self, text: str) -> tuple:
+    async def resolve_group(self, text: str) -> dict:
         """Разрешить группу по ID или username"""
         # Используем ту же логику что и для каналов
         stats = await self.get_channel_stats(text)
-        if stats and stats.get("id"):
-            return stats["id"], stats.get("title", ""), stats.get("username", "")
-        return text, text, ""  # Возвращаем исходный текст как fallback
+        if stats and stats.get("id") and not stats.get("error"):
+            return stats
+        return None  # Возвращаем None если группа не найдена или есть ошибка
     
 
 

@@ -275,9 +275,9 @@ async def reaction_callback_handler(client, callback_query: CallbackQuery):
 # --- Вспомогательная функция для resolve_channel ---
 async def resolve_channel(api_client, text):
     stats = await api_client.get_channel_stats(text)
-    if stats and stats.get("id"):
-        return stats["id"], stats.get("title", ""), stats.get("username", "")
-    return None, text, ""
+    if stats and stats.get("id") and not stats.get("error"):
+        return stats
+    return None
 
 # --- Вспомогательная функция для форматирования статистики канала ---
 def format_channel_stats(stats):

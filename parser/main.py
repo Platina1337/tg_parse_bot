@@ -10,24 +10,26 @@ from datetime import datetime, timedelta
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Body, APIRouter, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Body, APIRouter, Request, Form
 from pydantic import BaseModel
 import logging
 from dotenv import load_dotenv
 from pyrogram.errors import PeerIdInvalid
 from fastapi.responses import JSONResponse
 
-from parser.database import Database
+from .database import Database
 from shared.models import ForwardingConfigRequest, ParseConfig
-from parser.config import config
-from parser.forwarder import TelegramForwarder
+from .config import config
+from .forwarder import TelegramForwarder
 import aiosqlite
-from parser.navigation_api import router as navigation_router
+from .navigation_api import router as navigation_router
 from fastapi.middleware.cors import CORSMiddleware
-from parser.session_manager import SessionManager
-from parser.reaction_manager import ReactionManager
+from .session_manager import SessionManager
+from .reaction_manager import ReactionManager
+from .text_editor import TextEditor
 from pydantic import BaseModel, Field
 from pyrogram import Client
+from .bulk_link_updater import BulkLinkUpdater
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -95,11 +97,21 @@ class PostingTemplateRequest(BaseModel):
 class NavigationMessageRequest(BaseModel):
     message_id: int
 
+# --- Модели для редактирования текста ---
+class TextEditRequest(BaseModel):
+    channel_id: int
+    link_text: str
+    link_url: str
+    max_posts: int = 100
+
 # Инициализация базы данных
 db = Database()
 
 # Инициализация форвардера (будет запущен при необходимости)
 forwarder = None
+
+# Инициализация редактора текста (будет запущен при необходимости)
+text_editor = None
 
 # Initialize session manager and reaction manager
 session_manager = None
@@ -161,6 +173,17 @@ def get_or_create_forwarder():
     if forwarder is None:
         forwarder = TelegramForwarder(db_instance=db, session_manager=session_manager)
     return forwarder
+
+def get_or_create_text_editor():
+    """Получить существующий text_editor или создать новый"""
+    global text_editor, session_manager
+    if text_editor is None:
+        if session_manager is None:
+            logger.error("[get_or_create_text_editor] session_manager не инициализирован!")
+            raise Exception("Session manager не инициализирован")
+        logger.info(f"[get_or_create_text_editor] Создаем TextEditor с session_manager")
+        text_editor = TextEditor(session_manager=session_manager)
+    return text_editor
 
 @app.post("/monitor/start")
 async def start_monitoring(request: MonitorRequest):
@@ -253,221 +276,157 @@ async def get_channel_last_message(channel_id: str):
 
 @app.get("/channel/stats/{channel_id}")
 async def get_channel_stats(channel_id: str):
-    logger.info(f"[API] === НАЧАЛО ОБРАБОТКИ /channel/stats/{channel_id} ===")
+    """Получить статистику канала"""
     try:
-        # Пробуем сначала int, если не получилось — используем строку (username)
-        try:
-            channel_id_typed = int(channel_id)
-            id_type = 'id'
-            logger.info(f"[API] channel_id_typed={channel_id_typed}, id_type={id_type}")
-        except (ValueError, TypeError):
-            channel_id_typed = channel_id
-            id_type = 'username'
-            logger.info(f"[API] channel_id_typed={channel_id_typed}, id_type={id_type}")
+        logger.info(f"[API] === НАЧАЛО ОБРАБОТКИ /channel/stats/{channel_id} ===")
         
-        # Сначала проверяем БД на наличие данных о канале
+        # Определяем тип идентификатора (ID или username)
+        if channel_id.startswith("-100") or channel_id.isdigit():
+            channel_id_typed = int(channel_id)
+            id_type = "id"
+        else:
+            channel_id_typed = channel_id
+            id_type = "username"
+        
+        logger.info(f"[API] channel_id_typed={channel_id_typed}, id_type={id_type}")
+        
+        # Сначала проверяем в БД
         logger.info(f"[API] Проверяем БД на наличие данных о канале {channel_id_typed}")
-        db_stats = {
+        parsed_stats = await db.get_channel_stats(channel_id_typed)
+        logger.info(f"[API] Получена статистика из БД: {parsed_stats}")
+        
+        # Проверяем таблицу channel_info
+        logger.info(f"[API] Проверяем таблицу channel_info для канала {channel_id_typed}")
+        channel_info = await db.get_channel_info(channel_id_typed)
+        
+        if channel_info:
+            logger.info(f"[API] Информация о канале {channel_id_typed} найдена в БД: {channel_info}")
+            # Объединяем статистику и информацию о канале
+            stats = {**parsed_stats, **channel_info}
+        else:
+            logger.info(f"[API] Информация о канале {channel_id_typed} в БД не найдена")
+            
+            # Если данных нет, пытаемся получить из Telegram API
+            if parsed_stats['parsed_count'] == 0:
+                logger.info(f"[API] Данных в БД нет, нужно запросить из Telegram API")
+                logger.info(f"[API] Делаем запрос к Telegram API для канала {channel_id_typed}")
+                
+                logger.info(f"[API][DEBUG] Перед get_or_create_forwarder")
+                forwarder = get_or_create_forwarder()
+                logger.info(f"[API][DEBUG] Получен forwarder: {forwarder}")
+                
+                userbot = await forwarder.get_userbot(task="parsing")
+                logger.info(f"[API][DEBUG] userbot: {userbot}")
+                
+                try:
+                    # ДОБАВЛЕНО: Попытка разрешения peer ID
+                    if id_type == "id":
+                        logger.info(f"[API] Пытаемся разрешить peer ID {channel_id_typed}")
+                        try:
+                            # Метод 1: Прямое получение чата
+                            chat = await userbot.get_chat(channel_id_typed)
+                            logger.info(f"[API] ✅ Успешно получили чат: {chat.title} (@{chat.username})")
+                        except Exception as direct_error:
+                            logger.warning(f"[API] Прямое получение чата не удалось: {direct_error}")
+                            
+                            # Метод 2: Попытка получения через invite link (если доступен)
+                            try:
+                                logger.info(f"[API] Пытаемся получить invite link для канала")
+                                invite_link = await userbot.export_chat_invite_link(channel_id_typed)
+                                logger.info(f"[API] Получили invite link: {invite_link}")
+                                chat = await userbot.get_chat(channel_id_typed)
+                                logger.info(f"[API] ✅ Успешно получили чат через invite link: {chat.title}")
+                            except Exception as invite_error:
+                                logger.warning(f"[API] Получение через invite link не удалось: {invite_error}")
+                                
+                                # Метод 2.5: Попытка вступления по invite link (если известен)
+                                try:
+                                    # Проверяем, есть ли invite link в конфигурации или БД
+                                    # Пока что пропускаем этот метод, так как нет функции для получения invite link
+                                    raise Exception("Invite link не найден")
+                                except Exception as join_error:
+                                    logger.warning(f"[API] Вступление по invite link не удалось: {join_error}")
+                                    
+                                    # Метод 3: Поиск канала по части названия или описания
+                                    try:
+                                        logger.info(f"[API] Пытаемся найти канал через поиск")
+                                        # Если userbot подписан на канал, он должен быть в диалогах
+                                        async for dialog in userbot.get_dialogs():
+                                            if dialog.chat.id == channel_id_typed:
+                                                chat = dialog.chat
+                                                logger.info(f"[API] ✅ Найден канал в диалогах: {chat.title} (@{chat.username})")
+                                                break
+                                        else:
+                                            raise Exception(f"Канал {channel_id_typed} не найден в диалогах userbot")
+                                    except Exception as search_error:
+                                        logger.error(f"[API] Поиск канала не удался: {search_error}")
+                                        raise Exception(f"Не удалось разрешить peer ID {channel_id_typed}. Убедитесь, что userbot подписан на канал или имеет к нему доступ.")
+                    else:
+                        # Для username обычная логика
+                        chat = await userbot.get_chat(channel_id_typed)
+                    
+                    # Сохраняем информацию о канале в БД
+                    channel_data = {
+                        'id': chat.id,
+                        'title': chat.title,
+                        'username': chat.username or '',
+                        'description': getattr(chat, 'description', '') or '',
+                        'members_count': getattr(chat, 'members_count', 0) or 0,
+                        'type': str(chat.type) if hasattr(chat, 'type') else 'unknown'
+                    }
+                    
+                    await db.save_channel_info(channel_data)
+                    logger.info(f"[API] Сохранена информация о канале в БД: {channel_data}")
+                    
+                    # Объединяем статистику и информацию о канале
+                    stats = {**parsed_stats, **channel_data}
+                    
+                except Exception as e:
+                    logger.error(f"[API] Ошибка при получении информации о канале: {e}")
+                    # Возвращаем базовую статистику даже при ошибке
+                    stats = {
+                        **parsed_stats,
+                        'id': channel_id_typed,
+                        'title': f"Канал {channel_id}",
+                        'username': '',
+                        'description': '',
+                        'members_count': 0,
+                        'type': 'unknown',
+                        'error': str(e)
+                    }
+            else:
+                # Если есть статистика парсинга, но нет информации о канале
+                stats = {
+                    **parsed_stats,
+                    'id': channel_id_typed,
+                    'title': f"Канал {channel_id}",
+                    'username': '',
+                    'description': '',
+                    'members_count': 0,
+                    'type': 'unknown'
+                }
+        
+        logger.info(f"[API] === КОНЕЦ ОБРАБОТКИ /channel/stats/{channel_id} ===")
+        return stats
+        
+    except Exception as e:
+        logger.error(f"[API] Ошибка при получении статистики канала {channel_id}: {e}")
+        return {
             'parsed_count': 0,
-            'parsed_media_groups': 0,
-            'parsed_singles': 0,
             'min_id': None,
             'max_id': None,
+            'parsed_media_groups': 0,
+            'parsed_singles': 0,
             'last_parsed_id': None,
-            'last_parsed_date': None
+            'last_parsed_date': None,
+            'id': channel_id,
+            'title': f"Канал {channel_id}",
+            'username': '',
+            'description': '',
+            'members_count': 0,
+            'type': 'unknown',
+            'error': str(e)
         }
-        
-        try:
-            db_stats = await db.get_channel_stats(channel_id_typed)
-            logger.info(f"[API] Получена статистика из БД: {db_stats}")
-        except Exception as e:
-            logger.warning(f"[API] Не удалось получить статистику из БД: {e}")
-        
-        # Проверяем, есть ли в БД информация о канале (не только статистика парсинга)
-        logger.info(f"[API] Проверяем таблицу channel_info для канала {channel_id_typed}")
-        channel_info_from_db = None
-        last_message_id = None
-        try:
-            # Проверяем, есть ли запись о канале в БД
-            async with db.conn.execute(
-                "SELECT channel_title, username, total_posts, is_public, last_updated, last_message_id FROM channel_info WHERE channel_id = ?",
-                (str(channel_id_typed),)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    channel_info_from_db = {
-                        'channel_title': row[0],
-                        'username': row[1],
-                        'total_posts': row[2],
-                        'is_public': bool(row[3]),
-                        'last_updated': row[4],
-                        'last_message_id': row[5] if len(row) > 5 else None
-                    }
-                    last_message_id = channel_info_from_db.get('last_message_id')
-                    logger.info(f"[API] Найдена информация о канале в БД: {channel_info_from_db}")
-                else:
-                    logger.info(f"[API] Информация о канале {channel_id_typed} в БД не найдена")
-        except Exception as e:
-            logger.warning(f"[API] Не удалось получить информацию о канале из БД: {e}")
-        
-        # Если в БД есть актуальная информация (не старше 1 часа), используем её
-        if channel_info_from_db:
-            last_updated = datetime.fromisoformat(channel_info_from_db['last_updated'])
-            time_diff = datetime.now() - last_updated
-            logger.info(f"[API] Время с последнего обновления: {time_diff}")
-            if time_diff < timedelta(hours=1):
-                logger.info(f"[API] Используем данные из БД (актуальны)")
-                return {
-                    "status": "success",
-                    "channel_id": channel_id_typed,
-                    "channel_title": channel_info_from_db['channel_title'],
-                    "username": channel_info_from_db['username'],
-                    "total_posts": channel_info_from_db['total_posts'],
-                    "parsed_posts": db_stats['parsed_count'],
-                    "parsed_media_groups": db_stats['parsed_media_groups'],
-                    "parsed_singles": db_stats['parsed_singles'],
-                    "min_id": db_stats['min_id'],
-                    "max_id": db_stats['max_id'],
-                    "last_parsed_id": db_stats['last_parsed_id'],
-                    "last_parsed_date": db_stats['last_parsed_date'],
-                    "last_message_id": last_message_id,
-                    "is_member": True,  # Если есть в БД, значит был доступ
-                    "is_public": channel_info_from_db['is_public'],
-                    "accessible": True,
-                    "source": "database"
-                }
-            else:
-                logger.info(f"[API] Данные в БД устарели (старше 1 часа)")
-        else:
-            logger.info(f"[API] Данных в БД нет, нужно запросить из Telegram API")
-        
-        # Если данных нет или они устарели, делаем запрос к Telegram API
-        logger.info(f"[API] Делаем запрос к Telegram API для канала {channel_id_typed}")
-        logger.info(f"[API][DEBUG] Перед get_or_create_forwarder")
-        forwarder = get_or_create_forwarder()
-        logger.info(f"[API][DEBUG] Получен forwarder: {forwarder}")
-        # Получаем userbot асинхронно
-        userbot = await forwarder.get_userbot()
-        logger.info(f"[API][DEBUG] userbot: {userbot}")
-        # Запускаем userbot если не запущен
-        if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
-            logger.info(f"[API][DEBUG] Userbot не запущен, запускаем... userbot: {userbot}")
-            await userbot.start()
-            logger.info(f"[API][DEBUG] Userbot успешно запущен")
-        # Получаем информацию о канале
-        try:
-            chat = await userbot.get_chat(channel_id_typed)
-            if not chat:
-                logger.warning(f"[API] Канал {channel_id_typed} не найден")
-                return {
-                    "status": "error",
-                    "message": f"Канал {channel_id_typed} не найден или недоступен",
-                    "parsed_posts": db_stats['parsed_count'],
-                    "parsed_media_groups": db_stats['parsed_media_groups'],
-                    "parsed_singles": db_stats['parsed_singles'],
-                    "min_id": db_stats['min_id'],
-                    "max_id": db_stats['max_id'],
-                    "last_parsed_id": db_stats['last_parsed_id'],
-                    "last_parsed_date": db_stats['last_parsed_date'],
-                    "source": "database_only"
-                }
-        except Exception as e:
-            logger.error(f"[API] Ошибка при получении информации о канале: {e}")
-            return {
-                "status": "error",
-                "message": f"Ошибка при получении информации о канале: {str(e)}",
-                "parsed_posts": db_stats['parsed_count'],
-                "parsed_media_groups": db_stats['parsed_media_groups'],
-                "parsed_singles": db_stats['parsed_singles'],
-                "min_id": db_stats['min_id'],
-                "max_id": db_stats['max_id'],
-                "last_parsed_id": db_stats['last_parsed_id'],
-                "last_parsed_date": db_stats['last_parsed_date'],
-                "source": "database_only"
-            }
-        
-        # Попробуем получить последнее сообщение
-        try:
-            # Получаем историю сообщений (только 1 сообщение, самое новое)
-            messages = []
-            async for message in userbot.get_chat_history(channel_id_typed, limit=1):
-                messages.append(message)
-                break  # Берем только первое (самое новое)
-            
-            if messages:
-                last_message = messages[0]
-                last_message_id = last_message.id
-                logger.info(f"[API] Получено последнее сообщение ID: {last_message_id}")
-            else:
-                logger.info(f"[API] В канале нет сообщений")
-                last_message_id = None
-        except Exception as e:
-            logger.error(f"[API] Ошибка при получении последнего сообщения: {e}")
-            last_message_id = None
-        
-        # Теперь получаем общее количество сообщений
-        total_posts = getattr(chat, 'message_count', 0) or 0
-        logger.info(f"[API] Общее количество постов: {total_posts}")
-        
-        # Извлекаем остальные данные из объекта chat
-        channel_title = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(channel_id_typed)
-        username = getattr(chat, 'username', None)
-        is_member = not getattr(chat, 'left', False)
-        is_public = bool(username)
-        description = getattr(chat, 'description', None)
-        created_at = getattr(chat, 'date', None)
-        members_count = getattr(chat, 'members_count', None)
-        logger.info(f"[API] Извлечённые данные: title={channel_title}, username={username}, total_posts={total_posts}, is_member={is_member}, is_public={is_public}, description={description}, created_at={created_at}, members_count={members_count}, last_message_id={last_message_id}")
-        
-        # Сохраняем информацию о канале в БД
-        logger.info(f"[API] Сохраняем информацию о канале в БД")
-        try:
-            # Используем правильный ID канала
-            correct_channel_id = str(chat.id) if hasattr(chat, 'id') else str(channel_id_typed)
-            await db.conn.execute(
-                """INSERT OR REPLACE INTO channel_info 
-                   (channel_id, channel_title, username, total_posts, is_public, last_updated, last_message_id) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (correct_channel_id, channel_title, username, total_posts, is_public, datetime.now().isoformat(), last_message_id)
-            )
-            await db.conn.commit()
-            logger.info(f"[API] Сохранена информация о канале в БД с ID: {correct_channel_id}")
-        except Exception as e:
-            logger.warning(f"[API] Не удалось сохранить информацию о канале в БД: {e}")
-        
-        logger.info(f"[API] Возвращаем результат")
-        
-        return {
-            "status": "success",
-            "channel_id": str(chat.id) if hasattr(chat, 'id') else str(channel_id_typed),  # Используем ID из chat объекта
-            "channel_title": channel_title,
-            "username": username,
-            "total_posts": total_posts,
-            "parsed_posts": db_stats['parsed_count'],
-            "parsed_media_groups": db_stats['parsed_media_groups'],
-            "parsed_singles": db_stats['parsed_singles'],
-            "min_id": db_stats['min_id'],
-            "max_id": db_stats['max_id'],
-            "last_parsed_id": db_stats['last_parsed_id'],
-            "last_parsed_date": db_stats['last_parsed_date'],
-            "last_message_id": last_message_id,
-            "is_member": is_member,
-            "is_public": is_public,
-            "accessible": True,
-            "members_count": members_count,
-            "description": description,
-            "created_at": created_at.isoformat() if created_at else None,
-            "source": "telegram_api"
-        }
-    except Exception as e:
-        logger.error(f"[API] Непредвиденная ошибка: {e}")
-        return {
-            "status": "error",
-            "message": str(e),
-            "source": "error"
-        }
-    finally:
-        logger.info(f"[API] === КОНЕЦ ОБРАБОТКИ /channel/stats/{channel_id} ===")
 
 @app.get("/monitor/status/{channel_id}")
 async def monitor_status(channel_id: str):
@@ -1925,6 +1884,218 @@ async def get_all_public_groups_tasks():
     except Exception as e:
         logger.error(f"Error getting public groups tasks: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# === TEXT EDITOR ENDPOINTS ===
+
+@app.post("/text-editor/start")
+async def start_text_editing(request: TextEditRequest):
+    """Запуск редактирования текста постов в канале"""
+    try:
+        logger.info(f"[API] Запуск редактирования текста для канала {request.channel_id}")
+        logger.info(f"[API] Параметры: текст='{request.link_text}', ссылка='{request.link_url}', лимит={request.max_posts}")
+        
+        # Валидация входных данных
+        if not request.link_text or not request.link_url:
+            error_msg = "Текст и ссылка обязательны для редактирования"
+            logger.error(f"[API] {error_msg}")
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        if request.max_posts <= 0:
+            error_msg = "Количество постов должно быть больше 0"
+            logger.error(f"[API] {error_msg}")
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        logger.info(f"[API] Получаем text_editor...")
+        text_editor = get_or_create_text_editor()
+        
+        logger.info(f"[API] Запускаем задачу редактирования...")
+        task_id = await text_editor.start_text_editing(
+            channel_id=request.channel_id,
+            link_text=request.link_text,
+            link_url=request.link_url,
+            max_posts=request.max_posts
+        )
+        
+        logger.info(f"[API] Редактирование запущено с ID: {task_id}")
+        return {
+            "status": "success",
+            "task_id": task_id,
+            "message": "Редактирование текста запущено"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API] Ошибка запуска редактирования: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/text-editor/status/{task_id}")
+async def get_text_editing_status(task_id: str):
+    """Получение статуса задачи редактирования"""
+    try:
+        text_editor = get_or_create_text_editor()
+        task_info = text_editor.get_task_status(task_id)
+        
+        if task_info is None:
+            raise HTTPException(status_code=404, detail="Задача не найдена")
+            
+        return {
+            "status": "success",
+            "task": task_info
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API] Ошибка получения статуса: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/text-editor/tasks")
+async def get_all_text_editing_tasks():
+    """Получение всех задач редактирования"""
+    try:
+        text_editor = get_or_create_text_editor()
+        tasks = text_editor.get_all_tasks()
+        
+        return {
+            "status": "success",
+            "tasks": tasks
+        }
+        
+    except Exception as e:
+        logger.error(f"[API] Ошибка получения задач: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/text-editor/stop/{task_id}")
+async def stop_text_editing(task_id: str):
+    """Остановка задачи редактирования"""
+    try:
+        text_editor = get_or_create_text_editor()
+        success = text_editor.stop_task(task_id)
+        
+        if not success:
+            raise HTTPException(status_code=404, detail="Задача не найдена или уже завершена")
+            
+        return {
+            "status": "success",
+            "message": "Задача остановлена"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API] Ошибка остановки задачи: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/text-editor/assign-session")
+async def assign_text_editing_session(request: dict):
+    """Назначить сессию для редактирования текста"""
+    try:
+        session_alias = request.get("session_alias")
+        if not session_alias:
+            raise HTTPException(status_code=400, detail="session_alias обязателен")
+        
+        global session_manager
+        if not session_manager:
+            raise HTTPException(status_code=500, detail="Session manager не инициализирован")
+        
+        result = await session_manager.assign_task(session_alias, "text_editing")
+        
+        if result.get("success"):
+            logger.info(f"[API] Сессия {session_alias} назначена для text_editing")
+            return {
+                "status": "success",
+                "message": f"Сессия {session_alias} назначена для редактирования текста"
+            }
+        else:
+            error_msg = result.get("error", "Неизвестная ошибка")
+            logger.error(f"[API] Ошибка назначения сессии: {error_msg}")
+            raise HTTPException(status_code=400, detail=error_msg)
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API] Ошибка назначения сессии для text_editing: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/text-editor/sessions")
+async def get_text_editing_sessions():
+    """Получить список сессий для редактирования текста"""
+    try:
+        global session_manager
+        if not session_manager:
+            raise HTTPException(status_code=500, detail="Session manager не инициализирован")
+        
+        # Получаем сессии для text_editing
+        assigned_sessions = await session_manager.get_sessions_for_task("text_editing")
+        
+        # Получаем все активные сессии
+        all_sessions = await session_manager.get_all_sessions()
+        active_sessions = [s for s in all_sessions if s.is_active]
+        
+        return {
+            "status": "success",
+            "assigned_sessions": [
+                {
+                    "alias": s.alias if hasattr(s, 'alias') else s.session_path,
+                    "phone": s.phone if hasattr(s, 'phone') else None
+                } for s in assigned_sessions
+            ],
+            "available_sessions": [
+                {
+                    "alias": s.alias if hasattr(s, 'alias') else s.session_path,
+                    "phone": s.phone if hasattr(s, 'phone') else None
+                } for s in active_sessions
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"[API] Ошибка получения сессий для text_editing: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/bulk-update-links")
+async def bulk_update_links(
+    channel_id: str = Form(..., description="ID канала для обновления"),
+    dry_run: bool = Form(True, description="Только предпросмотр, без изменений"),
+    limit: int = Form(1000, description="Максимальное количество сообщений")
+):
+    """
+    Массовое обновление ссылок в постах канала
+    Заменяет ссылку "Приватный канал / Подписаться" на новую
+    """
+    try:
+        from bulk_link_updater import BulkLinkUpdater
+        
+        logger.info(f"[API] 🚀 Запрос на массовое обновление ссылок в канале {channel_id}")
+        logger.info(f"[API] Параметры: dry_run={dry_run}, limit={limit}")
+        
+        # Создаем обновлятор
+        updater = BulkLinkUpdater()
+        
+        # Запускаем клиент
+        if not await updater.start_client():
+            return {"success": False, "error": "Не удалось запустить клиент"}
+        
+        try:
+            # Обновляем сообщения
+            stats = await updater.update_channel_messages(channel_id, dry_run=dry_run)
+            
+            result = {
+                "success": True,
+                "dry_run": dry_run,
+                "stats": stats,
+                "message": "Предпросмотр завершен" if dry_run else "Обновление завершено"
+            }
+            
+            logger.info(f"[API] ✅ Массовое обновление ссылок завершено: {stats}")
+            return result
+            
+        finally:
+            await updater.stop_client()
+            
+    except Exception as e:
+        logger.error(f"[API] ❌ Ошибка массового обновления ссылок: {e}")
+        return {"success": False, "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn

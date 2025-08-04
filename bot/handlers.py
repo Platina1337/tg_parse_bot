@@ -29,6 +29,8 @@ from bot.states import (
     get_channel_info, get_target_channel_info,
     FSM_REACTION_CHANNEL, FSM_REACTION_SETTINGS, FSM_REACTION_EMOJIS, FSM_REACTION_MODE, FSM_REACTION_HASHTAG, FSM_REACTION_DATE, FSM_REACTION_DATE_RANGE, FSM_REACTION_COUNT, FSM_REACTION_CONFIRM,
     get_reaction_settings_keyboard, get_reaction_inline_keyboard,
+    FSM_TEXT_EDIT_CHANNEL, FSM_TEXT_EDIT_LINK_TEXT, FSM_TEXT_EDIT_LINK_URL, FSM_TEXT_EDIT_LIMIT, FSM_TEXT_EDIT_CONFIRM,
+    get_text_edit_menu_keyboard, get_text_edit_confirmation_keyboard,
 )
 from bot.config import config
 from bot.core import (
@@ -38,6 +40,7 @@ from bot.core import (
 )
 from bot.api_client import api_client
 from bot.states import format_forwarding_config
+from bot.text_editor_manager import TextEditorManager
 import html
 
 # Настройка логирования
@@ -170,8 +173,22 @@ async def text_handler(client: Client, message: Message):
                     pass
             if sent is not None:
                 user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_FORWARD_CHANNEL, "last_msg_id": sent.id}
-            else:
-                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_FORWARD_CHANNEL}
+            return
+            return
+        elif text in ["✏️ Редактирование текста"]:
+            sent = await message.reply(
+                "🛠 **Редактирование текста постов**\n\n"
+                "Этот режим позволяет добавлять новые гиперссылки ко всем постам в канале.\n\n"
+                "Выберите действие:",
+                reply_markup=get_text_edit_menu_keyboard()
+            )
+            if last_msg_id:
+                try:
+                    await client.delete_messages(message.chat.id, last_msg_id)
+                except Exception:
+                    pass
+            if sent is not None:
+                user_states[user_id] = {**user_states.get(user_id, {}), "state": "text_edit_menu", "last_msg_id": sent.id}
             return
         elif text in ["Навигация по хэштегам", "🧭 Навигация по хэштегам"]:
             from bot.navigation_manager import navigation_menu_handler
@@ -192,11 +209,6 @@ async def text_handler(client: Client, message: Message):
             await show_main_menu(client, message, "Пожалуйста, выберите действие из меню:")
             return
 
-    # В начале text_handler, перед обработкой любого пользовательского ввода для настроек пересылки:
-    if user_states.get(user_id, {}).get("state") in [FSM_FORWARD_FOOTER_LINK, FSM_FORWARD_FOOTER_LINK_TEXT]:
-        # Если пользователь переключился на другой режим, сбрасываем состояние
-        user_states[user_id]["state"] = None
-
     # --- FSM: Пересылка ---
     if state == FSM_FORWARD_CHANNEL:
         print(f"[FSM][DEBUG] FSM_FORWARD_CHANNEL | text='{text}'")
@@ -216,19 +228,23 @@ async def text_handler(client: Client, message: Message):
                 user_states[user_id]["forward_channel_username"] = username
         else:
             # --- Новый вариант: нормализация ---
-            channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
+            channel_info = await resolve_channel(api_client, text)
+            if channel_info is None:
+                sent = await message.reply("❌ Не удалось определить ID канала. Введите корректный username или ID.", reply_markup=ReplyKeyboardRemove())
+                if sent is not None:
+                    user_states[user_id]["last_msg_id"] = sent.id
+                return
+                
+            channel_id = channel_info["id"]
+            channel_title = channel_info["title"]
+            channel_username = channel_info.get("username", "")
+            
             # Попробуем получить numeric id, если возможно
             real_id = None
             try:
                 real_id = int(channel_id)
             except (ValueError, TypeError):
-                # channel_id не приводится к int, пробуем получить через get_channel_stats
-                stats = await api_client.get_channel_stats(channel_id)
-                real_id = stats.get("id")  # Используем id из ответа API
-                try:
-                    real_id = int(real_id)
-                except (ValueError, TypeError):
-                    real_id = None
+                real_id = None
             
             if real_id is None:
                 sent = await message.reply("❌ Не удалось определить ID канала. Введите корректный username или ID.", reply_markup=ReplyKeyboardRemove())
@@ -287,14 +303,22 @@ async def text_handler(client: Client, message: Message):
                 user_states[user_id]["forward_target_username"] = username
             await api_client.update_user_target_channel_last_used(user_id, channel_id)
         else:
-            channel_id, channel_title, channel_username = await resolve_channel(api_client, text)
+            channel_info = await resolve_channel(api_client, text)
+            if channel_info is None:
+                sent = await message.reply("❌ Не удалось определить ID канала. Введите корректный username или ID.", reply_markup=ReplyKeyboardRemove())
+                if sent is not None:
+                    user_states[user_id]["last_msg_id"] = sent.id
+                return
+                
+            channel_id = channel_info["id"]
+            channel_title = channel_info["title"]
+            channel_username = channel_info.get("username", "")
             
             # Определяем, что ввел пользователь: username или ID
             is_username = not text.startswith("-100") and not text.isdigit()
             
-            # Получаем реальный ID из API
-            stats = await api_client.get_channel_stats(channel_id)
-            real_id = stats.get("id", channel_id)
+            # Используем ID из channel_info
+            real_id = channel_id
             try:
                 real_id = int(real_id)
             except (ValueError, TypeError):
@@ -318,7 +342,7 @@ async def text_handler(client: Client, message: Message):
             'parse_mode': 'all',
             'hashtag_filter': None,
             'delay_seconds': 1,
-            'footer_text': '🌐 <a href="https://t.me/TESAMSH/4026">_TSSH_Fans_</a>',
+            'footer_text': '🌐 <a href="https://t.me/TESAMSH/4026">_TSSH_Fans_</a>\n\n<a href="https://t.me/+ybzXQhwkAio4ZGYy">Приватный канал / Подписаться</a>',
             'text_mode': 'hashtags_only',
             'max_posts': None,
             'hide_sender': True
@@ -341,17 +365,6 @@ async def text_handler(client: Client, message: Message):
             sent = await message.reply(f"Ошибка при получении статистики: {e}", reply_markup=get_main_keyboard())
             user_states[user_id]["state"] = FSM_MAIN_MENU
             return
-        # Сразу после этого — обычная клавиатура:
-        await message.reply(
-            "Выберите действие с помощью кнопок ниже.",
-            reply_markup=get_forwarding_keyboard(channel_id, target_channel)
-        )
-        # Устанавливаю обычную клавиатуру для чата:
-        await client.send_message(
-            message.chat.id,
-            " ",
-            reply_markup=get_forwarding_keyboard(channel_id, target_channel)
-        )
 
 
 
@@ -986,8 +999,287 @@ async def text_handler(client: Client, message: Message):
         await process_reaction_fsm(client, message)
         return
     
+    # === TEXT EDITING HANDLERS ===
+    elif state == "text_edit_menu":
+        if text == "🆕 Запустить редактирование":
+            kb = await get_channel_history_keyboard(user_id)
+            sent = await message.reply(
+                "📺 **Выбор канала для редактирования**\n\n"
+                "Выберите канал из истории или введите ID/ссылку канала:",
+                reply_markup=kb or ReplyKeyboardRemove()
+            )
+            if last_msg_id:
+                try:
+                    await client.delete_messages(message.chat.id, last_msg_id)
+                except Exception:
+                    pass
+            if sent:
+                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_CHANNEL, "last_msg_id": sent.id}
+        elif text == "📊 Статус задач редактирования":
+            await show_text_edit_tasks_status(client, message, user_id)
+        elif text == "⏹️ Остановить задачу":
+            await show_text_edit_stop_menu(client, message, user_id)
+        elif text == "🔙 Назад в главное меню":
+            await show_main_menu(client, message)
+        return
+    
+    elif state == FSM_TEXT_EDIT_CHANNEL:
+        channel_info = await resolve_channel(api_client, text)
+        if channel_info is None:
+            await message.reply("❌ Канал не найден. Попробуйте еще раз:")
+            return
+            
+        # Извлекаем числовой ID из строки
+        numeric_id = extract_numeric_id(channel_info['id'])
+        if numeric_id is None:
+            await message.reply("❌ Не удалось извлечь числовой ID канала. Попробуйте еще раз:")
+            return
+            
+        user_states[user_id]['text_edit_channel_id'] = numeric_id
+        user_states[user_id]['text_edit_channel_title'] = channel_info['title']
+        user_states[user_id]['text_edit_channel_username'] = channel_info.get('username')
+        
+        sent = await message.reply(
+            f"📺 **Канал выбран**: {channel_info['title']}\n\n"
+            "✏️ **Введите текст для гиперссылки**\n\n"
+            "Например: `подписывайтесь на приватку`\n"
+            "Этот текст будет добавлен к постам как кликабельная ссылка.",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+        )
+        if last_msg_id:
+            try:
+                await client.delete_messages(message.chat.id, last_msg_id)
+            except Exception:
+                pass
+        if sent:
+            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_LINK_TEXT, "last_msg_id": sent.id}
+        return
+    
+    elif state == FSM_TEXT_EDIT_LINK_TEXT:
+        if text == "🔙 Назад":
+            kb = await get_channel_history_keyboard(user_id)
+            sent = await message.reply(
+                "📺 **Выбор канала для редактирования**\n\n"
+                "Выберите канал из истории или введите ID/ссылку канала:",
+                reply_markup=kb or ReplyKeyboardRemove()
+            )
+            if last_msg_id:
+                try:
+                    await client.delete_messages(message.chat.id, last_msg_id)
+                except Exception:
+                    pass
+            if sent:
+                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_CHANNEL, "last_msg_id": sent.id}
+            return
+            
+        user_states[user_id]['text_edit_link_text'] = text
+        
+        sent = await message.reply(
+            f"✏️ **Текст ссылки**: `{text}`\n\n"
+            "🔗 **Введите URL для гиперссылки**\n\n"
+            "Например: `https://t.me/yourchannel`\n"
+            "На этот адрес будет вести ссылка.",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+        )
+        if last_msg_id:
+            try:
+                await client.delete_messages(message.chat.id, last_msg_id)
+            except Exception:
+                pass
+        if sent:
+            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_LINK_URL, "last_msg_id": sent.id}
+        return
+    
+    elif state == FSM_TEXT_EDIT_LINK_URL:
+        if text == "🔙 Назад":
+            sent = await message.reply(
+                f"📺 **Канал выбран**: {user_states[user_id].get('text_edit_channel_title', 'Неизвестно')}\n\n"
+                "✏️ **Введите текст для гиперссылки**\n\n"
+                "Например: `подписывайтесь на приватку`\n"
+                "Этот текст будет добавлен к постам как кликабельная ссылка.",
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+            )
+            if last_msg_id:
+                try:
+                    await client.delete_messages(message.chat.id, last_msg_id)
+                except Exception:
+                    pass
+            if sent:
+                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_LINK_TEXT, "last_msg_id": sent.id}
+            return
+            
+        # Простая валидация URL
+        if not (text.startswith('http://') or text.startswith('https://') or text.startswith('tg://')):
+            await message.reply("❌ Неверный формат URL. Должен начинаться с http://, https:// или tg://")
+            return
+            
+        user_states[user_id]['text_edit_link_url'] = text
+        
+        sent = await message.reply(
+            f"🔗 **URL ссылки**: `{text}`\n\n"
+            "📊 **Введите лимит постов для редактирования**\n\n"
+            "Например: `100` (будут изменены 100 последних постов)\n"
+            "Введите число от 1 до 1000:",
+            reply_markup=ReplyKeyboardMarkup([
+                [KeyboardButton("100"), KeyboardButton("50"), KeyboardButton("25")],
+                [KeyboardButton("🔙 Назад")]
+            ], resize_keyboard=True)
+        )
+        if last_msg_id:
+            try:
+                await client.delete_messages(message.chat.id, last_msg_id)
+            except Exception:
+                pass
+        if sent:
+            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_LIMIT, "last_msg_id": sent.id}
+        return
+    
+    elif state == FSM_TEXT_EDIT_LIMIT:
+        if text == "🔙 Назад":
+            sent = await message.reply(
+                f"✏️ **Текст ссылки**: `{user_states[user_id].get('text_edit_link_text', 'Неизвестно')}`\n\n"
+                "🔗 **Введите URL для гиперссылки**\n\n"
+                "Например: `https://t.me/yourchannel`\n"
+                "На этот адрес будет вести ссылка.",
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+            )
+            if last_msg_id:
+                try:
+                    await client.delete_messages(message.chat.id, last_msg_id)
+                except Exception:
+                    pass
+            if sent:
+                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_LINK_URL, "last_msg_id": sent.id}
+            return
+            
+        try:
+            limit = int(text)
+            if limit < 1 or limit > 1000:
+                await message.reply("❌ Лимит должен быть от 1 до 1000")
+                return
+        except ValueError:
+            await message.reply("❌ Введите корректное число")
+            return
+            
+        user_states[user_id]['text_edit_limit'] = limit
+        
+        # Показываем подтверждение
+        channel_title = user_states[user_id].get('text_edit_channel_title', 'Неизвестно')
+        link_text = user_states[user_id].get('text_edit_link_text', 'Неизвестно')
+        link_url = user_states[user_id].get('text_edit_link_url', 'Неизвестно')
+        
+        sent = await message.reply(
+            f"📋 **Подтверждение редактирования**\n\n"
+            f"📺 **Канал**: {channel_title}\n"
+            f"✏️ **Текст ссылки**: `{link_text}`\n"
+            f"🔗 **URL**: `{link_url}`\n"
+            f"📊 **Лимит постов**: {limit}\n\n"
+            f"➡️ **Что будет сделано**:\n"
+            f"К последним {limit} постам в канале будет добавлена ссылка:\n"
+            f"`{link_text}` → `{link_url}`\n\n"
+            f"⚠️ **Внимание**: Это действие изменит существующие посты!\n\n"
+            f"Продолжить?",
+            reply_markup=get_text_edit_confirmation_keyboard()
+        )
+        if last_msg_id:
+            try:
+                await client.delete_messages(message.chat.id, last_msg_id)
+            except Exception:
+                pass
+        if sent:
+            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_CONFIRM, "last_msg_id": sent.id}
+        return
+    
+    elif state == FSM_TEXT_EDIT_CONFIRM:
+        if text == "✅ Запустить":
+            await start_text_editing_task(client, message, user_id)
+        elif text in ["❌ Отмена", "🔙 Назад"]:
+            sent = await message.reply(
+                "🛠 **Редактирование текста постов**\n\n"
+                "Этот режим позволяет добавлять новые гиперссылки ко всем постам в канале.\n\n"
+                "Выберите действие:",
+                reply_markup=get_text_edit_menu_keyboard()
+            )
+            if last_msg_id:
+                try:
+                    await client.delete_messages(message.chat.id, last_msg_id)
+                except Exception:
+                    pass
+            if sent:
+                user_states[user_id] = {**user_states.get(user_id, {}), "state": "text_edit_menu", "last_msg_id": sent.id}
+        return
+    
     # Если этап не определён
     await show_main_menu(client, message, "Пожалуйста, выберите действие из меню:")
+
+async def show_text_edit_tasks_status(client, message, user_id):
+    """Показать статус всех задач редактирования текста"""
+    try:
+        text_editor = TextEditorManager()
+        result = await text_editor.get_all_tasks()
+        
+        formatted_message = text_editor.format_all_tasks_message(result)
+        
+        await message.reply(
+            formatted_message,
+            reply_markup=get_text_edit_menu_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении статуса задач: {e}")
+        await message.reply(
+            f"❌ **Ошибка**: {str(e)}",
+            reply_markup=get_text_edit_menu_keyboard()
+        )
+
+async def show_text_edit_stop_menu(client, message, user_id):
+    """Показать меню остановки задач редактирования"""
+    try:
+        text_editor = TextEditorManager()
+        result = await text_editor.get_all_tasks()
+        
+        if result.get('status') == 'error':
+            await message.reply(
+                f"❌ **Ошибка получения задач**: {result.get('message', 'Неизвестная ошибка')}",
+                reply_markup=get_text_edit_menu_keyboard()
+            )
+            return
+            
+        tasks = result.get('tasks', [])
+        running_tasks = [t for t in tasks if t.get('status') == 'running']
+        
+        if not running_tasks:
+            await message.reply(
+                "📝 **Остановка задач редактирования**\n\n"
+                "Нет активных задач для остановки.",
+                reply_markup=get_text_edit_menu_keyboard()
+            )
+            return
+            
+        # Создаем кнопки для каждой активной задачи
+        buttons = []
+        for task in running_tasks:
+            task_id = task.get('task_id', 'Неизвестно')
+            channel_id = task.get('channel_id', 'Неизвестно')
+            buttons.append([KeyboardButton(f"⏹️ {task_id} ({channel_id})")])
+            
+        buttons.append([KeyboardButton("🔙 Назад")])
+        
+        await message.reply(
+            "📝 **Остановка задач редактирования**\n\n"
+            "Выберите задачу для остановки:",
+            reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+        )
+        
+        # Переходим в состояние выбора задачи для остановки
+        user_states[user_id] = {**user_states.get(user_id, {}), "state": "text_edit_stop_select"}
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе меню остановки: {e}")
+        await message.reply(
+            f"❌ **Ошибка**: {str(e)}",
+            reply_markup=get_text_edit_menu_keyboard()
+        )
 
 async def show_forwarding_settings(client, message, user_id: int):
     config = dict(user_states[user_id]['forward_settings'])
@@ -2219,19 +2511,43 @@ async def check_userbot_admin_rights(client, channel_id):
         print(f"[ERROR] Ошибка проверки прав userbot: {e}")
         return False
 
+# --- Функция для извлечения числового ID из строки ---
+def extract_numeric_id(channel_id_str):
+    """Извлекает числовой ID из строки вида 'Name (ID: -1234567890, @username)'"""
+    if not channel_id_str:
+        return None
+        
+    # Если это уже число, возвращаем как есть
+    try:
+        return int(channel_id_str)
+    except (ValueError, TypeError):
+        pass
+    
+    # Ищем паттерн (ID: -числа)
+    import re
+    match = re.search(r'\(ID:\s*(-?\d+)', str(channel_id_str))
+    if match:
+        return int(match.group(1))
+    
+    # Если начинается с -100 (стандартный канал ID)
+    if str(channel_id_str).startswith('-100') and str(channel_id_str).replace('-', '').isdigit():
+        return int(channel_id_str)
+        
+    return None
+
 # --- Функция для нормализации канала ---
 async def resolve_channel(api_client, text):
     stats = await api_client.get_channel_stats(text)
-    if stats and stats.get("id"):
-        return stats["id"], stats.get("title", ""), stats.get("username", "")
-    return text, text, ""  # Возвращаем исходный текст как fallback
+    if stats and stats.get("id") and not stats.get("error"):
+        return stats
+    return None  # Возвращаем None если канал не найден или есть ошибка
 
 # --- Функция для нормализации группы ---
 async def resolve_group(api_client, text):
     stats = await api_client.get_channel_stats(text)
-    if stats and stats.get("id"):
-        return stats["id"], stats.get("title", ""), stats.get("username", "")
-    return text, text, ""  # Возвращаем исходный текст как fallback
+    if stats and stats.get("id") and not stats.get("error"):
+        return stats
+    return None  # Возвращаем None если группа не найдена или есть ошибка
 
 def format_channel(cfg, channel_id_key="channel_id", title_key="channel_title", username_key="username"):
     channel_id = cfg.get(channel_id_key) or cfg.get("source_channel") or cfg.get("target_channel")
@@ -2648,4 +2964,126 @@ async def process_callback_query(client, callback_query):
 
 
 # Обработка реакций перенесена в reaction_master.py
+
+# === TEXT EDITING HELPER FUNCTIONS ===
+
+async def start_text_editing_task(client, message, user_id):
+    """Запуск задачи редактирования текста"""
+    try:
+        channel_id = user_states[user_id].get('text_edit_channel_id')
+        link_text = user_states[user_id].get('text_edit_link_text')
+        link_url = user_states[user_id].get('text_edit_link_url')
+        limit = user_states[user_id].get('text_edit_limit')
+        
+        # Убеждаемся, что channel_id - это число
+        if not isinstance(channel_id, int):
+            numeric_id = extract_numeric_id(channel_id)
+            if numeric_id is None:
+                await message.reply("❌ Ошибка: некорректный ID канала")
+                return
+            channel_id = numeric_id
+        
+        text_editor = TextEditorManager()
+        result = await text_editor.start_text_editing(
+            channel_id=channel_id,
+            link_text=link_text,
+            link_url=link_url,
+            max_posts=limit
+        )
+        
+        if result.get('status') == 'success':
+            task_id = result.get('task_id')
+            await message.reply(
+                f"✅ **Редактирование запущено!**\n\n"
+                f"📋 **ID задачи**: `{task_id}`\n\n"
+                f"Процесс редактирования запущен в фоновом режиме.\n"
+                f"Используйте '📊 Статус задач редактирования' для отслеживания прогресса.",
+                reply_markup=get_text_edit_menu_keyboard()
+            )
+        else:
+            await message.reply(
+                f"❌ **Ошибка запуска редактирования**\n\n"
+                f"{result.get('message', 'Неизвестная ошибка')}",
+                reply_markup=get_text_edit_menu_keyboard()
+            )
+            
+        # Возвращаемся в меню редактирования текста
+        user_states[user_id] = {**user_states.get(user_id, {}), "state": "text_edit_menu"}
+        
+    except Exception as e:
+        logger.error(f"Ошибка при запуске редактирования: {e}")
+        await message.reply(
+            f"❌ **Ошибка**: {str(e)}",
+            reply_markup=get_text_edit_menu_keyboard()
+        )
+        user_states[user_id] = {**user_states.get(user_id, {}), "state": "text_edit_menu"}
+
+async def show_text_edit_tasks_status(client, message, user_id):
+    """Показать статус всех задач редактирования текста"""
+    try:
+        text_editor = TextEditorManager()
+        result = await text_editor.get_all_tasks()
+        
+        formatted_message = text_editor.format_all_tasks_message(result)
+        
+        await message.reply(
+            formatted_message,
+            reply_markup=get_text_edit_menu_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении статуса задач: {e}")
+        await message.reply(
+            f"❌ **Ошибка**: {str(e)}",
+            reply_markup=get_text_edit_menu_keyboard()
+        )
+
+async def show_text_edit_stop_menu(client, message, user_id):
+    """Показать меню остановки задач редактирования"""
+    try:
+        text_editor = TextEditorManager()
+        result = await text_editor.get_all_tasks()
+        
+        if result.get('status') == 'error':
+            await message.reply(
+                f"❌ **Ошибка получения задач**: {result.get('message', 'Неизвестная ошибка')}",
+                reply_markup=get_text_edit_menu_keyboard()
+            )
+            return
+            
+        tasks = result.get('tasks', [])
+        running_tasks = [t for t in tasks if t.get('status') == 'running']
+        
+        if not running_tasks:
+            await message.reply(
+                "📝 **Остановка задач редактирования**\n\n"
+                "Нет активных задач для остановки.",
+                reply_markup=get_text_edit_menu_keyboard()
+            )
+            return
+            
+        # Создаем кнопки для каждой активной задачи
+        buttons = []
+        for task in running_tasks:
+            task_id = task.get('task_id', 'Неизвестно')
+            channel_id = task.get('channel_id', 'Неизвестно')
+            buttons.append([KeyboardButton(f"⏹️ {task_id} ({channel_id})")])
+            
+        buttons.append([KeyboardButton("🔙 Назад")])
+        
+        await message.reply(
+            "📝 **Остановка задач редактирования**\n\n"
+            "Выберите задачу для остановки:",
+            reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+        )
+        
+        # Переходим в состояние выбора задачи для остановки
+        user_states[user_id] = {**user_states.get(user_id, {}), "state": "text_edit_stop_select"}
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе меню остановки: {e}")
+        await message.reply(
+            f"❌ **Ошибка**: {str(e)}",
+            reply_markup=get_text_edit_menu_keyboard()
+        )
 
