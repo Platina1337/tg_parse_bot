@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-pyrogram
-tgcrypto
-pydantic
-pydantic-settings
-python-dotenv
-sqlalchemy
-aiosqlite

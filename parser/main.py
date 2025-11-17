@@ -5,7 +5,7 @@ import re
 import asyncio
 import traceback
 import time
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime, timedelta
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -30,6 +30,7 @@ from .text_editor import TextEditor
 from pydantic import BaseModel, Field
 from pyrogram import Client
 from .bulk_link_updater import BulkLinkUpdater
+from parser.config import config as parser_config
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -56,25 +57,8 @@ class MonitorRequest(BaseModel):
 # Модели для запросов пересылки
 class ForwardingRequest(BaseModel):
     source_channel: str
-    target_channel: str
+    target_channels: List[str]  # Список каналов для пересылки
     config: dict
-
-class ForwardingConfigRequest(BaseModel):
-    user_id: int
-    source_channel_id: int
-    target_channel_id: str
-    parse_mode: str = "all"
-    hashtag_filter: Optional[str] = None
-    delay_seconds: int = 0
-    footer_text: str = ""
-    # Поля для гиперссылки в приписке
-    footer_link: Optional[str] = None  # URL для гиперссылки
-    footer_link_text: Optional[str] = None  # Текст, который будет гиперссылкой
-    footer_full_link: bool = False  # Превращать ли всю приписку в ссылку
-    text_mode: str = "hashtags_only"
-    max_posts: Optional[int] = None
-    hide_sender: bool = True
-    paid_content_stars: Optional[int] = 0  # Новое поле для стоимости платного контента
 
 # --- Pydantic модели для запросов ---
 
@@ -100,9 +84,12 @@ class NavigationMessageRequest(BaseModel):
 # --- Модели для редактирования текста ---
 class TextEditRequest(BaseModel):
     channel_id: int
-    link_text: str
-    link_url: str
+    footer_text: str
     max_posts: int = 100
+    require_hashtags: bool = False
+    require_specific_text: bool = False
+    specific_text: str = ""
+    require_old_footer: bool = True
 
 # Инициализация базы данных
 db = Database()
@@ -117,13 +104,16 @@ text_editor = None
 session_manager = None
 reaction_manager = None
 
+# Initialize public groups forwarder
+public_groups_forwarder = None
+
 # Хранение задач реакций
 reaction_tasks = {}
 
 @app.on_event("startup")
 async def startup_event():
     """Действия при запуске сервиса"""
-    global forwarder, session_manager, reaction_manager
+    global forwarder, session_manager, reaction_manager, public_groups_forwarder
     
     await db.init()
     # Сбросить все мониторинги в неактивные (на случай падения/рестарта)
@@ -138,8 +128,21 @@ async def startup_event():
     await session_manager.import_sessions_from_files()
     await session_manager.load_clients()
     
+    # Обновляем user_id для всех сессий (для определения дублирующихся аккаунтов)
+    logger.info("[STARTUP] Обновление user_id для сессий...")
+    try:
+        updated_count = await session_manager.update_session_user_ids()
+        logger.info(f"[STARTUP] Обновлено user_id для {updated_count} сессий")
+    except Exception as e:
+        logger.error(f"[STARTUP] Ошибка при обновлении user_id: {e}")
+    
     # Initialize reaction manager
     reaction_manager = ReactionManager(session_manager=session_manager)
+    
+    # Initialize public groups forwarder
+    from parser.public_groups_forwarder import PublicGroupsForwarder
+    public_groups_forwarder = PublicGroupsForwarder(db, session_manager)
+    logger.info("[STARTUP] PublicGroupsForwarder инициализирован")
 
     # --- Новое: инициализация userbot при старте ---
     forwarder = get_or_create_forwarder()
@@ -169,9 +172,9 @@ async def shutdown_event():
 
 def get_or_create_forwarder():
     """Получить существующий forwarder или создать новый"""
-    global forwarder, session_manager
+    global forwarder, session_manager, reaction_manager
     if forwarder is None:
-        forwarder = TelegramForwarder(db_instance=db, session_manager=session_manager)
+        forwarder = TelegramForwarder(db_instance=db, session_manager=session_manager, reaction_manager=reaction_manager)
     return forwarder
 
 def get_or_create_text_editor():
@@ -193,9 +196,11 @@ async def start_monitoring(request: MonitorRequest):
         target_channel = request.config.settings.get("target_channel")
         if not target_channel:
             raise HTTPException(status_code=400, detail="Не указан целевой канал для публикации!")
-        await parser.start_monitoring(
-            request.channel_link,
-            request.config
+        forwarder = get_or_create_forwarder()
+        await forwarder.start_monitoring(
+            source_channel=request.channel_link,
+            target_channel=request.config.settings.get("target_channel"),
+            config=request.config.dict() if hasattr(request.config, 'dict') else request.config
         )
         return {"status": "success", "message": f"Monitoring started. Target: {target_channel}"}
     except Exception as e:
@@ -206,7 +211,8 @@ async def start_monitoring(request: MonitorRequest):
 async def stop_monitoring(channel_id: int):
     """Остановка мониторинга канала"""
     try:
-        await parser.stop_monitoring(channel_id)
+        forwarder = get_or_create_forwarder()
+        await forwarder.stop_forwarding(channel_id)
         return {"status": "success", "message": "Monitoring stopped"}
     except Exception as e:
         logger.error(f"Error stopping monitoring: {e}")
@@ -229,13 +235,18 @@ async def get_channel_last_message(channel_id: str):
         
         # Получаем forwarder
         forwarder = get_or_create_forwarder()
-        
+
+        # Получаем userbot через forwarder
+        userbot = await forwarder.get_userbot(task="parsing")
+        if not userbot:
+            raise HTTPException(status_code=500, detail="Не удалось получить userbot для получения сообщений")
+
         # Запускаем userbot если не запущен
-        if not hasattr(forwarder.userbot, 'is_connected') or not forwarder.userbot.is_connected:
+        if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
             logger.info(f"[API] Userbot не запущен, запускаем...")
-            await forwarder.userbot.start()
+            await userbot.start()
             logger.info(f"[API] Userbot успешно запущен")
-        
+
         # Получаем последнее сообщение из канала
         logger.info(f"[API] Делаем запрос к Telegram API для получения последнего сообщения из канала {channel_id_typed}")
         try:
@@ -455,7 +466,13 @@ async def start_forwarding(request: dict):
         logger.info(f"[API] Запрос: {request}")
         user_id = request.get('user_id')
         source_channel_id = request.get('source_channel_id')
-        target_channel_id = request.get('target_channel_id')
+        # Поддержка как старого формата (target_channel_id), так и нового (target_channel_ids)
+        if 'target_channel_ids' in request:
+            target_channel_ids = request.get('target_channel_ids')
+        elif 'target_channel_id' in request:
+            target_channel_ids = [request.get('target_channel_id')]
+        else:
+            raise HTTPException(status_code=400, detail="Не указан target_channel_id или target_channel_ids")
         settings = request.get('settings')
         if settings:
             config = {
@@ -476,6 +493,19 @@ async def start_forwarding(request: dict):
                 'footer_link': settings.get('footer_link'),
                 'footer_link_text': settings.get('footer_link_text'),
                 'footer_full_link': settings.get('footer_full_link', False),
+                # Добавляем настройки реакций
+                'reactions_enabled': settings.get('reactions_enabled', False),
+                'reaction_emojis': settings.get('reaction_emojis', []),
+                # Добавляем настройки watermark
+                'watermark_enabled': settings.get('watermark_enabled', False),
+                'watermark_mode': settings.get('watermark_mode', 'all'),
+                'watermark_chance': settings.get('watermark_chance', 100),
+                'watermark_hashtag': settings.get('watermark_hashtag'),
+                'watermark_image_path': settings.get('watermark_image_path'),
+                'watermark_position': settings.get('watermark_position', 'bottom_right'),
+                'watermark_opacity': settings.get('watermark_opacity', 128),
+                'watermark_scale': settings.get('watermark_scale', 0.3),
+                'watermark_text': settings.get('watermark_text'),
             }
             logger.info(f"[API] Итоговый config для форвардера (из settings): {config}")
         else:
@@ -497,10 +527,23 @@ async def start_forwarding(request: dict):
                 'footer_link': request.get('footer_link'),
                 'footer_link_text': request.get('footer_link_text'),
                 'footer_full_link': request.get('footer_full_link', False),
+                # Добавляем настройки реакций
+                'reactions_enabled': request.get('reactions_enabled', False),
+                'reaction_emojis': request.get('reaction_emojis', []),
+                # Добавляем настройки watermark
+                'watermark_enabled': request.get('watermark_enabled', False),
+                'watermark_mode': request.get('watermark_mode', 'all'),
+                'watermark_chance': request.get('watermark_chance', 100),
+                'watermark_hashtag': request.get('watermark_hashtag'),
+                'watermark_image_path': request.get('watermark_image_path'),
+                'watermark_position': request.get('watermark_position', 'bottom_right'),
+                'watermark_opacity': request.get('watermark_opacity', 128),
+                'watermark_scale': request.get('watermark_scale', 0.3),
+                'watermark_text': request.get('watermark_text'),
             }
             logger.info(f"[API] Итоговый config для форвардера (из request): {config}")
-        await forward_messages(user_id, source_channel_id, target_channel_id, config)
-        logger.info(f"[API] ✅ Мониторинг запущен для пользователя {user_id}")
+        await forward_messages(user_id, source_channel_id, target_channel_ids, config)
+        logger.info(f"[API] ✅ Мониторинг запущен для пользователя {user_id} в {len(target_channel_ids)} каналов")
         return {"status": "success", "message": "Пересылка запущена"}
     except Exception as e:
         logger.error(f"[API] ❌ Ошибка запуска мониторинга: {e}")
@@ -511,18 +554,18 @@ async def start_forwarding_parsing(request: ForwardingRequest):
     """Запуск парсинга и пересылки существующих сообщений"""
     try:
         logger.info(f"[API] 🚀 ЗАПУСК ПАРСИНГА + ПЕРЕСЫЛКИ (НЕ МОНИТОРИНГА!)")
-        logger.info(f"[API] Источник: {request.source_channel} -> Цель: {request.target_channel}")
+        logger.info(f"[API] Источник: {request.source_channel} -> Цели: {request.target_channels}")
         logger.info(f"[API] Конфигурация: {request.config}")
-        
+
         # Подробное логирование конфигурации
         paid_stars = request.config.get('paid_content_stars', 0)
         logger.info(f"[API] 🔍 ПЛАТНЫЕ ЗВЕЗДЫ: {paid_stars} (тип: {type(paid_stars)})")
         logger.info(f"[API] 🔍 Все ключи конфигурации: {list(request.config.keys())}")
-        
+
         forwarder = get_or_create_forwarder()
         result = await forwarder.start_forwarding_parsing(
             source_channel=request.source_channel,
-            target_channel=request.target_channel,
+            target_channels=request.target_channels,
             config=request.config
         )
         logger.info(f"[API] ✅ Парсинг + пересылка завершены: {result}")
@@ -571,8 +614,22 @@ async def save_forwarding_config(config: ForwardingConfigRequest):
             forwarder = TelegramForwarder(db_instance=db)
         userbot = await forwarder.get_userbot()
         new_config = config.dict()
-        for field in ["source_channel_id", "target_channel_id"]:
-            val = new_config[field]
+
+        # Обработка обратной совместимости: target_channel_id или target_channel_ids
+        target_channels = []
+        if config.target_channel_ids:
+            target_channels = config.target_channel_ids
+        elif config.target_channel_id:
+            target_channels = [config.target_channel_id]
+
+        if not target_channels:
+            logger.error(f"[CONFIG] Не указаны target каналы. target_channel_ids: {config.target_channel_ids}, target_channel_id: {config.target_channel_id}")
+            return {"status": "error", "message": "Не указан ни target_channel_id, ни target_channel_ids"}, 400
+
+        # Обрабатываем все каналы
+        resolved_target_channels = []
+        for target_channel in target_channels:
+            val = target_channel
             if isinstance(val, str) and not val.startswith("-100") and not val.isdigit():
                 try:
                     # Добавляем обработку FloodWait и других ошибок
@@ -580,6 +637,7 @@ async def save_forwarding_config(config: ForwardingConfigRequest):
                         chat = await userbot.get_chat(val)
                     except Exception as chat_error:
                         if "FLOOD_WAIT" in str(chat_error):
+                            wait_time = int(re.search(r'(\d+)', str(chat_error)).group(1))
                             logger.warning(f"[CONFIG] FloodWait: ожидаем {wait_time} секунд")
                             await asyncio.sleep(wait_time)
                             chat = await userbot.get_chat(val)
@@ -588,15 +646,46 @@ async def save_forwarding_config(config: ForwardingConfigRequest):
                             return {"status": "error", "message": f"Канал {val} недоступен или не существует"}, 400
                         else:
                             raise chat_error
-                    new_config[field] = chat.id
+                    resolved_target_channels.append(chat.id)
                 except Exception as e:
-                    return {"status": "error", "message": f"Не удалось получить id для {field}: {val} ({e})"}, 400
+                    return {"status": "error", "message": f"Не удалось получить id для канала {val}: {e}"}, 400
             elif isinstance(val, str) and val.isdigit():
-                new_config[field] = int(val)
+                resolved_target_channels.append(int(val))
+            else:
+                resolved_target_channels.append(val)
+
+        # Обновляем конфигурацию
+        new_config['target_channel_ids'] = resolved_target_channels
+        # target_channel_id оставляем для обратной совместимости, если он был передан
+
+        # Обрабатываем source_channel_id
+        source_val = new_config['source_channel_id']
+        if isinstance(source_val, str) and not source_val.startswith("-100") and not source_val.isdigit():
+            try:
+                try:
+                    chat = await userbot.get_chat(source_val)
+                except Exception as chat_error:
+                    if "FLOOD_WAIT" in str(chat_error):
+                        wait_time = int(re.search(r'(\d+)', str(chat_error)).group(1))
+                        logger.warning(f"[CONFIG] FloodWait: ожидаем {wait_time} секунд")
+                        await asyncio.sleep(wait_time)
+                        chat = await userbot.get_chat(source_val)
+                    elif "Peer id invalid" in str(chat_error) or "ID not found" in str(chat_error):
+                        logger.error(f"[CONFIG] Канал {source_val} недоступен или не существует: {chat_error}")
+                        return {"status": "error", "message": f"Канал {source_val} недоступен или не существует"}, 400
+                    else:
+                        raise chat_error
+                new_config['source_channel_id'] = chat.id
+            except Exception as e:
+                return {"status": "error", "message": f"Не удалось получить id для source_channel_id: {source_val} ({e})"}, 400
+        elif isinstance(source_val, str) and source_val.isdigit():
+            new_config['source_channel_id'] = int(source_val)
+
         # Сохраняем конфигурацию в базу данных
         await db.add_forwarding_config(ForwardingConfigRequest(**new_config))
         return {"status": "success", "message": "Конфигурация сохранена"}
     except Exception as e:
+        logger.error(f"[CONFIG] Ошибка сохранения конфигурации: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.post("/forwarding/clear_history")
@@ -674,30 +763,37 @@ async def get_forwarding_history_stats(channel_id: int = None, target_channel: s
         logger.error(f"Error getting forwarding history stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-async def forward_messages(user_id: int, source_channel_id: int, target_channel_id: int, config: dict = None):
+async def forward_messages(user_id: int, source_channel_id: int, target_channel_ids: list, config: dict = None):
     """Запуск мониторинга пересылки сообщений"""
     try:
         logger.info(f"[FORWARD_MESSAGES] 🔄 ЗАПУСК МОНИТОРИНГА (НЕ ПАРСИНГА!)")
-        logger.info(f"[FORWARD_MESSAGES] Пользователь: {user_id}, Источник: {source_channel_id}, Цель: {target_channel_id}")
+        logger.info(f"[FORWARD_MESSAGES] Пользователь: {user_id}, Источник: {source_channel_id}, Цели: {target_channel_ids}")
         if config is None:
             config = await db.get_forwarding_config(user_id, source_channel_id)
         logger.info(f"[FORWARD_MESSAGES] ⚙️ Конфигурация: {config}")
+        logger.info(f"[FORWARD_MESSAGES] 🖼️ Watermark настройки: enabled={config.get('watermark_enabled')}, mode={config.get('watermark_mode')}, text='{config.get('watermark_text')}'")
         global forwarder
-        if forwarder is None:
-            forwarder = TelegramForwarder(db_instance=db)
-            logger.info("Forwarder initialized with existing userbot")
-        try:
-            logger.info(f"[FORWARD_MESSAGES] Вызов start_forwarding для пересылки новых сообщений (handler)")
-            result = await forwarder.start_forwarding(
-                source_channel=str(source_channel_id),
-                target_channel=str(target_channel_id),
-                config=config
-            )
-            logger.info(f"[FORWARD_MESSAGES] ✅ Мониторинг запущен: {result}")
-        except Exception as e:
-            logger.error(f"[FORWARD_MESSAGES] ❌ Ошибка в процессе запуска мониторинга: {e}")
-            import traceback
-            logger.error(f"[FORWARD_MESSAGES] Полная ошибка: {traceback.format_exc()}")
+        forwarder = get_or_create_forwarder()
+        logger.info("Forwarder initialized with session_manager and reaction_manager")
+
+        results = []
+        for target_channel_id in target_channel_ids:
+            try:
+                logger.info(f"[FORWARD_MESSAGES] Вызов start_forwarding для пересылки новых сообщений (handler) в канал {target_channel_id}")
+                result = await forwarder.start_forwarding(
+                    source_channel=str(source_channel_id),
+                    target_channel=str(target_channel_id),
+                    config=config
+                )
+                results.append(f"Канал {target_channel_id}: {result}")
+                logger.info(f"[FORWARD_MESSAGES] ✅ Мониторинг запущен для канала {target_channel_id}: {result}")
+            except Exception as e:
+                logger.error(f"[FORWARD_MESSAGES] ❌ Ошибка в процессе запуска мониторинга для канала {target_channel_id}: {e}")
+                results.append(f"Канал {target_channel_id}: Ошибка - {e}")
+                import traceback
+                logger.error(f"[FORWARD_MESSAGES] Полная ошибка для канала {target_channel_id}: {traceback.format_exc()}")
+
+        logger.info(f"[FORWARD_MESSAGES] ✅ Мониторинг запущен для всех каналов: {results}")
     except Exception as e:
         logger.error(f"[FORWARD_MESSAGES] ❌ Ошибка запуска мониторинга: {e}")
         import traceback
@@ -859,7 +955,7 @@ async def get_user_groups(user_id: int):
 
 @app.post("/user/groups/{user_id}")
 async def add_user_group(user_id: int, request: GroupRequest):
-    """Добавить группу в историю пользователя (только если группа существует)"""
+    """Добавить группу в историю пользователя (только если группа существует и пользователь имеет к ней доступ)"""
     try:
         forwarder = get_or_create_forwarder()
         try:
@@ -867,20 +963,68 @@ async def add_user_group(user_id: int, request: GroupRequest):
             chat = await userbot.get_chat(request.group_id)
             group_title = getattr(chat, 'title', None) or request.group_title
             username = getattr(chat, 'username', None)
+
+            # Проверяем, имеет ли пользователь доступ к группе
+            # Для этого пытаемся получить информацию о правах пользователя в группе
+            try:
+                member = await userbot.get_chat_member(chat.id, userbot.me.id)
+
+                # Проверяем права в зависимости от типа чата
+                if hasattr(member, 'can_send_messages') and not member.can_send_messages:
+                    logger.warning(f"[API][add_user_group] Пользователь не имеет права отправлять сообщения в группу {request.group_id}")
+                    raise HTTPException(status_code=403, detail="У вас нет прав на отправку сообщений в эту группу")
+                elif not hasattr(member, 'can_send_messages'):
+                    # Для некоторых типов чатов (каналы) может не быть атрибута can_send_messages
+                    # В этом случае проверяем статус участника
+                    if hasattr(member, 'status'):
+                        from pyrogram.enums import ChatMemberStatus
+
+                        # Определяем тип чата
+                        chat_type = getattr(chat, 'type', None)
+
+                        # Проверяем статус участника
+                        status_str = str(member.status)
+
+                        if chat_type == 'ChatType.CHANNEL':
+                            # Для каналов нужны права администратора для отправки сообщений
+                            if 'ADMINISTRATOR' not in status_str and 'OWNER' not in status_str:
+                                logger.warning(f"[API][add_user_group] Бот не имеет прав администратора в канале {request.group_id} (статус: {member.status})")
+                                raise HTTPException(status_code=403, detail="Бот не имеет прав администратора для отправки сообщений в этот канал")
+                        elif chat_type in ['ChatType.SUPERGROUP', 'ChatType.GROUP']:
+                            # Для групп и супергрупп достаточно быть участником (не забаненным и не вышедшим)
+                            if 'LEFT' in status_str or 'BANNED' in status_str or 'RESTRICTED' in status_str:
+                                logger.warning(f"[API][add_user_group] Бот не может отправлять сообщения в группу {request.group_id} (статус: {member.status})")
+                                raise HTTPException(status_code=403, detail="Бот не может отправлять сообщения в эту группу")
+                        else:
+                            # Для других типов чатов проверяем базовые права
+                            if 'LEFT' in status_str or 'BANNED' in status_str:
+                                logger.warning(f"[API][add_user_group] Бот не имеет доступа к чату {request.group_id} (статус: {member.status})")
+                                raise HTTPException(status_code=403, detail="Бот не имеет доступа к этому чату")
+
+            except Exception as perm_error:
+                logger.warning(f"[API][add_user_group] Не удалось проверить права в группе {request.group_id}: {perm_error}")
+                # Если не можем проверить права, даем пользователю инструкцию
+                raise HTTPException(status_code=403, detail="Не удалось проверить доступ к группе. Убедитесь, что бот добавлен в группу как администратор и имеет права на отправку сообщений")
+
+        except HTTPException:
+            raise
         except Exception as e:
             logger.warning(f"[API][add_user_group] Не удалось получить группу {request.group_id}: {e}")
-            raise HTTPException(status_code=400, detail="Группа не найдена или недоступна")
-        
+            if "USERNAME_INVALID" in str(e):
+                raise HTTPException(status_code=400, detail="Группа с таким username не существует")
+            else:
+                raise HTTPException(status_code=400, detail="Группа не найдена или недоступна")
+
         # Определяем, что передал клиент: username или ID
         is_username = not request.group_id.startswith("-100") and not request.group_id.isdigit()
-        
+
         if is_username:
             # Клиент передал username, сохраняем username в поле username, а ID в поле group_id
             await db.add_user_group(user_id, str(chat.id), group_title, request.group_id)
         else:
             # Клиент передал ID, сохраняем ID в поле group_id, а username в поле username
             await db.add_user_group(user_id, str(chat.id), group_title, username)
-        
+
         return {"status": "success"}
     except HTTPException:
         raise
@@ -1101,17 +1245,21 @@ async def start_forwarding_parsing_background(request: dict):
     """Запустить парсинг+пересылку в фоновом режиме (возвращает task_id сразу)."""
     try:
         source_channel = request.get("source_channel")
-        target_channel = request.get("target_channel")
+        target_channels = request.get("target_channels")
         config = request.get("config", {})
-        
-        if not source_channel or not target_channel:
+
+        if not source_channel or not target_channels:
             return JSONResponse(
                 status_code=400,
-                content={"error": "source_channel и target_channel обязательны"}
+                content={"error": "source_channel и target_channels обязательны"}
             )
-        
+
+        # Если передан один канал в старом формате, конвертируем в список
+        if isinstance(target_channels, str):
+            target_channels = [target_channels]
+
         forwarder = get_or_create_forwarder()
-        task_id = await forwarder.start_forwarding_parsing(source_channel, target_channel, config)
+        task_id = await forwarder.start_forwarding_parsing(source_channel, target_channels, config)
         
         return JSONResponse(content={
             "status": "started",
@@ -1177,20 +1325,32 @@ async def stop_parse_forward_task(task_id: str):
 @app.get("/forwarding/all_tasks")
 async def get_all_parse_forward_tasks():
     """Получить список всех задач парсинг+пересылки."""
+    logger.info("[API] Запрос на получение списка всех задач парсинг+пересылки")
     try:
         forwarder = get_or_create_forwarder()
+        if forwarder is None:
+            logger.error("[API] Forwarder не инициализирован")
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Forwarder not initialized"}
+            )
+
         tasks = forwarder.get_all_parse_forward_tasks()
-        
+        logger.info(f"[API] Успешно получено {len(tasks)} задач")
+
         return JSONResponse(content={
             "tasks": tasks,
             "count": len(tasks)
         })
-        
+
     except Exception as e:
-        logger.error(f"Ошибка при получении списка задач: {e}")
+        logger.error(f"[API] Ошибка при получении списка задач: {e}")
+        logger.error(f"[API] Тип ошибки: {type(e).__name__}")
+        import traceback
+        logger.error(f"[API] Трассировка: {traceback.format_exc()}")
         return JSONResponse(
             status_code=500,
-            content={"error": str(e)}
+            content={"error": str(e), "traceback": traceback.format_exc()}
         )
 
 # --- Session Management API Endpoints ---
@@ -1402,13 +1562,78 @@ async def init_session(request: dict, background_tasks: BackgroundTasks):
     session_name = request.get("session_name")
     if not session_name:
         raise HTTPException(status_code=400, detail="session_name обязателен")
-    def run_pyrogram_interactive():
+    
+    async def run_pyrogram_interactive_async():
+        """Асинхронная функция для создания сессии"""
+        print(f"\n{'='*60}")
         print(f"[SESSIONS/INIT] Запуск интерактивной авторизации для сессии: {session_name}")
-        app = Client(session_name)
-        app.start()
-        print(f"[SESSIONS/INIT] Сессия {session_name} успешно создана!")
-        app.stop()
-    background_tasks.add_task(run_pyrogram_interactive)
+        print(f"{'='*60}\n")
+        
+        # Создаём папку для сессии, если её нет
+        session_dir = "sessions"
+        os.makedirs(session_dir, exist_ok=True)
+        
+        # Запрашиваем данные через консоль
+        print("📱 Для создания новой сессии необходимы следующие данные:")
+        print("   (Получить можно на https://my.telegram.org/apps)\n")
+        
+        try:
+            api_id = input("🔑 Введите API ID: ").strip()
+            api_hash = input("🔐 Введите API Hash: ").strip()
+            
+            if not api_id or not api_hash:
+                print("[SESSIONS/INIT] ❌ API ID и API Hash обязательны!")
+                return
+            
+            # Создаём Pyrogram клиента с указанными учетными данными
+            app = Client(
+                name=session_name,
+                api_id=int(api_id),
+                api_hash=api_hash,
+                workdir="sessions"
+            )
+            
+            print("\n📞 Теперь введите данные для авторизации:")
+            
+            # Запускаем клиента (здесь произойдёт запрос номера телефона и кода)
+            await app.start()
+            
+            print(f"\n✅ [SESSIONS/INIT] Сессия {session_name} успешно создана и авторизована!")
+            
+            # Получаем информацию о пользователе
+            me = await app.get_me()
+            print(f"👤 Авторизован как: {me.first_name} (@{me.username if me.username else 'N/A'})")
+            print(f"🆔 ID: {me.id}")
+            print(f"📱 Phone: {me.phone_number}")
+            
+            # Останавливаем клиента
+            await app.stop()
+            
+            # Регистрируем сессию в БД через add_account
+            result = await session_manager.add_account(
+                alias=session_name,
+                api_id=int(api_id),
+                api_hash=api_hash,
+                phone=me.phone_number
+            )
+            
+            if result.get("success"):
+                print(f"✅ [SESSIONS/INIT] Сессия {session_name} зарегистрирована в базе данных")
+            else:
+                print(f"⚠️ [SESSIONS/INIT] Предупреждение при регистрации: {result.get('error', 'Unknown')}")
+            print(f"\n{'='*60}")
+            print(f"✨ Готово! Теперь сессию '{session_name}' можно использовать в боте")
+            print(f"{'='*60}\n")
+            
+        except KeyboardInterrupt:
+            print(f"\n\n❌ [SESSIONS/INIT] Создание сессии отменено пользователем")
+        except Exception as e:
+            print(f"\n❌ [SESSIONS/INIT] Ошибка создания сессии: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Запускаем как фоновую задачу
+    background_tasks.add_task(run_pyrogram_interactive_async)
     logger.info(f"[API] /sessions/init: инициирована интерактивная авторизация для {session_name}")
     return {"success": True, "message": f"Интерактивная авторизация для {session_name} запущена в терминале парсера."}
 
@@ -1526,6 +1751,68 @@ async def get_available_reactions():
         "success": True,
         "reactions": reactions
     }
+
+@app.post("/reactions/mass_add_smart")
+async def mass_add_reactions_smart(request: Request, background_tasks: BackgroundTasks):
+    """Умное массовое проставление реакций (автоматически выбирает разные реакции для дублирующихся аккаунтов)"""
+    import logging
+    global session_manager, reaction_manager, reaction_tasks
+    sessions = await session_manager.get_sessions_for_task("reactions")
+    if not sessions:
+        logging.error("[MASS_REACTIONS_SMART] Нет ни одной сессии, назначенной на reactions")
+        return JSONResponse({"success": False, "error": "Нет ни одной сессии, назначенной на reactions"})
+    
+    data = await request.json()
+    chat_id = data.get("chat_id")
+    emojis = data.get("emojis", [])
+    mode = data.get("mode")
+    count = data.get("count")
+    date = data.get("date")
+    date_from = data.get("date_from")
+    date_to = data.get("date_to")
+    hashtag = data.get("hashtag")
+    delay = data.get("delay", 1)
+    
+    # Дополнительное логирование для отладки
+    logging.info(f"[MASS_REACTIONS_SMART] === НАЧАЛО ОБРАБОТКИ ===")
+    logging.info(f"[MASS_REACTIONS_SMART] Получены данные: chat_id={chat_id}, emojis={emojis}, mode={mode}, count={count}, delay={delay}")
+    logging.info(f"[MASS_REACTIONS_SMART] Тип emojis: {type(emojis)}, длина: {len(emojis) if emojis else 0}")
+    
+    if not emojis:
+        return JSONResponse({"success": False, "error": "Не указаны эмодзи для реакций"})
+    
+    # Создаем task_id
+    task_id = f"mass_reactions_smart_{chat_id}_{int(time.time())}"
+    
+    # Сохраняем информацию о задаче
+    reaction_tasks[task_id] = {
+        "task_id": task_id,
+        "chat_id": chat_id,
+        "emojis": emojis,
+        "mode": mode,
+        "count": count,
+        "date": date,
+        "date_from": date_from,
+        "date_to": date_to,
+        "hashtag": hashtag,
+        "delay": delay,
+        "status": "running",
+        "progress": 0,
+        "total": count or 0,
+        "started_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "error": None,
+        "results": []
+    }
+    
+    # Запускаем массовые реакции в фоне
+    background_tasks.add_task(execute_mass_reactions_smart, task_id, chat_id, emojis, mode, count, date, date_from, date_to, hashtag, delay)
+    
+    return JSONResponse({
+        "success": True,
+        "message": "Умное массовое проставление реакций запущено в фоновом режиме",
+        "task_id": task_id
+    })
 
 @app.post("/reactions/mass_add")
 async def mass_add_reactions(request: Request, background_tasks: BackgroundTasks):
@@ -1769,6 +2056,143 @@ async def execute_mass_reactions(task_id, chat_id, emojis, mode, count, date, da
         reaction_tasks[task_id]["results"] = all_results
         logging.info(f"[MASS_REACTIONS] Статус задачи {task_id} обновлен на '{reaction_tasks[task_id]['status']}'")
 
+
+async def execute_mass_reactions_smart(task_id, chat_id, emojis, mode, count, date, date_from, date_to, hashtag, delay):
+    """Выполнение умных массовых реакций в фоновом режиме (с автоматическим выбором разных реакций для дублирующихся аккаунтов)"""
+    import logging
+    global session_manager, reaction_manager, reaction_tasks
+    
+    sessions = await session_manager.get_sessions_for_task("reactions")
+    if not sessions:
+        logging.error("[MASS_REACTIONS_SMART] Нет ни одной сессии, назначенной на reactions")
+        # Обновляем статус задачи при ошибке
+        if task_id in reaction_tasks:
+            reaction_tasks[task_id]["status"] = "error"
+            reaction_tasks[task_id]["error"] = "Нет ни одной сессии, назначенной на reactions"
+            reaction_tasks[task_id]["completed_at"] = datetime.now().isoformat()
+        return
+    
+    logging.info(f"[MASS_REACTIONS_SMART] Используется {len(sessions)} сессий для реакций")
+    
+    # Получаем первую сессию для получения сообщений
+    first_session = sessions[0]
+    userbot = await session_manager.get_client(first_session.alias)
+    logging.info(f"[MASS_REACTIONS_SMART] Используется userbot для получения сообщений: alias={first_session.alias}")
+    
+    try:
+        if not userbot.is_connected:
+            await userbot.start()
+        
+        # Получаем сообщения
+        messages = []
+        logging.info(f"[MASS_REACTIONS_SMART] chat_id={chat_id}, mode={mode}, count={count}, emojis={emojis}, delay={delay}")
+        
+        # Берем больше сообщений для поиска постов
+        limit_for_search = max(count * 3, 100) if count else 2000
+        
+        if mode == "from_last":
+            async for msg in userbot.get_chat_history(chat_id, limit=limit_for_search):
+                messages.append(msg)
+        elif mode == "last_n":
+            async for msg in userbot.get_chat_history(chat_id, limit=limit_for_search):
+                messages.append(msg)
+        else:
+            async for msg in userbot.get_chat_history(chat_id, limit=limit_for_search):
+                messages.append(msg)
+        
+        logging.info(f"[MASS_REACTIONS_SMART] Найдено сообщений: {len(messages)}")
+        if not messages:
+            logging.warning(f"[MASS_REACTIONS_SMART] В канале {chat_id} нет сообщений!")
+            if task_id in reaction_tasks:
+                reaction_tasks[task_id]["status"] = "error"
+                reaction_tasks[task_id]["error"] = "Нет сообщений в канале"
+                reaction_tasks[task_id]["completed_at"] = datetime.now().isoformat()
+            return
+        
+        # Группируем сообщения по постам (медиагруппы + отдельные посты)
+        posts_to_react = []
+        processed_media_groups = set()
+        
+        for msg in messages:
+            if hasattr(msg, 'media_group_id') and msg.media_group_id is not None:
+                if msg.media_group_id not in processed_media_groups:
+                    posts_to_react.append(msg)
+                    processed_media_groups.add(msg.media_group_id)
+            else:
+                posts_to_react.append(msg)
+        
+        logging.info(f"[MASS_REACTIONS_SMART] Найдено постов для обработки: {len(posts_to_react)}")
+        
+        # Ограничиваем количество постов по count
+        if count:
+            posts_to_react = posts_to_react[:count]
+        
+        reacted_posts = 0
+        errors = []
+        
+        # Проставляем реакции на каждый пост с использованием умного алгоритма
+        for i, post in enumerate(posts_to_react):
+            try:
+                logging.info(f"[MASS_REACTIONS_SMART] Обрабатываем пост {i+1}/{len(posts_to_react)}: сообщение {post.id}")
+                
+                # Используем умное проставление реакций
+                result = await reaction_manager.add_reactions_smart(
+                    chat_id=chat_id,
+                    message_id=post.id,
+                    available_reactions=emojis
+                )
+                
+                if result.get("success"):
+                    reacted_posts += 1
+                    logging.info(f"[MASS_REACTIONS_SMART] Успешно проставлены реакции на пост {post.id}")
+                else:
+                    error_msg = result.get("error", "Unknown error")
+                    errors.append(f"Post {post.id}: {error_msg}")
+                    logging.error(f"[MASS_REACTIONS_SMART] Ошибка проставления реакций на пост {post.id}: {error_msg}")
+                
+                # Обновляем прогресс
+                if task_id in reaction_tasks:
+                    reaction_tasks[task_id]["progress"] = reacted_posts
+                
+                # Задержка между постами
+                if delay > 0 and i < len(posts_to_react) - 1:
+                    logging.info(f"[MASS_REACTIONS_SMART] Задержка {delay} сек перед следующим постом")
+                    await asyncio.sleep(delay)
+                    
+            except Exception as e:
+                error_msg = f"Post {post.id}: {str(e)}"
+                errors.append(error_msg)
+                logging.error(f"[MASS_REACTIONS_SMART] Ошибка при обработке поста {post.id}: {e}")
+        
+        logging.info(f"[MASS_REACTIONS_SMART] === ЗАВЕРШЕНО === Обработано {reacted_posts} постов из {len(posts_to_react)}")
+        
+        # Обновляем статус задачи
+        if task_id in reaction_tasks:
+            if errors and len(errors) == len(posts_to_react):
+                reaction_tasks[task_id]["status"] = "error"
+                reaction_tasks[task_id]["error"] = "; ".join(errors[:3])
+            else:
+                reaction_tasks[task_id]["status"] = "completed"
+            
+            reaction_tasks[task_id]["completed_at"] = datetime.now().isoformat()
+            reaction_tasks[task_id]["results"] = {
+                "total_posts": len(posts_to_react),
+                "reacted_posts": reacted_posts,
+                "errors": errors
+            }
+            logging.info(f"[MASS_REACTIONS_SMART] Статус задачи {task_id} обновлен на '{reaction_tasks[task_id]['status']}'")
+            
+    except Exception as e:
+        logging.error(f"[MASS_REACTIONS_SMART] Глобальная ошибка: {e}")
+        if task_id in reaction_tasks:
+            reaction_tasks[task_id]["status"] = "error"
+            reaction_tasks[task_id]["error"] = str(e)
+            reaction_tasks[task_id]["completed_at"] = datetime.now().isoformat()
+    finally:
+        if userbot.is_connected:
+            await userbot.stop()
+
+
 # API эндпоинты для работы с задачами реакций
 @app.get("/reactions/task_status/{task_id}")
 async def get_reaction_task_status(task_id: str):
@@ -1819,20 +2243,23 @@ async def get_all_reaction_tasks():
 
 class PublicGroupsRequest(BaseModel):
     source_channel: str
-    target_group: str
+    target_groups: List[str]
     user_id: int
     settings: dict
 
 @app.post("/public_groups/start")
 async def start_public_groups_forwarding(request: PublicGroupsRequest):
     """Запуск пересылки в публичные группы"""
+    global public_groups_forwarder
     try:
-        from parser.public_groups_forwarder import PublicGroupsForwarder
-        public_forwarder = PublicGroupsForwarder(db, session_manager)
+        if not public_groups_forwarder:
+            from parser.public_groups_forwarder import PublicGroupsForwarder
+            public_groups_forwarder = PublicGroupsForwarder(db, session_manager)
+            logger.info("[API] PublicGroupsForwarder создан в start_public_groups_forwarding")
         
-        result = await public_forwarder.start_forwarding(
+        result = await public_groups_forwarder.start_forwarding(
             request.source_channel,
-            request.target_group,
+            request.target_groups,
             request.user_id,
             request.settings
         )
@@ -1845,15 +2272,18 @@ async def start_public_groups_forwarding(request: PublicGroupsRequest):
 @app.post("/public_groups/stop")
 async def stop_public_groups_forwarding(request: dict):
     """Остановка пересылки в публичные группы"""
+    global public_groups_forwarder
     try:
         task_id = request.get("task_id")
         if not task_id:
             raise HTTPException(status_code=400, detail="task_id is required")
         
-        from parser.public_groups_forwarder import PublicGroupsForwarder
-        public_forwarder = PublicGroupsForwarder(db, session_manager)
+        if not public_groups_forwarder:
+            from parser.public_groups_forwarder import PublicGroupsForwarder
+            public_groups_forwarder = PublicGroupsForwarder(db, session_manager)
+            logger.info("[API] PublicGroupsForwarder создан в stop_public_groups_forwarding")
         
-        result = await public_forwarder.stop_forwarding(task_id)
+        result = await public_groups_forwarder.stop_forwarding(task_id)
         return result
     except Exception as e:
         logger.error(f"Error stopping public groups forwarding: {e}")
@@ -1862,11 +2292,14 @@ async def stop_public_groups_forwarding(request: dict):
 @app.get("/public_groups/status/{task_id}")
 async def get_public_groups_status(task_id: str):
     """Получить статус задачи пересылки в публичные группы"""
+    global public_groups_forwarder
     try:
-        from parser.public_groups_forwarder import PublicGroupsForwarder
-        public_forwarder = PublicGroupsForwarder(db, session_manager)
+        if not public_groups_forwarder:
+            from parser.public_groups_forwarder import PublicGroupsForwarder
+            public_groups_forwarder = PublicGroupsForwarder(db, session_manager)
+            logger.info("[API] PublicGroupsForwarder создан в get_public_groups_status")
         
-        result = await public_forwarder.get_status(task_id)
+        result = await public_groups_forwarder.get_status(task_id)
         return result
     except Exception as e:
         logger.error(f"Error getting public groups status: {e}")
@@ -1875,11 +2308,14 @@ async def get_public_groups_status(task_id: str):
 @app.get("/public_groups/all_tasks")
 async def get_all_public_groups_tasks():
     """Получить все задачи пересылки в публичные группы"""
+    global public_groups_forwarder
     try:
-        from parser.public_groups_forwarder import PublicGroupsForwarder
-        public_forwarder = PublicGroupsForwarder(db, session_manager)
+        if not public_groups_forwarder:
+            from parser.public_groups_forwarder import PublicGroupsForwarder
+            public_groups_forwarder = PublicGroupsForwarder(db, session_manager)
+            logger.info("[API] PublicGroupsForwarder создан в get_all_public_groups_tasks")
         
-        result = await public_forwarder.get_all_tasks()
+        result = await public_groups_forwarder.get_all_tasks()
         return result
     except Exception as e:
         logger.error(f"Error getting public groups tasks: {e}")
@@ -1892,11 +2328,11 @@ async def start_text_editing(request: TextEditRequest):
     """Запуск редактирования текста постов в канале"""
     try:
         logger.info(f"[API] Запуск редактирования текста для канала {request.channel_id}")
-        logger.info(f"[API] Параметры: текст='{request.link_text}', ссылка='{request.link_url}', лимит={request.max_posts}")
-        
+        logger.info(f"[API] Параметры: приписка='{request.footer_text}', лимит={request.max_posts}")
+
         # Валидация входных данных
-        if not request.link_text or not request.link_url:
-            error_msg = "Текст и ссылка обязательны для редактирования"
+        if not request.footer_text:
+            error_msg = "Текст приписки обязателен для редактирования"
             logger.error(f"[API] {error_msg}")
             raise HTTPException(status_code=400, detail=error_msg)
         
@@ -1911,9 +2347,12 @@ async def start_text_editing(request: TextEditRequest):
         logger.info(f"[API] Запускаем задачу редактирования...")
         task_id = await text_editor.start_text_editing(
             channel_id=request.channel_id,
-            link_text=request.link_text,
-            link_url=request.link_url,
-            max_posts=request.max_posts
+            footer_text=request.footer_text,
+            max_posts=request.max_posts,
+            require_hashtags=request.require_hashtags,
+            require_specific_text=request.require_specific_text,
+            specific_text=request.specific_text,
+            require_old_footer=request.require_old_footer
         )
         
         logger.info(f"[API] Редактирование запущено с ID: {task_id}")
@@ -2096,6 +2535,67 @@ async def bulk_update_links(
     except Exception as e:
         logger.error(f"[API] ❌ Ошибка массового обновления ссылок: {e}")
         return {"success": False, "error": str(e)}
+
+class WatermarkSettings(BaseModel):
+    watermark_enabled: bool
+    watermark_mode: str
+    watermark_chance: int
+    watermark_hashtag: Optional[str] = None
+    watermark_image_path: Optional[str] = None
+    watermark_position: str
+    watermark_opacity: int
+    watermark_scale: float
+    watermark_text: Optional[str] = None
+
+class WatermarkSettingsRequest(BaseModel):
+    user_id: int
+    channel_id: str
+    settings: WatermarkSettings
+
+@app.post("/watermark/settings")
+async def save_watermark_settings_endpoint(request: WatermarkSettingsRequest):
+    """Сохранить настройки водяного знака для канала."""
+    try:
+        await db.save_watermark_settings(request.user_id, request.channel_id, request.settings.dict())
+        return {"status": "success", "message": "Настройки водяного знака сохранены."}
+    except Exception as e:
+        logger.error(f"Ошибка сохранения настроек водяного знака: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/watermark/settings/{user_id}/{channel_id}")
+async def get_watermark_settings_endpoint(user_id: int, channel_id: str):
+    """Получить настройки водяного знака для канала."""
+    try:
+        settings = await db.get_watermark_settings(user_id, channel_id)
+        if settings:
+            return {"status": "success", "settings": settings}
+        else:
+            # Возвращаем дефолтные настройки, если в БД ничего нет
+            return {"status": "success", "settings": {
+                'watermark_enabled': False,
+                'watermark_mode': 'all',
+                'watermark_chance': 100,
+                'watermark_hashtag': None,
+                'watermark_image_path': None,
+                'watermark_position': 'bottom_right',
+                'watermark_opacity': 128,
+                'watermark_scale': 0.3,
+                'watermark_text': None
+            }}
+    except Exception as e:
+        logger.error(f"Ошибка получения настроек водяного знака: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/forwarding/history")
+async def clear_forwarding_history_endpoint(channel_id: int = None, target_channel: str = None):
+    """Очистить историю пересланных постов"""
+    try:
+        # Здесь можно добавить логику очистки истории пересылки
+        result = await db.clear_forwarding_history(channel_id, target_channel)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        logger.error(f"Error clearing forwarding history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

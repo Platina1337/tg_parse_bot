@@ -26,7 +26,7 @@ class Message(BaseModel):
     media_group_id: Optional[int] = None
     local_file_path: Optional[str] = None  # Путь к скачанному медиа
     parsed: bool = False
-    forwarded_to: Optional[str] = None  # ID канала, куда было переслано
+    forwarded_to: Optional[List[str]] = None  # Список ID каналов, куда было переслано
 
     @staticmethod
     def from_pyrogram(message) -> 'Message':
@@ -98,7 +98,7 @@ class ParseConfig(BaseModel):
     parse_direction: str = "backward"  # "forward" (от старых к новым) или "backward" (от новых к старым)
 
 class PostingSettings(BaseModel):
-    target_channel_id: int  # ID канала, куда будут поститься сообщения
+    target_channel_ids: List[int]  # Список ID каналов, куда будут поститься сообщения
     text_mode: Optional[str] = None  # Режим текста ("с текстом", "только хэштеги")
     order: Optional[str] = None      # Порядок публикации ("old_to_new", "new_to_old", "random", ...)
     mode: Optional[str] = None       # Режим публикации ("все", "media", "text")
@@ -138,7 +138,7 @@ class PostingSettings(BaseModel):
     paid_content_chance: Optional[int] = None  # Шанс (1..10) для рандомного режима
 
 class PostingConfig(BaseModel):
-    target_channel_id: int  # ID канала, куда будут поститься сообщения
+    target_channel_ids: List[int]  # Список ID каналов, куда будут поститься сообщения
     bot_token: str         # Токен бота, который будет постить
     text_mode: Optional[str] = None
     order: Optional[str] = None
@@ -227,7 +227,8 @@ class PostingConfig(BaseModel):
 class ForwardingConfigRequest(BaseModel):
     user_id: int
     source_channel_id: Union[int, str]  # Можно передавать id (int) или username (str)
-    target_channel_id: Union[int, str]  # Можно передавать id (int) или username (str)
+    target_channel_ids: Optional[List[Union[int, str]]] = None  # Список ID каналов, куда пересылать (новый формат)
+    target_channel_id: Optional[Union[int, str]] = None  # Основной канал для пересылки (для обратной совместимости)
     parse_mode: str = "all"  # "all" или "hashtags"
     hashtag_filter: Optional[str] = None
     delay_seconds: int = 0
@@ -249,7 +250,17 @@ class ForwardingConfigRequest(BaseModel):
     media_filter: str = "all"  # "all" (все сообщения) или "media_only" (только с медиа)
     range_mode: str = "all"  # "all" (все сообщения) или "range" (по диапазону)
     range_start_id: Optional[int] = None  # ID сообщения для начала диапазона
-    range_end_id: Optional[int] = None  # ID сообщения для конца диапазона 
+    range_end_id: Optional[int] = None  # ID сообщения для конца диапазона
+    # --- Новые поля для watermark ---
+    watermark_enabled: bool = False  # Включение/выключение watermark
+    watermark_mode: str = "all"  # "all", "random", "hashtag", "manual"
+    watermark_chance: int = 100  # Шанс применения watermark в процентах (0-100)
+    watermark_hashtag: Optional[str] = None  # Хэштег для автоматического применения watermark
+    watermark_image_path: Optional[str] = None  # Путь к файлу изображения watermark
+    watermark_position: str = "bottom_right"  # "center", "bottom_right", "bottom_left", "top_right", "top_left"
+    watermark_opacity: int = 128  # Прозрачность watermark (0-255)
+    watermark_scale: float = 0.3  # Масштаб watermark относительно размера изображения (0.1-1.0)
+    watermark_text: Optional[str] = None  # Текстовый watermark 
 
 class SessionMeta(BaseModel):
     id: int  # Primary key in DB
@@ -258,6 +269,7 @@ class SessionMeta(BaseModel):
     api_hash: str
     phone: str
     session_path: str  # Путь к .session файлу
+    user_id: Optional[int] = None  # Telegram User ID для идентификации дублирующихся аккаунтов
     is_active: bool = True
     created_at: datetime = datetime.now()
     last_used_at: Optional[datetime] = None

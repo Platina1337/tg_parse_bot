@@ -47,6 +47,8 @@ docker-compose up
 
 ## Запуск в режиме разработки
 
+python -m access_bot.main 
+
 ### Parser service
 ```bash
 cd parser

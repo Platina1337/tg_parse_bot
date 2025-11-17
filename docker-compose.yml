@@ -29,4 +29,18 @@ services:
     volumes:
       - ./media:/app/media
       - ./bot/sessions:/app/sessions
+    restart: always
+
+  access_bot:
+    build:
+      context: .
+      dockerfile: access_bot/Dockerfile
+    env_file:
+      - .env.docker
+    environment:
+      - ENV_FILE=.env.docker
+    depends_on:
+      - parser
+    volumes:
+      - ./access_bot:/app
     restart: always 

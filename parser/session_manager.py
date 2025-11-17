@@ -89,24 +89,46 @@ class SessionManager:
         return {"success": True, "alias": alias}
 
     async def get_client(self, alias: str) -> Optional[Client]:
+        logger.debug(f"[SESSION_MANAGER][get_client] Запрашиваем клиента для alias: {alias}")
+
         if alias not in self.clients:
+            logger.debug(f"[SESSION_MANAGER][get_client] Клиент {alias} не найден в кэше, загружаем все клиенты")
             await self.load_clients()
+
         client = self.clients.get(alias)
         if not client:
+            logger.debug(f"[SESSION_MANAGER][get_client] Клиент {alias} не найден в кэше, пытаемся создать из БД")
             # Попробовать создать клиента из БД
-            session = await self.db.get_session_by_alias(alias)
-            if session:
-                session_dir_abs = os.path.abspath(self.session_dir)
-                # Используем только alias для имени файла сессии
-                alias_clean = os.path.basename(session.alias if hasattr(session, 'alias') else session.session_path)
-                client = Client(
-                    name=os.path.join(session_dir_abs, alias_clean),
-                    api_id=session.api_id,
-                    api_hash=session.api_hash,
-                    workdir=session_dir_abs,
-                    phone_number=session.phone
-                )
-                self.clients[alias_clean] = client
+            try:
+                session = await self.db.get_session_by_alias(alias)
+                if session:
+                    logger.debug(f"[SESSION_MANAGER][get_client] Найдена сессия в БД: id={session.id}, alias={session.alias}, is_active={session.is_active}")
+                    session_dir_abs = os.path.abspath(self.session_dir)
+                    # Используем только alias для имени файла сессии
+                    alias_clean = os.path.basename(session.alias if hasattr(session, 'alias') else session.session_path)
+                    session_path = os.path.join(session_dir_abs, alias_clean)
+
+                    logger.debug(f"[SESSION_MANAGER][get_client] Создаем клиента: session_path={session_path}, api_id={session.api_id}, phone={session.phone}")
+                    client = Client(
+                        name=session_path,
+                        api_id=session.api_id,
+                        api_hash=session.api_hash,
+                        workdir=session_dir_abs,
+                        phone_number=session.phone
+                    )
+                    self.clients[alias_clean] = client
+                    logger.debug(f"[SESSION_MANAGER][get_client] Клиент создан и сохранен в кэше под ключом {alias_clean}")
+                else:
+                    logger.warning(f"[SESSION_MANAGER][get_client] Сессия {alias} не найдена в БД")
+            except Exception as e:
+                logger.error(f"[SESSION_MANAGER][get_client] Ошибка при получении сессии {alias} из БД: {e}", exc_info=True)
+                return None
+
+        if client:
+            logger.debug(f"[SESSION_MANAGER][get_client] Возвращаем клиента для {alias}: connected={getattr(client, 'is_connected', 'unknown')}")
+        else:
+            logger.warning(f"[SESSION_MANAGER][get_client] Клиент для {alias} не найден")
+
         return self.clients.get(alias)
 
     async def send_code(self, alias: str, phone: str) -> Dict[str, Any]:
@@ -239,16 +261,104 @@ class SessionManager:
         return {"success": True, "alias": alias, "assignments": assignments}
     
     async def get_client(self, alias: str) -> Optional[Client]:
+        logger.debug(f"[SESSION_MANAGER][get_client_v2] Запрашиваем клиента для alias: {alias}")
+
         if alias not in self.clients:
+            logger.debug(f"[SESSION_MANAGER][get_client_v2] Клиент {alias} не найден в кэше, загружаем все клиенты")
             await self.load_clients()
+
         client = self.clients.get(alias)
         if client and not client.is_connected:
+            logger.info(f"[SESSION_MANAGER][get_client_v2] Клиент {alias} найден но не подключен, запускаем сессию")
+            logger.debug(f"[SESSION_MANAGER][get_client_v2] Информация о клиенте: name={getattr(client, 'name', 'unknown')}, api_id={getattr(client, 'api_id', 'unknown')}")
+
             try:
+                # Добавляем диагностику состояния БД перед запуском
+                logger.debug(f"[SESSION_MANAGER][get_client_v2] Диагностика состояния БД перед запуском сессии {alias}")
+                db_path = getattr(self.db, 'db_path', 'unknown')
+                logger.debug(f"[SESSION_MANAGER][get_client_v2] Путь к БД: {db_path}")
+
+                # Проверяем, существует ли файл БД
+                if os.path.exists(db_path):
+                    logger.debug(f"[SESSION_MANAGER][get_client_v2] Файл БД существует, размер: {os.path.getsize(db_path)} байт")
+                    # Проверяем права доступа
+                    try:
+                        with open(db_path, 'rb') as f:
+                            f.read(1)
+                        logger.debug(f"[SESSION_MANAGER][get_client_v2] Файл БД доступен для чтения")
+                    except Exception as access_error:
+                        logger.error(f"[SESSION_MANAGER][get_client_v2] Ошибка доступа к файлу БД: {access_error}")
+                else:
+                    logger.warning(f"[SESSION_MANAGER][get_client_v2] Файл БД не существует: {db_path}")
+
+                # Проверяем, не заблокирована ли БД другой транзакцией
+                try:
+                    await self.db.conn.execute("SELECT 1")
+                    logger.debug(f"[SESSION_MANAGER][get_client_v2] БД доступна для запросов")
+                except Exception as db_error:
+                    logger.error(f"[SESSION_MANAGER][get_client_v2] БД недоступна перед запуском сессии: {db_error}")
+
+                logger.debug(f"[SESSION_MANAGER][get_client_v2] Запускаем client.start() для {alias}")
                 await client.start()
-                logger.info(f"[SESSION_MANAGER] Запущена сессия {alias}")
+                logger.info(f"[SESSION_MANAGER][get_client_v2] ✅ Успешно запущена сессия {alias}")
+
+                # Проверяем статус после запуска
+                try:
+                    me = await client.get_me()
+                    logger.debug(f"[SESSION_MANAGER][get_client_v2] Сессия авторизована как: {me.first_name} (@{me.username})")
+                except Exception as auth_error:
+                    logger.warning(f"[SESSION_MANAGER][get_client_v2] Сессия запущена но не авторизована: {auth_error}")
+
             except Exception as e:
-                logger.error(f"[SESSION_MANAGER] Ошибка запуска сессии {alias}: {e}")
+                logger.error(f"[SESSION_MANAGER][get_client_v2] ❌ Критическая ошибка запуска сессии {alias}: {e}", exc_info=True)
+
+                # Дополнительная диагностика ошибки
+                if "database is locked" in str(e).lower():
+                    logger.error(f"[SESSION_MANAGER][get_client_v2] 🔒 ОШИБКА 'DATABASE IS LOCKED' для сессии {alias}")
+                    logger.error(f"[SESSION_MANAGER][get_client_v2] 🔍 Детали ошибки блокировки БД:")
+                    logger.error(f"[SESSION_MANAGER][get_client_v2]   - Тип ошибки: {type(e).__name__}")
+                    logger.error(f"[SESSION_MANAGER][get_client_v2]   - Сообщение: {str(e)}")
+                    logger.error(f"[SESSION_MANAGER][get_client_v2]   - Путь к БД: {getattr(self.db, 'db_path', 'unknown')}")
+                    logger.error(f"[SESSION_MANAGER][get_client_v2]   - Соединение с БД активно: {self.db.conn is not None}")
+
+                    # Проверяем статус соединения с БД
+                    if self.db.conn:
+                        try:
+                            # Пытаемся выполнить простой запрос
+                            await self.db.conn.execute("SELECT 1")
+                            logger.error(f"[SESSION_MANAGER][get_client_v2]   - БД отвечает на простые запросы: ДА")
+                        except Exception as test_error:
+                            logger.error(f"[SESSION_MANAGER][get_client_v2]   - БД отвечает на простые запросы: НЕТ ({test_error})")
+
+                    # Проверяем файл БД
+                    db_path = getattr(self.db, 'db_path', 'unknown')
+                    if os.path.exists(db_path):
+                        file_size = os.path.getsize(db_path)
+                        logger.error(f"[SESSION_MANAGER][get_client_v2]   - Файл БД существует: ДА, размер: {file_size} байт")
+
+                        # Проверяем, не является ли файл БД поврежденным
+                        try:
+                            with open(db_path, 'rb') as f:
+                                header = f.read(100)
+                            logger.error(f"[SESSION_MANAGER][get_client_v2]   - Файл БД читается: ДА")
+                        except Exception as file_error:
+                            logger.error(f"[SESSION_MANAGER][get_client_v2]   - Файл БД читается: НЕТ ({file_error})")
+                    else:
+                        logger.error(f"[SESSION_MANAGER][get_client_v2]   - Файл БД существует: НЕТ")
+
+                    logger.error(f"[SESSION_MANAGER][get_client_v2] 💡 РЕКОМЕНДАЦИИ:")
+                    logger.error(f"[SESSION_MANAGER][get_client_v2]   1. Проверьте, нет ли других процессов, использующих БД")
+                    logger.error(f"[SESSION_MANAGER][get_client_v2]   2. Попробуйте перезапустить все сервисы")
+                    logger.error(f"[SESSION_MANAGER][get_client_v2]   3. Проверьте права доступа к файлу parser.db")
+                    logger.error(f"[SESSION_MANAGER][get_client_v2]   4. Возможно, файл БД поврежден - попробуйте восстановить из бэкапа")
+
                 return None
+
+        if client:
+            logger.debug(f"[SESSION_MANAGER][get_client_v2] Возвращаем клиента для {alias}: connected={getattr(client, 'is_connected', 'unknown')}")
+        else:
+            logger.warning(f"[SESSION_MANAGER][get_client_v2] Клиент для {alias} не найден")
+
         return client
     
     async def start_session(self, alias: str) -> bool:
@@ -315,19 +425,43 @@ class SessionManager:
     async def add_reaction(self, chat_id: str, message_id: int, reaction: str, session_names: Optional[List[str]] = None) -> Dict[str, str]:
         """Add reaction to a message using all or specific accounts"""
         results = {}
-        sessions_to_use = session_names if session_names else list(self.clients.keys())
-        
+        sessions_to_use = []
+        if session_names:
+            sessions_to_use = session_names
+        else:
+            # Получаем все сессии, назначенные для реакций
+            reaction_sessions = await self.get_sessions_for_task('reactions')
+            sessions_to_use = [s.alias for s in reaction_sessions]
+
+        if not sessions_to_use:
+            logger.warning("[REACTIONS] Нет сессий, назначенных для постановки реакций.")
+            return {"status": "warning", "message": "No sessions assigned for reactions"}
+
+        try:
+            numeric_chat_id = int(chat_id)
+        except (ValueError, TypeError):
+            logger.error(f"[REACTIONS] Неверный формат chat_id: '{chat_id}'. ID должен быть числовым.")
+            results["error"] = "Invalid chat_id format"
+            return results
+
         for alias in sessions_to_use:
-            client = self.clients.get(alias)
+            client = await self.get_client(alias)
             if client:
                 try:
-                    # Check if client is connected
                     if not client.is_connected:
                         await client.start()
-                    
-                    # Add reaction
+
+                    # Проверяем, может ли сессия получить доступ к каналу
+                    try:
+                        chat_info = await client.get_chat(numeric_chat_id)
+                        logger.info(f"Сессия {alias} имеет доступ к каналу {numeric_chat_id}")
+                    except Exception as access_error:
+                        logger.warning(f"Сессия {alias} не имеет доступа к каналу {numeric_chat_id}: {access_error}")
+                        results[alias] = f"no_access: {str(access_error)}"
+                        continue
+
                     await client.send_reaction(
-                        chat_id=chat_id,
+                        chat_id=numeric_chat_id,
                         message_id=message_id,
                         emoji=reaction
                     )
@@ -459,4 +593,148 @@ class SessionManager:
             return {"success": False, "error": str(e)} 
 
     async def get_sessions_for_task(self, task: str) -> list:
-        return await self.db.get_sessions_for_task(task) 
+        return await self.db.get_sessions_for_task(task)
+
+    async def update_session_user_ids(self):
+        """Обновить user_id для всех сессий, получив их из Telegram API"""
+        sessions = await self.db.get_all_sessions()
+        updated_count = 0
+        
+        for session in sessions:
+            if session.user_id is None:  # Обновляем только если еще не установлен
+                try:
+                    client = await self.get_client(session.alias)
+                    if client:
+                        if not client.is_connected:
+                            await client.start()
+                        
+                        me = await client.get_me()
+                        if me and me.id:
+                            await self.db.update_session(session.id, user_id=me.id)
+                            logger.info(f"[SESSION_MANAGER] Обновлен user_id для сессии {session.alias}: {me.id}")
+                            updated_count += 1
+                        
+                        if client.is_connected:
+                            await client.stop()
+                except Exception as e:
+                    logger.error(f"[SESSION_MANAGER] Ошибка обновления user_id для сессии {session.alias}: {e}")
+        
+        logger.info(f"[SESSION_MANAGER] Обновлено user_id для {updated_count} сессий")
+        return updated_count
+
+    async def group_sessions_by_user_id(self, sessions: List[SessionMeta]) -> Dict[int, List[SessionMeta]]:
+        """Группирует сессии по user_id для определения дублирующихся аккаунтов
+        
+        Args:
+            sessions: Список сессий для группировки
+            
+        Returns:
+            Словарь {user_id: [список сессий]}
+        """
+        groups = {}
+        
+        for session in sessions:
+            if session.user_id is None:
+                # Если user_id еще не установлен, пробуем получить его
+                try:
+                    client = await self.get_client(session.alias)
+                    if client:
+                        if not client.is_connected:
+                            await client.start()
+                        
+                        me = await client.get_me()
+                        if me and me.id:
+                            session.user_id = me.id
+                            await self.db.update_session(session.id, user_id=me.id)
+                            logger.info(f"[SESSION_MANAGER] Получен user_id для сессии {session.alias}: {me.id}")
+                        
+                        if client.is_connected:
+                            await client.stop()
+                except Exception as e:
+                    logger.error(f"[SESSION_MANAGER] Ошибка получения user_id для сессии {session.alias}: {e}")
+            
+            if session.user_id:
+                if session.user_id not in groups:
+                    groups[session.user_id] = []
+                groups[session.user_id].append(session)
+            else:
+                # Сессии без user_id группируем отдельно (каждая в своей группе)
+                groups[f"unknown_{session.id}"] = [session]
+        
+        return groups
+
+    async def get_next_parsing_session(self, current_session_alias: str = None) -> Optional[Client]:
+        """
+        Получить следующую доступную сессию для парсинга.
+        Если текущая сессия указана, возвращает следующую за ней.
+        Если текущая не указана, возвращает первую доступную.
+        """
+        logger.debug(f"[SESSION_MANAGER][get_next_parsing_session] Запрашиваем сессию для парсинга, текущая: {current_session_alias}")
+
+        parsing_sessions = await self.get_sessions_for_task("parsing")
+        logger.debug(f"[SESSION_MANAGER][get_next_parsing_session] Найдено сессий для парсинга: {len(parsing_sessions)}")
+
+        if not parsing_sessions:
+            logger.warning("[SESSION_MANAGER][get_next_parsing_session] Нет сессий, назначенных для парсинга")
+            logger.warning("[SESSION_MANAGER][get_next_parsing_session] Используйте assign_session для назначения сессий задаче 'parsing'")
+            return None
+
+        # Логируем все доступные сессии
+        session_info = [f"{s.alias}(id={s.id},active={s.is_active})" for s in parsing_sessions]
+        logger.debug(f"[SESSION_MANAGER][get_next_parsing_session] Доступные сессии: {session_info}")
+
+        # Если текущая сессия не указана, возвращаем первую
+        if current_session_alias is None:
+            session = parsing_sessions[0]
+            logger.info(f"[SESSION_MANAGER][get_next_parsing_session] Выбрана первая сессия для парсинга: {session.alias}")
+            logger.debug(f"[SESSION_MANAGER][get_next_parsing_session] Детали сессии: id={session.id}, api_id={session.api_id}, phone={session.phone}")
+
+            client = await self.get_client(session.alias)
+            if client:
+                logger.info(f"[SESSION_MANAGER][get_next_parsing_session] ✅ Успешно получен клиент для первой сессии: {session.alias}")
+                return client
+            else:
+                logger.error(f"[SESSION_MANAGER][get_next_parsing_session] ❌ Не удалось получить клиент для сессии: {session.alias}")
+                return None
+
+        # Находим индекс текущей сессии
+        current_index = -1
+        for i, session in enumerate(parsing_sessions):
+            if session.alias == current_session_alias:
+                current_index = i
+                break
+
+        if current_index == -1:
+            logger.warning(f"[SESSION_MANAGER][get_next_parsing_session] Текущая сессия {current_session_alias} не найдена в списке парсинга")
+            logger.warning(f"[SESSION_MANAGER][get_next_parsing_session] Доступные сессии: {[s.alias for s in parsing_sessions]}")
+            return None
+
+        # Пробуем следующую сессию (по кругу)
+        next_index = (current_index + 1) % len(parsing_sessions)
+        session = parsing_sessions[next_index]
+
+        logger.info(f"[SESSION_MANAGER][get_next_parsing_session] Переключение на следующую сессию для парсинга: {session.alias} (была {current_session_alias})")
+        logger.debug(f"[SESSION_MANAGER][get_next_parsing_session] Детали новой сессии: id={session.id}, api_id={session.api_id}, phone={session.phone}")
+
+        client = await self.get_client(session.alias)
+        if client:
+            logger.info(f"[SESSION_MANAGER][get_next_parsing_session] ✅ Успешно переключено на сессию: {session.alias}")
+            return client
+
+        # Если следующая не доступна, пробуем остальные
+        logger.warning(f"[SESSION_MANAGER][get_next_parsing_session] Следующая сессия {session.alias} недоступна, пробуем другие")
+
+        for i in range(len(parsing_sessions)):
+            if i == current_index:
+                continue
+            session = parsing_sessions[i]
+            logger.debug(f"[SESSION_MANAGER][get_next_parsing_session] Пробуем сессию: {session.alias}")
+
+            client = await self.get_client(session.alias)
+            if client:
+                logger.info(f"[SESSION_MANAGER][get_next_parsing_session] ✅ Найдена доступная сессия для парсинга: {session.alias} (была {current_session_alias})")
+                return client
+
+        logger.error("[SESSION_MANAGER][get_next_parsing_session] ❌ Не найдено доступных сессий для парсинга")
+        logger.error("[SESSION_MANAGER][get_next_parsing_session] Проверьте статус сессий и логи выше для диагностики")
+        return None 

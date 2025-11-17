@@ -17,16 +17,21 @@ class TextEditorManager:
     def __init__(self):
         self.base_url = config.PARSER_SERVICE_URL
         
-    async def start_text_editing(self, channel_id: int, link_text: str, link_url: str, max_posts: int = 100) -> Dict[str, Any]:
+    async def start_text_editing(self, channel_id: int, footer_text: str, max_posts: int = 100,
+                                require_hashtags: bool = False, require_specific_text: bool = False,
+                                specific_text: str = "", require_old_footer: bool = True) -> Dict[str, Any]:
         """
         Запуск редактирования текста постов
-        
+
         Args:
             channel_id: ID канала
-            link_text: Текст для гиперссылки
-            link_url: URL для гиперссылки  
+            footer_text: HTML текст приписки для замены
             max_posts: Максимальное количество постов
-            
+            require_hashtags: Требовать хэштеги в тексте
+            require_specific_text: Требовать определенный текст
+            specific_text: Текст для поиска
+            require_old_footer: Заменять старую приписку
+
         Returns:
             dict: Результат запуска редактирования
         """
@@ -36,9 +41,12 @@ class TextEditorManager:
                     f"{self.base_url}/text-editor/start",
                     json={
                         "channel_id": channel_id,
-                        "link_text": link_text,
-                        "link_url": link_url,
-                        "max_posts": max_posts
+                        "footer_text": footer_text,
+                        "max_posts": max_posts,
+                        "require_hashtags": require_hashtags,
+                        "require_specific_text": require_specific_text,
+                        "specific_text": specific_text,
+                        "require_old_footer": require_old_footer
                     }
                 )
                 
@@ -140,21 +148,32 @@ class TextEditorManager:
         processed = task_info.get('processed_count', 0)
         modified = task_info.get('modified_count', 0)
         channel_id = task_info.get('channel_id', 'Неизвестно')
-        link_text = task_info.get('link_text', 'Неизвестно')
+        footer_text = task_info.get('footer_text', 'Неизвестно')
         max_posts = task_info.get('max_posts', 0)
-        
+        require_hashtags = task_info.get('require_hashtags', False)
+        require_specific_text = task_info.get('require_specific_text', False)
+        specific_text = task_info.get('specific_text', '')
+        require_old_footer = task_info.get('require_old_footer', True)
+
         status_emoji = {
             'running': '🔄',
             'completed': '✅',
             'stopped': '⏹️',
             'error': '❌'
         }.get(status, '❓')
-        
+
         message = f"{status_emoji} **Редактирование текста**\n\n"
         message += f"📋 ID задачи: `{task_id}`\n"
         message += f"📺 Канал: `{channel_id}`\n"
-        message += f"🔗 Добавляемый текст: `{link_text}`\n"
+        message += f"📝 Новая приписка: `{footer_text[:50]}{'...' if len(footer_text) > 50 else ''}`\n"
         message += f"📊 Лимит постов: {max_posts}\n"
+        if require_hashtags or require_specific_text or not require_old_footer:
+            message += f"🏷️ Хэштеги: {'Да' if require_hashtags else 'Нет'}\n"
+            message += f"🔤 Текст: {'Да' if require_specific_text else 'Нет'}"
+            if require_specific_text and specific_text:
+                message += f" ({specific_text[:20]}{'...' if len(specific_text) > 20 else ''})"
+            message += "\n"
+            message += f"📝 Старая приписка: {'Да' if require_old_footer else 'Нет'}\n"
         message += f"📈 Обработано: {processed}\n"
         message += f"✏️ Изменено: {modified}\n"
         message += f"📍 Статус: {status}"
@@ -197,6 +216,7 @@ class TextEditorManager:
             channel_id = task.get('channel_id', 'Неизвестно')
             processed = task.get('processed_count', 0)
             modified = task.get('modified_count', 0)
+            footer_text = task.get('footer_text', 'Неизвестно')
             
             message += f"{status_emoji} `{task_id}`\n"
             message += f"   📺 Канал: `{channel_id}`\n"

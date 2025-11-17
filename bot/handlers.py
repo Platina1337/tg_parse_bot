@@ -2,6 +2,7 @@ import re
 import asyncio
 import logging
 import os
+import traceback
 from datetime import datetime
 import pytz
 from typing import Dict, Optional
@@ -14,34 +15,42 @@ from shared.models import ParseConfig, ParseMode, PostingSettings
 from bot.settings import get_user_settings, update_user_settings, clear_user_settings, get_user_templates, save_user_template, DB_PATH
 from bot.states import (
     user_states, FSM_MAIN_MENU,
-    FSM_FORWARD_CHANNEL, FSM_FORWARD_TARGET, FSM_FORWARD_SETTINGS, FSM_FORWARD_HASHTAG,
-    FSM_FORWARD_DELAY, FSM_FORWARD_FOOTER, FSM_FORWARD_FOOTER_LINK, FSM_FORWARD_FOOTER_LINK_TEXT, FSM_FORWARD_TEXT_MODE, FSM_FORWARD_LIMIT,
+    FSM_FORWARD_CHANNEL, FSM_FORWARD_TARGET, FSM_FORWARD_TARGETS, FSM_FORWARD_SETTINGS, FSM_FORWARD_HASHTAG,
+    FSM_FORWARD_DELAY, FSM_FORWARD_FOOTER, FSM_FORWARD_TEXT_MODE, FSM_FORWARD_LIMIT,
     FSM_FORWARD_DIRECTION, FSM_FORWARD_MEDIA_FILTER, FSM_FORWARD_RANGE, FSM_FORWARD_RANGE_START, FSM_FORWARD_RANGE_END,
+    FSM_FORWARD_MENU,
     get_main_keyboard, get_channel_history_keyboard, get_target_channel_history_keyboard,
     get_forwarding_keyboard, get_forwarding_settings_keyboard, get_parse_mode_keyboard, get_text_mode_keyboard,
     get_direction_keyboard, get_media_filter_keyboard, get_range_mode_keyboard,
-    posting_stats, start_forwarding_parsing_api, get_forwarding_history_stats_api, 
+    posting_stats, get_forwarding_history_stats_api,
     clear_forwarding_history_api, get_channel_info, get_target_channel_info,
     get_stop_last_task_inline_keyboard, get_forwarding_inline_keyboard,
      format_channel_stats, format_forwarding_stats,
     start_forwarding_api, stop_forwarding_api, get_forwarding_stats_api, save_forwarding_config_api,
-    start_forwarding_parsing_api, get_forwarding_history_stats_api, clear_forwarding_history_api,
     get_channel_info, get_target_channel_info,
     FSM_REACTION_CHANNEL, FSM_REACTION_SETTINGS, FSM_REACTION_EMOJIS, FSM_REACTION_MODE, FSM_REACTION_HASHTAG, FSM_REACTION_DATE, FSM_REACTION_DATE_RANGE, FSM_REACTION_COUNT, FSM_REACTION_CONFIRM,
     get_reaction_settings_keyboard, get_reaction_inline_keyboard,
-    FSM_TEXT_EDIT_CHANNEL, FSM_TEXT_EDIT_LINK_TEXT, FSM_TEXT_EDIT_LINK_URL, FSM_TEXT_EDIT_LIMIT, FSM_TEXT_EDIT_CONFIRM,
-    get_text_edit_menu_keyboard, get_text_edit_confirmation_keyboard,
+    FSM_TEXT_EDIT_CHANNEL, FSM_TEXT_EDIT_SETTINGS, FSM_TEXT_EDIT_LINK_TEXT, FSM_TEXT_EDIT_LINK_URL, FSM_TEXT_EDIT_LIMIT, FSM_TEXT_EDIT_FOOTER_EDIT, FSM_TEXT_EDIT_SPECIFIC_TEXT, FSM_TEXT_EDIT_CONFIRM,
+    get_text_edit_menu_keyboard, get_text_edit_confirmation_keyboard, get_text_edit_inline_keyboard,
 )
 from bot.config import config
 from bot.core import (
     show_main_menu, start_forwarding_api, stop_forwarding_api, get_forwarding_stats_api, save_forwarding_config_api,
     start_forwarding_parsing_api, get_forwarding_history_stats_api, clear_forwarding_history_api,
-    get_channel_info, get_target_channel_info
+    get_channel_info, get_target_channel_info, get_actual_published_count, get_publish_stat_text
 )
 from bot.api_client import api_client
 from bot.states import format_forwarding_config
 from bot.text_editor_manager import TextEditorManager
+from bot.watermark_manager import watermark_manager
+from bot.states import (
+    FSM_WATERMARK_TEXT_INPUT, FSM_WATERMARK_CHANCE, FSM_WATERMARK_HASHTAG,
+    FSM_WATERMARK_OPACITY, FSM_WATERMARK_SCALE,
+    get_watermark_menu_keyboard, get_watermark_type_keyboard,
+    get_watermark_mode_keyboard, get_watermark_position_keyboard
+)
 import html
+from unittest.mock import MagicMock
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -69,6 +78,119 @@ async def safe_edit_message(client, chat_id: int, message_id: int, text: str, re
                 text=text,
                 reply_markup=reply_markup
             )
+
+async def show_watermark_channel_selection(client, message, user_id):
+    """Показать выбор канала для watermark настроек"""
+    logger.info(f"[WATERMARK] >>> ENTERING show_watermark_channel_selection for user {user_id}")
+
+    user_state = user_states.get(user_id, {})
+    target_channels = user_state.get('forward_target_channels', [])
+
+    if not target_channels:
+        text = "❌ Нет каналов для настройки watermark"
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="forward_back")]])
+    else:
+        text = """
+🎨 **Выберите канал для настройки watermark**
+
+Для каждого канала можно настроить отдельные параметры watermark:
+• Тип (текст/изображение)
+• Режим применения
+• Позиция и прозрачность
+
+Выберите канал, чтобы увидеть его текущие настройки и внести изменения.
+"""
+        buttons = []
+        for channel in target_channels:
+            channel_id = str(channel['id'])
+            channel_title = channel['title']
+            # Асинхронно получаем статус watermark для каждого канала
+            wm_settings = await watermark_manager.get_channel_watermark_settings(user_id, channel_id)
+            wm_status = "✅" if wm_settings.get('watermark_enabled') else "❌"
+            buttons.append([InlineKeyboardButton(f"{wm_status} {channel_title}", callback_data=f"watermark_channel_{channel_id}")])
+        
+        buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_forward_settings")])
+        keyboard = InlineKeyboardMarkup(buttons)
+
+    await safe_edit_message(client, message.chat.id, message.id, text, keyboard)
+    logger.info(f"[WATERMARK] <<< EXITING show_watermark_channel_selection for user {user_id}")
+
+async def show_target_channels_management(client, message, user_id):
+    """Показать управление выбранными целевыми каналами"""
+    logger.info(f"[TARGET_CHANNELS] >>> ENTERING show_target_channels_management for user {user_id}")
+    try:
+        user_state = user_states.get(user_id, {})
+        source_channel = user_state.get('forward_channel_title', 'Не выбран')
+        target_channels = user_state.get('forward_target_channels', [])
+        logger.info(f"[TARGET_CHANNELS] User state: {user_state}")
+        logger.info(f"[TARGET_CHANNELS] Found {len(target_channels)} target channels: {target_channels}")
+
+        if not target_channels:
+            text = f"📥 Из: {source_channel}\n\n❌ Не выбрано ни одного целевого канала"
+        else:
+            text = f"📥 Из: {source_channel}\n\n📤 Выбранные каналы для пересылки:"
+            for i, ch in enumerate(target_channels, 1):
+                title = ch.get('title', ch['id'])
+                username = ch.get('username', '')
+                if username:
+                    title += f" (@{username})"
+                text += f"\n{i}. {title}"
+
+        # Создаем клавиатуру для управления каналами
+        keyboard_buttons = [
+            [InlineKeyboardButton("➕ Добавить канал", callback_data="add_target_channel")],
+            [InlineKeyboardButton("🎨 Watermark", callback_data="watermark_channel_select")],
+            [InlineKeyboardButton("🚀 Начать пересылку", callback_data="forward_to_settings")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="forward_back")]
+        ]
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+
+        # Временно отключаем проверку доступа к каналам
+        # # Проверяем доступ к каналам и показываем статус
+        # access_checks = []
+        # for ch in target_channels:
+        #     try:
+        #         # Проверяем доступ через API
+        #         channel_info = await api_client.get_channel_info(str(ch['id']))
+        #         if channel_info and channel_info.get('error'):
+        #             access_checks.append(f"❌ {ch.get('title', ch['id'])} - нет доступа")
+        #         else:
+        #             access_checks.append(f"✅ {ch.get('title', ch['id'])}")
+        #     except Exception as e:
+        #         logger.warning(f"[ACCESS_CHECK] Error checking access for channel {ch['id']}: {e}")
+        #         access_checks.append(f"❓ {ch.get('title', ch['id'])} - проверка не удалась")
+
+        # Временно отключаем показ статуса доступа
+        # if access_checks:
+        #     text += "\n\n📊 Статус доступа к каналам:"
+        #     for status in access_checks:
+        #         text += f"\n{status}"
+
+        # Удаляем кнопки удаления каналов если их больше 1
+        if len(target_channels) > 1:
+            remove_buttons = []
+            for i, ch in enumerate(target_channels, 1):
+                title = ch.get('title', ch['id'])
+                if len(title) > 20:
+                    title = title[:17] + "..."
+                remove_buttons.append(InlineKeyboardButton(f"❌ {i}. {title}", callback_data=f"remove_target_channel:{i-1}"))
+            # Добавляем кнопки удаления пачками по 2
+            for i in range(0, len(remove_buttons), 2):
+                keyboard.inline_keyboard.insert(-2, remove_buttons[i:i+2])
+
+        logger.info(f"[TARGET_CHANNELS] About to send message with keyboard, text length: {len(text)}")
+        logger.info(f"[TARGET_CHANNELS] Keyboard has {len(keyboard.inline_keyboard)} rows")
+        sent = await message.reply(text, reply_markup=keyboard)
+        logger.info(f"[TARGET_CHANNELS] Message sent successfully, message_id: {sent.id if sent else None}")
+        if sent is not None:
+            user_states[user_id]["last_msg_id"] = sent.id
+        user_states[user_id]["state"] = FSM_FORWARD_TARGETS
+        logger.info(f"[TARGET_CHANNELS] <<< EXITING show_target_channels_management successfully")
+
+    except Exception as e:
+        logger.error(f"[TARGET_CHANNELS] Error: {e}")
+        await message.reply("❌ Ошибка при отображении управления каналами", reply_markup=get_main_keyboard())
+        user_states[user_id]["state"] = FSM_MAIN_MENU
 
 async def safe_edit_callback_message(callback_query, text: str, reply_markup=None):
     """Безопасное редактирование сообщения callback с обработкой ошибки MESSAGE_NOT_MODIFIED"""
@@ -139,6 +261,26 @@ async def text_handler(client: Client, message: Message):
     from bot.public_groups_manager import handle_public_groups_text
     if await handle_public_groups_text(client, message):
         return  # Если обработано — не продолжаем дальше
+    
+    # --- FSM: обработка watermark ---
+    from bot.watermark_handlers import (
+        handle_watermark_text_input, handle_watermark_chance_input,
+        handle_watermark_hashtag_input, handle_watermark_opacity_input,
+        handle_watermark_scale_input
+    )
+    if state in [FSM_WATERMARK_TEXT_INPUT, FSM_WATERMARK_CHANCE, FSM_WATERMARK_HASHTAG, 
+                 FSM_WATERMARK_OPACITY, FSM_WATERMARK_SCALE]:
+        if state == FSM_WATERMARK_TEXT_INPUT:
+            await handle_watermark_text_input(client, message)
+        elif state == FSM_WATERMARK_CHANCE:
+            await handle_watermark_chance_input(client, message)
+        elif state == FSM_WATERMARK_HASHTAG:
+            await handle_watermark_hashtag_input(client, message)
+        elif state == FSM_WATERMARK_OPACITY:
+            await handle_watermark_opacity_input(client, message)
+        elif state == FSM_WATERMARK_SCALE:
+            await handle_watermark_scale_input(client, message)
+        return  # Если обработано — не продолжаем дальше
 
     # --- FSM: обработка сессий ---
     # Убираем дублирующий вызов handle_session_text_input, так как он уже вызывается в bot_main.py
@@ -176,11 +318,11 @@ async def text_handler(client: Client, message: Message):
             return
             return
         elif text in ["✏️ Редактирование текста"]:
+            kb = await get_channel_history_keyboard(user_id)
             sent = await message.reply(
-                "🛠 **Редактирование текста постов**\n\n"
-                "Этот режим позволяет добавлять новые гиперссылки ко всем постам в канале.\n\n"
-                "Выберите действие:",
-                reply_markup=get_text_edit_menu_keyboard()
+                "📺 **Выбор канала для редактирования текста**\n\n"
+                "Выберите канал из истории или введите ID/ссылку канала:",
+                reply_markup=kb or ReplyKeyboardRemove()
             )
             if last_msg_id:
                 try:
@@ -188,7 +330,7 @@ async def text_handler(client: Client, message: Message):
                 except Exception:
                     pass
             if sent is not None:
-                user_states[user_id] = {**user_states.get(user_id, {}), "state": "text_edit_menu", "last_msg_id": sent.id}
+                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_CHANNEL, "last_msg_id": sent.id}
             return
         elif text in ["Навигация по хэштегам", "🧭 Навигация по хэштегам"]:
             from bot.navigation_manager import navigation_menu_handler
@@ -285,6 +427,7 @@ async def text_handler(client: Client, message: Message):
     # --- FSM: Выбор целевого канала для пересылки ---
     if state == FSM_FORWARD_TARGET:
         print(f"[FSM][DEBUG] FSM_FORWARD_TARGET | text='{text}'")
+        logger.info(f"[FSM] Processing FSM_FORWARD_TARGET for user {user_id}, text: '{text}'")
         if text == "Назад":
             kb = await get_channel_history_keyboard(user_id)
             sent = await message.reply("Выберите канал для пересылки:", reply_markup=kb or ReplyKeyboardRemove())
@@ -292,17 +435,51 @@ async def text_handler(client: Client, message: Message):
                 user_states[user_id]["last_msg_id"] = sent.id
             user_states[user_id]["state"] = FSM_FORWARD_CHANNEL
             return
+        logger.info(f"[FSM] Checking regex match for text: '{text}'")
         match = re.match(r"(.+) \(ID: (-?\d+)(?:, @(\w+))?\)", text)
         if match:
+            logger.info(f"[FSM] Regex matched! Groups: {match.groups()}")
             channel_title = match.group(1)
             channel_id = match.group(2)
             username = match.group(3)
-            user_states[user_id]["forward_target_channel"] = channel_id
+            # Временно отключаем проверку доступа
+            # # Проверяем доступ к каналу через API
+            # try:
+            #     channel_access_info = await api_client.get_channel_info(str(channel_id))
+            #     if channel_access_info and channel_access_info.get('error'):
+            #         sent = await message.reply(f"❌ Нет доступа к каналу '{channel_title}'. Убедитесь, что сессия подписана на этот канал.", reply_markup=ReplyKeyboardRemove())
+            #         if sent is not None:
+            #             user_states[user_id]["last_msg_id"] = sent.id
+            #         return
+            # except Exception as e:
+            #     logger.warning(f"[ACCESS_CHECK] Не удалось проверить доступ к каналу {channel_id}: {e}")
+
+            # Инициализируем список каналов если его нет
+            if "forward_target_channels" not in user_states[user_id]:
+                user_states[user_id]["forward_target_channels"] = []
+            # Добавляем канал в список
+            channel_info = {
+                "id": channel_id,
+                "title": channel_title,
+                "username": username
+            }
+            if channel_info not in user_states[user_id]["forward_target_channels"]:
+                user_states[user_id]["forward_target_channels"].append(channel_info)
+            logger.info(f"[FSM] About to set forward_target_title to '{channel_title}'")
             user_states[user_id]["forward_target_title"] = channel_title
             if username:
                 user_states[user_id]["forward_target_username"] = username
+            logger.info(f"[FSM] About to update target channel last used for {channel_id}")
             await api_client.update_user_target_channel_last_used(user_id, channel_id)
+            logger.info(f"[FSM] Successfully updated target channel last used")
+
+            # После выбора целевого канала показываем управление каналами
+            logger.info(f"[FSM] About to call show_target_channels_management for user {user_id}")
+            await show_target_channels_management(client, message, user_id)
+            logger.info(f"[FSM] Successfully showed target channels management")
+            return
         else:
+            logger.info(f"[FSM] Regex not matched, trying resolve_channel for text: '{text}'")
             channel_info = await resolve_channel(api_client, text)
             if channel_info is None:
                 sent = await message.reply("❌ Не удалось определить ID канала. Введите корректный username или ID.", reply_markup=ReplyKeyboardRemove())
@@ -323,54 +500,73 @@ async def text_handler(client: Client, message: Message):
                 real_id = int(real_id)
             except (ValueError, TypeError):
                 real_id = channel_id
-            
+
+            # Временно отключаем проверку доступа
+            # # Проверяем доступ к каналу через API
+            # try:
+            #     channel_access_info = await api_client.get_channel_info(str(real_id))
+            #     if channel_access_info and channel_access_info.get('error'):
+            #         sent = await message.reply(f"❌ Нет доступа к каналу '{channel_title}'. Убедитесь, что сессия подписана на этот канал.", reply_markup=ReplyKeyboardRemove())
+            #         if sent is not None:
+            #             user_states[user_id]["last_msg_id"] = sent.id
+            #         return
+            # except Exception as e:
+            #     logger.warning(f"[ACCESS_CHECK] Не удалось проверить доступ к каналу {real_id}: {e}")
+
             # Сохраняем в БД правильно
             if is_username:
                 # Пользователь ввел username, сохраняем username в поле username, а ID в поле channel_id
                 await api_client.add_user_target_channel(user_id, str(real_id), channel_title, text)
-                user_states[user_id]["forward_target_channel"] = real_id
+                # Инициализируем список каналов если его нет
+                if "forward_target_channels" not in user_states[user_id]:
+                    user_states[user_id]["forward_target_channels"] = []
+                # Добавляем канал в список
+                channel_info = {
+                    "id": str(real_id),
+                    "title": channel_title,
+                    "username": text
+                }
+                if channel_info not in user_states[user_id]["forward_target_channels"]:
+                    user_states[user_id]["forward_target_channels"].append(channel_info)
                 user_states[user_id]["forward_target_username"] = text  # username
             else:
                 # Пользователь ввел ID, сохраняем ID в поле channel_id, а username в поле username
                 await api_client.add_user_target_channel(user_id, str(real_id), channel_title, channel_username)
-                user_states[user_id]["forward_target_channel"] = real_id
+                # Инициализируем список каналов если его нет
+                if "forward_target_channels" not in user_states[user_id]:
+                    user_states[user_id]["forward_target_channels"] = []
+                # Добавляем канал в список
+                channel_info = {
+                    "id": str(real_id),
+                    "title": channel_title,
+                    "username": channel_username
+                }
+                if channel_info not in user_states[user_id]["forward_target_channels"]:
+                    user_states[user_id]["forward_target_channels"].append(channel_info)
                 if channel_username:
                     user_states[user_id]["forward_target_username"] = channel_username
             
             user_states[user_id]["forward_target_title"] = channel_title
-        user_states[user_id]['forward_settings'] = {
-            'parse_mode': 'all',
-            'hashtag_filter': None,
-            'delay_seconds': 1,
-            'footer_text': '🌐 <a href="https://t.me/TESAMSH/4026">_TSSH_Fans_</a>\n\n<a href="https://t.me/+ybzXQhwkAio4ZGYy">Приватный канал / Подписаться</a>',
-            'text_mode': 'hashtags_only',
-            'max_posts': None,
-            'hide_sender': True
-        }
-        # Показываем статистику канала и меню управления пересылкой
-        try:
-            stats = await api_client.get_channel_stats(str(user_states[user_id]['forward_channel_id']))
-            stat_text = format_channel_stats(stats)
-            channel_id = user_states[user_id]['forward_channel_id']
-            target_channel = user_states[user_id].get('forward_target_channel')
-            sent_stat = await message.reply(
-                f"📊 Статистика канала {user_states[user_id]['forward_channel_title']}:\n\n{stat_text}\n\nВыберите действие:",
-                reply_markup=get_forwarding_inline_keyboard(channel_id, target_channel)
-            )
-            if sent_stat is not None:
-                user_states[user_id]["last_msg_id"] = sent_stat.id
-            user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
+
+            # После выбора целевого канала показываем управление каналами
+            logger.info(f"[FSM] About to call show_target_channels_management for user {user_id}")
+            await show_target_channels_management(client, message, user_id)
+            logger.info(f"[FSM] Successfully showed target channels management")
+
+
+
+
+
+
+
+    # --- FSM: Управление выбранными каналами ---
+    if state == FSM_FORWARD_TARGETS:
+        print(f"[FSM][DEBUG] FSM_FORWARD_TARGETS | text='{text}'")
+        # В состоянии управления каналами игнорируем любой текстовый ввод
+        # Пользователь должен использовать только кнопки для навигации
+        if text and not text.startswith("/"):
+            await message.reply("⚠️ Используйте кнопки для управления каналами или настройки пересылки")
             return
-        except Exception as e:
-            sent = await message.reply(f"Ошибка при получении статистики: {e}", reply_markup=get_main_keyboard())
-            user_states[user_id]["state"] = FSM_MAIN_MENU
-            return
-
-
-
-
-
-
 
     # --- FSM: Настройки пересылки ---
     if state == FSM_FORWARD_SETTINGS:
@@ -616,79 +812,89 @@ async def text_handler(client: Client, message: Message):
                 user_states[user_id]['last_msg_id'] = sent.id
             return
         elif forward_state == 'limit_input':
-            # Обработка ввода лимита
             if text == "🔙 Назад":
-                # Возвращаемся к настройкам
-                config = dict(user_states[user_id]['forward_settings'])
-                config.setdefault('parse_direction', 'backward')
-                config.setdefault('media_filter', 'media_only')
-                config.setdefault('range_mode', 'all')
-                config.setdefault('range_start_id', None)
-                config.setdefault('range_end_id', None)
-                config.setdefault('last_message_id', None)
-                config_text = format_forwarding_config(config)
-                sent = await message.reply(
-                    f"Текущие настройки пересылки:\n\n{config_text}\n\nВыберите параметр для изменения:",
-                    reply_markup=get_forwarding_settings_keyboard()
-                )
-                if sent is not None:
-                    user_states[user_id]['last_msg_id'] = sent.id
                 user_states[user_id]['forward_state'] = None
+                await show_forwarding_settings(client, message, user_id)
                 return
+
+            if text.lower() == '0' or text.lower() == 'без лимита':
+                user_states[user_id]['forward_settings']['max_posts'] = None
+                await message.reply("✅ Лимит снят!", reply_markup=ReplyKeyboardRemove())
+            else:
+                try:
+                    limit = int(text)
+                    if limit <= 0:
+                        raise ValueError
+                    user_states[user_id]['forward_settings']['max_posts'] = limit
+                    await message.reply(f"✅ Лимит установлен: {limit} постов", reply_markup=ReplyKeyboardRemove())
+                except ValueError:
+                    await message.reply("❌ Введите положительное число.", reply_markup=ReplyKeyboardRemove())
+                    return
             
-            try:
-                if text.strip().lower() == '0' or text.strip().lower() == 'без лимита':
-                    limit = None
-                else:
-                    limit = int(text.strip())
-                    if limit < 0:
-                        limit = None
-                user_states[user_id]['forward_settings']['max_posts'] = limit
-                user_states[user_id]['forward_state'] = None
-                
-                # Отправляем новое сообщение с настройками
-                config = dict(user_states[user_id]['forward_settings'])
-                config.setdefault('parse_direction', 'backward')
-                config.setdefault('media_filter', 'media_only')
-                config.setdefault('range_mode', 'all')
-                config.setdefault('range_start_id', None)
-                config.setdefault('range_end_id', None)
-                config.setdefault('last_message_id', None)
-                config_text = format_forwarding_config(config)
-                limit_display = str(limit) if limit else 'Без лимита'
-                sent = await message.reply(
-                    f"✅ Лимит {limit_display} сохранен!\n\n"
-                    f"Текущие настройки пересылки:\n\n{config_text}\n\n"
-                    f"Выберите параметр для изменения:",
-                    reply_markup=get_forwarding_settings_keyboard()
-                )
-                if sent is not None:
-                    user_states[user_id]['last_msg_id'] = sent.id
-                return
-            except ValueError:
-                await message.reply("Пожалуйста, введите число для лимита или '0' для снятия лимита.")
-                return
+            user_states[user_id]['forward_state'] = None
+            await show_forwarding_settings(client, message, user_id)
         
-        # --- Новые обработчики состояний ---
-        elif forward_state == 'range_start_input':
-            # Обработка ввода начального ID диапазона
+        elif forward_state == 'reactions_emojis_input':
             if text == "🔙 Назад":
-                # Возвращаемся к настройкам
-                config = dict(user_states[user_id]['forward_settings'])
-                config.setdefault('parse_direction', 'backward')
-                config.setdefault('media_filter', 'media_only')
-                config.setdefault('range_mode', 'all')
-                config.setdefault('range_start_id', None)
-                config.setdefault('range_end_id', None)
-                config.setdefault('last_message_id', None)
-                config_text = format_forwarding_config(config)
-                sent = await message.reply(
-                    f"Текущие настройки пересылки:\n\n{config_text}\n\nВыберите параметр для изменения:",
-                    reply_markup=get_forwarding_settings_keyboard()
-                )
-                if sent is not None:
-                    user_states[user_id]['last_msg_id'] = sent.id
                 user_states[user_id]['forward_state'] = None
+                # Re-show reactions menu on the original bot message
+                last_bot_message_id = user_states[user_id].get('last_msg_id')
+                settings = user_states[user_id].get('forward_settings', {})
+                reactions_enabled = settings.get('reactions_enabled', False)
+                emojis = settings.get('reaction_emojis', [])
+
+                text = "🎭 Настройка автоматических реакций\n\n"
+                if reactions_enabled:
+                    text += f"Статус: Включено\n"
+                    text += f"Эмодзи: {' '.join(emojis) if emojis else 'Не заданы'}"
+                else:
+                    text += "Статус: Отключено"
+
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Включить" if not reactions_enabled else "❌ Отключить", callback_data="forward_reactions_toggle")],
+                    [InlineKeyboardButton("😀 Изменить эмодзи", callback_data="forward_reactions_emojis")],
+                    [InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_settings")]
+                ])
+                if last_bot_message_id:
+                    await client.edit_message_text(message.chat.id, last_bot_message_id, text, reply_markup=kb)
+                return
+
+            emojis = text.split()
+            user_states[user_id]['forward_settings']['reaction_emojis'] = emojis
+            await message.reply(f"✅ Эмодзи сохранены: {' '.join(emojis)}", reply_markup=ReplyKeyboardRemove())
+            
+            user_states[user_id]['forward_state'] = None
+            
+            # Re-show reactions menu on the original bot message
+            last_bot_message_id = user_states[user_id].get('last_msg_id')
+            settings = user_states[user_id].get('forward_settings', {})
+            reactions_enabled = settings.get('reactions_enabled', False)
+            emojis = settings.get('reaction_emojis', [])
+
+            text = "🎭 Настройка автоматических реакций\n\n"
+            if reactions_enabled:
+                text += f"Статус: Включено\n"
+                text += f"Эмодзи: {' '.join(emojis) if emojis else 'Не заданы'}"
+            else:
+                text += "Статус: Отключено"
+
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Включить" if not reactions_enabled else "❌ Отключить", callback_data="forward_reactions_toggle")],
+                [InlineKeyboardButton("😀 Изменить эмодзи", callback_data="forward_reactions_emojis")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_settings")]
+            ])
+            if last_bot_message_id:
+                try:
+                    await client.edit_message_text(message.chat.id, last_bot_message_id, text, reply_markup=kb)
+                except MessageNotModified:
+                    pass
+            
+            return
+
+        elif forward_state == 'range_start_input':
+            if text == "🔙 Назад":
+                user_states[user_id]['forward_state'] = None
+                await show_forwarding_settings(client, message, user_id)
                 return
             
             try:
@@ -903,12 +1109,27 @@ async def text_handler(client: Client, message: Message):
             elif state == FSM_FORWARD_MONITORING or state == FSM_FORWARD_RUNNING:
                 # После запуска пересылки/мониторинга — возвращаем к статистике
                 stats = await api_client.get_channel_stats(str(user_states[user_id]['forward_channel_id']))
+
+                # Получаем реальный последний ID сообщения
+                real_last_message_id = await api_client.get_channel_last_message_id(str(user_states[user_id]['forward_channel_id']))
+                if real_last_message_id is not None:
+                    stats = stats.copy()  # Создаем копию чтобы не изменять оригинал
+                    stats['last_message_id'] = real_last_message_id
+
                 stat_text = format_channel_stats(stats)
                 channel_id = user_states[user_id]['forward_channel_id']
                 target_channel = user_states[user_id].get('forward_target_channel')
+
+                # Формируем текст с информацией о каналах
+                source_channel_info = f"📥 Из: {user_states[user_id]['forward_channel_title']}"
+                target_channel_info = ""
+                if target_channel:
+                    target_title = user_states[user_id].get('forward_target_title', target_channel)
+                    target_channel_info = f"\n📤 В: {target_title}"
+
                 await safe_edit_callback_message(
                     callback_query,
-                    f"📊 Статистика канала {user_states[user_id]['forward_channel_title']}:\n\n{stat_text}\n\nВыберите действие:",
+                    f"📊 Статистика канала:\n{source_channel_info}{target_channel_info}\n\n{stat_text}\n\nВыберите действие:",
                     reply_markup=get_forwarding_inline_keyboard(channel_id, target_channel)
                 )
                 user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
@@ -923,71 +1144,6 @@ async def text_handler(client: Client, message: Message):
             await show_main_menu(client, message, "Пожалуйста, выберите действие из меню:")
             return
 
-    # --- FSM: Ввод URL для гиперссылки в приписке ---
-    if state == FSM_FORWARD_FOOTER_LINK:
-        print(f"[FSM][DEBUG] FSM_FORWARD_FOOTER_LINK | text='{text}'")
-        if text == "Назад":
-            await show_forwarding_settings(client, message, user_id)
-            user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
-            return
-        # Сохраняем новый URL
-        new_url = text.strip()
-        forwarding_config = user_states[user_id]["forward_settings"]
-        forwarding_config["footer_link"] = new_url
-        forwarding_config["footer_link_text"] = None
-        forwarding_config["footer_full_link"] = True
-        user_states[user_id]["forward_settings"] = forwarding_config
-        # Показываем меню управления гиперссылкой
-        text_msg = f"Текущая ссылка в приписке: {new_url}\n\nВся приписка является гиперссылкой.\n\nВыберите действие:"
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Изменить URL", callback_data="forward_footer_link_change")],
-            [InlineKeyboardButton("📝 Изменить текст ссылки", callback_data="forward_footer_link_text")],
-            [InlineKeyboardButton("🗑️ Удалить ссылку", callback_data="forward_footer_link_delete")],
-            [InlineKeyboardButton("◀️ Назад", callback_data="forward_back_to_settings")]
-        ])
-        sent = await message.reply(text_msg, reply_markup=keyboard)
-        if sent:
-            user_states[user_id]["last_msg_id"] = sent.id
-        user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
-        return
-
-    # --- FSM: Настройка текста гиперссылки в приписке ---
-    def insert_link_once(footer_text, link_text, url):
-        # Заменить только первое вхождение link_text на ссылку
-        return re.sub(re.escape(link_text), f'<a href="{url}">{link_text}</a>', footer_text, count=1)
-
-    if state == FSM_FORWARD_FOOTER_LINK_TEXT:
-        print(f"[FSM][DEBUG] FSM_FORWARD_FOOTER_LINK_TEXT | text='{text}'")
-        if text == "Назад":
-            await show_forwarding_settings(client, message, user_id)
-            user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
-            return
-        footer_text = user_states[user_id]["forward_settings"].get("footer_text", "")
-        # Проверяем, что указанный текст присутствует в приписке
-        if text not in footer_text:
-            sent = await message.reply(
-                f"⚠️ Текст «{text}» не найден в приписке.\n\n"
-                f"Приписка: {footer_text}\n\n"
-                f"Пожалуйста, введите текст, который присутствует в приписке."
-            )
-            if sent:
-                user_states[user_id]["last_msg_id"] = sent.id
-            return
-        # Сохраняем текст для гиперссылки
-        user_states[user_id]["forward_settings"]["footer_link_text"] = text
-        user_states[user_id]["forward_settings"]["footer_full_link"] = False
-        # Формируем превью того, как будет выглядеть приписка
-        footer_link = user_states[user_id]["forward_settings"].get("footer_link", "")
-        preview = insert_link_once(footer_text, text, footer_link)
-        sent = await message.reply(
-            f"✅ Гиперссылка настроена!\n\n"
-            f"Так будет выглядеть приписка:\n{preview}",
-        )
-        if sent:
-            user_states[user_id]["last_msg_id"] = sent.id
-        await show_forwarding_settings(client, message, user_id)
-        user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
-        return
 
     # Проверяем состояния сессий и реакций
     if state and state.startswith("session_"):
@@ -1002,19 +1158,16 @@ async def text_handler(client: Client, message: Message):
     # === TEXT EDITING HANDLERS ===
     elif state == "text_edit_menu":
         if text == "🆕 Запустить редактирование":
-            kb = await get_channel_history_keyboard(user_id)
-            sent = await message.reply(
-                "📺 **Выбор канала для редактирования**\n\n"
-                "Выберите канал из истории или введите ID/ссылку канала:",
-                reply_markup=kb or ReplyKeyboardRemove()
-            )
+            # Сначала показываем настройки
+            await show_text_edit_settings(client, message, user_id)
+            # Удаляем предыдущее сообщение если есть
             if last_msg_id:
                 try:
                     await client.delete_messages(message.chat.id, last_msg_id)
                 except Exception:
                     pass
-            if sent:
-                user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_CHANNEL, "last_msg_id": sent.id}
+        elif text == "⚙️ Настройки редактирования":
+            await show_text_edit_settings(client, message, user_id)
         elif text == "📊 Статус задач редактирования":
             await show_text_edit_tasks_status(client, message, user_id)
         elif text == "⏹️ Остановить задачу":
@@ -1038,13 +1191,41 @@ async def text_handler(client: Client, message: Message):
         user_states[user_id]['text_edit_channel_id'] = numeric_id
         user_states[user_id]['text_edit_channel_title'] = channel_info['title']
         user_states[user_id]['text_edit_channel_username'] = channel_info.get('username')
-        
+
+        # Получаем настройки для отображения
+        text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+        footer_text = text_edit_settings.get('footer_text', '')
+        max_posts = text_edit_settings.get('max_posts', 100)
+        require_hashtags = text_edit_settings.get('require_hashtags', False)
+        require_specific_text = text_edit_settings.get('require_specific_text', False)
+        specific_text = text_edit_settings.get('specific_text', '')
+        require_old_footer = text_edit_settings.get('require_old_footer', True)
+
+        # Проверяем заполненность настроек
+        settings_complete = bool(footer_text.strip())
+
+        # Показываем меню канала с inline кнопками
+        channel_menu_text = f"📺 **Канал выбран**: {channel_info['title']}\n\n"
+
+        if settings_complete:
+            channel_menu_text += f"📝 **Приписка:** {footer_text[:50]}{'...' if len(footer_text) > 50 else ''}\n"
+            channel_menu_text += f"📊 **Максимум постов:** {max_posts}\n"
+            channel_menu_text += f"🏷️ **Хэштеги:** {'Да' if require_hashtags else 'Нет'}\n"
+            channel_menu_text += f"🔤 **Текст:** {'Да' if require_specific_text else 'Нет'}"
+            if require_specific_text and specific_text:
+                channel_menu_text += f" ({specific_text[:20]}{'...' if len(specific_text) > 20 else ''})"
+            channel_menu_text += "\n"
+            channel_menu_text += f"📝 **Старая приписка:** {'Да' if require_old_footer else 'Нет'}\n\n"
+            channel_menu_text += "✅ Настройки готовы. Можно запускать редактирование."
+        else:
+            channel_menu_text += "⚠️ **Приписка не установлена**\n\n"
+            channel_menu_text += "Необходимо настроить приписку перед запуском редактирования."
+
+        channel_menu_text += "\n\nВыберите действие:"
+
         sent = await message.reply(
-            f"📺 **Канал выбран**: {channel_info['title']}\n\n"
-            "✏️ **Введите текст для гиперссылки**\n\n"
-            "Например: `подписывайтесь на приватку`\n"
-            "Этот текст будет добавлен к постам как кликабельная ссылка.",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("🔙 Назад")]], resize_keyboard=True)
+            channel_menu_text,
+            reply_markup=get_text_edit_inline_keyboard(channel_id=numeric_id)
         )
         if last_msg_id:
             try:
@@ -1052,7 +1233,7 @@ async def text_handler(client: Client, message: Message):
             except Exception:
                 pass
         if sent:
-            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_LINK_TEXT, "last_msg_id": sent.id}
+            user_states[user_id]['last_msg_id'] = sent.id
         return
     
     elif state == FSM_TEXT_EDIT_LINK_TEXT:
@@ -1072,7 +1253,10 @@ async def text_handler(client: Client, message: Message):
                 user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_CHANNEL, "last_msg_id": sent.id}
             return
             
-        user_states[user_id]['text_edit_link_text'] = text
+        # Инициализируем настройки если их нет
+        if 'text_edit_settings' not in user_states[user_id]:
+            user_states[user_id]['text_edit_settings'] = {}
+        user_states[user_id]['text_edit_settings']['link_text'] = text
         
         sent = await message.reply(
             f"✏️ **Текст ссылки**: `{text}`\n\n"
@@ -1113,7 +1297,10 @@ async def text_handler(client: Client, message: Message):
             await message.reply("❌ Неверный формат URL. Должен начинаться с http://, https:// или tg://")
             return
             
-        user_states[user_id]['text_edit_link_url'] = text
+        # Инициализируем настройки если их нет
+        if 'text_edit_settings' not in user_states[user_id]:
+            user_states[user_id]['text_edit_settings'] = {}
+        user_states[user_id]['text_edit_settings']['link_url'] = text
         
         sent = await message.reply(
             f"🔗 **URL ссылки**: `{text}`\n\n"
@@ -1161,12 +1348,17 @@ async def text_handler(client: Client, message: Message):
             await message.reply("❌ Введите корректное число")
             return
             
-        user_states[user_id]['text_edit_limit'] = limit
+        # Инициализируем настройки если их нет
+        if 'text_edit_settings' not in user_states[user_id]:
+            user_states[user_id]['text_edit_settings'] = {}
+        user_states[user_id]['text_edit_settings']['max_posts'] = limit
         
         # Показываем подтверждение
         channel_title = user_states[user_id].get('text_edit_channel_title', 'Неизвестно')
-        link_text = user_states[user_id].get('text_edit_link_text', 'Неизвестно')
-        link_url = user_states[user_id].get('text_edit_link_url', 'Неизвестно')
+        # Получаем настройки из text_edit_settings
+        text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+        link_text = text_edit_settings.get('link_text', 'Неизвестно')
+        link_url = text_edit_settings.get('link_url', 'Неизвестно')
         
         sent = await message.reply(
             f"📋 **Подтверждение редактирования**\n\n"
@@ -1189,7 +1381,37 @@ async def text_handler(client: Client, message: Message):
         if sent:
             user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_CONFIRM, "last_msg_id": sent.id}
         return
-    
+
+    elif state == FSM_TEXT_EDIT_SETTINGS:
+        # Этот обработчик теперь не нужен, так как настройки работают через callback'и
+        return
+
+    elif state == FSM_TEXT_EDIT_FOOTER_EDIT:
+        # Сохраняем введенный footer текст
+        # Инициализируем настройки если их нет
+        if 'text_edit_settings' not in user_states[user_id]:
+            user_states[user_id]['text_edit_settings'] = {}
+
+        # Сохраняем footer текст
+        user_states[user_id]['text_edit_settings']['footer_text'] = text
+
+        # Возвращаемся к настройкам
+        await show_text_edit_settings(client, message, user_id)
+        return
+
+    elif state == FSM_TEXT_EDIT_SPECIFIC_TEXT:
+        # Сохраняем введенный текст для поиска
+        if 'text_edit_settings' not in user_states[user_id]:
+            user_states[user_id]['text_edit_settings'] = {}
+
+        # Сохраняем текст и включаем требование
+        user_states[user_id]['text_edit_settings']['specific_text'] = text
+        user_states[user_id]['text_edit_settings']['require_specific_text'] = True
+
+        # Возвращаемся к настройкам
+        await show_text_edit_settings(client, message, user_id)
+        return
+
     elif state == FSM_TEXT_EDIT_CONFIRM:
         if text == "✅ Запустить":
             await start_text_editing_task(client, message, user_id)
@@ -1300,28 +1522,40 @@ async def show_forwarding_settings(client, message, user_id: int):
     )
     if sent is not None:
         user_states[user_id]['last_msg_id'] = sent.id
+    user_states[user_id]['state'] = FSM_FORWARD_SETTINGS
 
 async def show_forwarding_menu(client, message, user_id: int):
     """Показать главное меню пересылки"""
-    channel_id = user_states[user_id].get('forward_channel_id')
-    target_channel = user_states[user_id].get('forward_target_channel')
-    
-    # Получаем информацию о каналах
-    channel_info = await get_channel_info(str(channel_id))
-    if target_channel:
-        target_info = await get_target_channel_info(target_channel)
-        target_display = target_info.get('channel_title', str(target_channel))
+    user_state = user_states.get(user_id, {})
+    source_channel_title = user_state.get('forward_channel_title', 'Не выбран')
+    target_channels = user_state.get('forward_target_channels', [])
+    channel_id = user_state.get('forward_channel_id')
+
+    menu_text = f"📥 Из: {html.escape(source_channel_title)}\n\n"
+
+    if not target_channels:
+        menu_text += "❌ Не выбрано ни одного целевого канала"
     else:
-        target_display = 'Не выбран'
-    channel_display = channel_info.get('channel_title', f"Канал {channel_id}")
-    menu_text = f"📺 Канал: {channel_display}\n"
-    menu_text += f"🎯 Целевой канал: {target_display}\n\n"
-    sent = await message.reply(
+        menu_text += "📤 В:"
+        for i, ch in enumerate(target_channels, 1):
+            title = ch.get('title', ch['id'])
+            username = ch.get('username', '')
+            if username:
+                title += f" (@{username})"
+            menu_text += f"\n{i}. {html.escape(title)}"
+
+    menu_text += "\n\nВыберите действие:"
+
+    # Вместо reply редактируем сообщение
+    await safe_edit_message(
+        client,
+        message.chat.id,
+        message.id,
         menu_text,
-        reply_markup=get_forwarding_inline_keyboard(channel_id, target_channel)
+        reply_markup=get_forwarding_inline_keyboard(channel_id, None)
     )
-    if sent is not None:
-        user_states[user_id]['last_msg_id'] = sent.id
+
+    user_states[user_id]['state'] = FSM_FORWARD_MENU
 
 # --- Обработчик callback запросов ---
 async def forwarding_callback_handler(client, callback_query):
@@ -1340,115 +1574,68 @@ async def forwarding_callback_handler(client, callback_query):
     if not forwarding_config and "forward_settings" in user_states[user_id]:
         forwarding_config = user_states[user_id]["forward_settings"]
 
-    # --- Обработка действий для гиперссылки в приписке ---
-    if action == "footer_link":
-        # Проверяем, есть ли уже приписка (footer_text)
-        footer_text = forwarding_config.get("footer_text", "")
-        # Проверяем, есть ли гиперссылка в приписке (HTML <a href=...>)
-        import re
-        link_match = re.search(r'<a href=["\\\']([^"\\\']+)["\\\']>(.*?)</a>', footer_text)
-        footer_link = forwarding_config.get("footer_link")
-        if not footer_link and link_match:
-            forwarding_config["footer_link"] = link_match.group(1)
-            forwarding_config["footer_link_text"] = link_match.group(2)
-            # Проверяем: вся ли приписка — гиперссылка
-            # Удаляем HTML-теги и пробелы для сравнения
-            import html
-            text_inside_link = html.unescape(link_match.group(2)).strip()
-            text_no_link = re.sub(r'<a href=["\\\']([^"\\\']+)["\\\']>(.*?)</a>', text_inside_link, footer_text).strip()
-            # Если вся приписка — только ссылка (без эмодзи и пробелов)
-            if footer_text.strip() == link_match.group(0).strip():
-                forwarding_config["footer_full_link"] = True
-            else:
-                forwarding_config["footer_full_link"] = False
-            user_states[user_id]["forward_settings"] = forwarding_config
-            footer_link = link_match.group(1)
-        if footer_link:
-            text = f"Текущая ссылка в приписке: {footer_link}\n\n"
-            if forwarding_config.get("footer_full_link", False):
-                text += "Вся приписка является гиперссылкой.\n\n"
-            elif forwarding_config.get("footer_link_text"):
-                text += f"Текст ссылки: {forwarding_config.get('footer_link_text')}\n\n"
-            text += "Выберите действие:"
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Изменить URL", callback_data="forward_footer_link_change")],
-                [InlineKeyboardButton("📝 Изменить текст ссылки", callback_data="forward_footer_link_text")],
-                [InlineKeyboardButton("✅ Вся приписка ссылкой", callback_data="forward_footer_link_full")],
-                [InlineKeyboardButton("🗑️ Удалить ссылку", callback_data="forward_footer_link_delete")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="forward_back_to_settings")]
-            ])
-        else:
-            text = "В приписке нет гиперссылки. Введите URL для добавления гиперссылки:"
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Отмена", callback_data="forward_back_to_settings")]
-            ])
-            user_states[user_id]["state"] = FSM_FORWARD_FOOTER_LINK
-            await callback_query.edit_message_text(text, reply_markup=keyboard)
-            await callback_query.answer()
-            return
-        await callback_query.edit_message_text(text, reply_markup=keyboard)
-        await callback_query.answer()
-        return
-    
-    elif action == "footer_link_change":
-        # Показываем форму для ввода нового URL, не дублируем текст и не показываем меню
-        text = "Введите новый URL для гиперссылки:"
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("◀️ Отмена", callback_data="forward_back_to_settings")]
-        ])
-        await callback_query.edit_message_text(text, reply_markup=keyboard)
-        user_states[user_id]["state"] = FSM_FORWARD_FOOTER_LINK
-        await callback_query.answer()
-        return
-    elif action == "footer_link_text":
-        footer_text = forwarding_config.get("footer_text", "")
-        text = f"Текущая приписка: {footer_text}\n\nВведите часть текста приписки, которую нужно сделать гиперссылкой:"
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Вся приписка как ссылка", callback_data="forward_footer_link_full")],
-            [InlineKeyboardButton("◀️ Отмена", callback_data="forward_back_to_settings")]
-        ])
-        await callback_query.edit_message_text(text, reply_markup=keyboard)
-        user_states[user_id]["state"] = FSM_FORWARD_FOOTER_LINK_TEXT
-        await callback_query.answer()
-        return
-    
-    elif action == "footer_link_full":
-        # Делаем всю приписку гиперссылкой
-        forwarding_config["footer_full_link"] = True
-        
-        # Если был текст ссылки, удаляем его (теперь вся приписка - ссылка)
-        if "footer_link_text" in forwarding_config:
-            del forwarding_config["footer_link_text"]
-            
-        # Обновляем настройки
-        user_states[user_id]["forward_settings"] = forwarding_config
-        
-        await callback_query.answer("✅ Вся приписка будет гиперссылкой!")
-        await show_forwarding_settings(client, callback_query.message, user_id)
-        user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
-        return
-    
-    elif action == "footer_link_delete":
-        # Удаляем настройки гиперссылки
-        if "footer_link" in forwarding_config:
-            del forwarding_config["footer_link"]
-        if "footer_link_text" in forwarding_config:
-            del forwarding_config["footer_link_text"]
-        if "footer_full_link" in forwarding_config:
-            del forwarding_config["footer_full_link"]
-            
-        # Обновляем настройки
-        user_states[user_id]["forward_settings"] = forwarding_config
-        
-        await callback_query.answer("✅ Гиперссылка удалена!")
-        await show_forwarding_settings(client, callback_query.message, user_id)
-        user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
-        return
         
     elif action == "back_to_settings":
         # Возвращаемся к настройкам пересылки
         await show_forwarding_settings(client, callback_query.message, user_id)
         await callback_query.answer()
+        return
+    
+    # === ОБРАБОТКА WATERMARK CALLBACK ===
+    if data.startswith('watermark') or data.startswith('wm_'):
+        from bot.watermark_handlers import (
+            handle_watermark_settings, handle_wm_toggle, handle_wm_type,
+            handle_wm_type_text, handle_wm_type_image, handle_wm_mode,
+            handle_wm_mode_all, handle_wm_mode_random, handle_wm_mode_hashtag,
+            handle_wm_mode_manual, handle_wm_position, handle_wm_position_set,
+            handle_wm_opacity, handle_wm_scale, handle_wm_save, handle_wm_menu
+        )
+
+        if data == 'watermark_settings':
+            await handle_watermark_settings(client, callback_query)
+        elif data == 'watermark_channel_select':
+            # Показать список каналов для выбора watermark
+            await show_watermark_channel_selection(client, callback_query.message, user_id)
+            await callback_query.answer()
+            return
+        elif data.startswith('watermark_channel_'):
+            # Обработка выбора канала для watermark
+            channel_id = data.replace('watermark_channel_', '')
+            user_states[user_id]['current_watermark_channel_id'] = channel_id
+            # Автоматически применяем настройки канала
+            await watermark_manager.apply_channel_watermark(user_id, channel_id)
+            await handle_watermark_settings(client, callback_query)
+        elif data == 'wm_toggle':
+            await handle_wm_toggle(client, callback_query)
+        elif data == 'wm_type':
+            await handle_wm_type(client, callback_query)
+        elif data == 'wm_type_text':
+            await handle_wm_type_text(client, callback_query)
+        elif data == 'wm_type_image':
+            await handle_wm_type_image(client, callback_query)
+        elif data == 'wm_mode':
+            await handle_wm_mode(client, callback_query)
+        elif data == 'wm_mode_all':
+            await handle_wm_mode_all(client, callback_query)
+        elif data == 'wm_mode_random':
+            await handle_wm_mode_random(client, callback_query)
+        elif data == 'wm_mode_hashtag':
+            await handle_wm_mode_hashtag(client, callback_query)
+        elif data == 'wm_mode_manual':
+            await handle_wm_mode_manual(client, callback_query)
+        elif data == 'wm_position':
+            await handle_wm_position(client, callback_query)
+        elif data.startswith('wm_pos_'):
+            position = data.replace('wm_pos_', '')
+            await handle_wm_position_set(client, callback_query, position)
+        elif data == 'wm_opacity':
+            await handle_wm_opacity(client, callback_query)
+        elif data == 'wm_scale':
+            await handle_wm_scale(client, callback_query)
+        elif data == 'wm_save':
+            await handle_wm_save(client, callback_query)
+        elif data == 'wm_menu':
+            await handle_wm_menu(client, callback_query)
         return
 
     if data == 'start_monitoring':
@@ -1527,7 +1714,7 @@ async def forwarding_callback_handler(client, callback_query):
             'mode': publish_settings.get('mode', 'все'),
             'footer': publish_settings.get('footer', ''),
             'max_posts': publish_settings.get('max_posts', 0),
-            'parse_mode': publish_settings.get('parse_mode', 'html'),
+            'parse_mode': publish_settings.get('parse_mode', 'HTML'),
             'disable_web_page_preview': publish_settings.get('disable_web_page_preview', False),
             'disable_notification': publish_settings.get('disable_notification', False),
             'protect_content': publish_settings.get('protect_content', False),
@@ -1636,10 +1823,6 @@ async def forwarding_callback_handler(client, callback_query):
         await callback_query.answer()
         return
     
-    # --- Обработчики очистки истории пересылки ---
-    if data in ["clear_all_history", "clear_channel_history", "clear_target_history", "back_to_settings"]:
-        await handle_clear_history_callback(client, callback_query, user_id)
-        return
     
     # --- Обработчики настроек пересылки ---
     if data == "forward_parse_mode":
@@ -1694,16 +1877,161 @@ async def forwarding_callback_handler(client, callback_query):
         return
     
     if data == "forward_footer":
-        # Запрашиваем ввод приписки
+        # Показываем меню настройки приписки
         current_footer = user_states[user_id]['forward_settings'].get('footer_text', '')
+        footer_preview = current_footer if current_footer else "Приписка не установлена"
+
+        # Создаем клавиатуру с опциями
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Изменить текст", callback_data="forward_footer_edit")],
+            [InlineKeyboardButton("📋 Шаблоны", callback_data="forward_footer_templates")],
+            [InlineKeyboardButton("🔗 Редактировать ссылки", callback_data="forward_footer_links")],
+            [InlineKeyboardButton("🗑️ Удалить", callback_data="forward_footer_delete")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_settings")]
+        ])
+
+        text = f"📝 Настройка приписки к сообщениям\n\n"
+        text += f"Текущая приписка:\n{footer_preview}\n\n"
+        text += f"Приписка добавляется к каждому пересылаемому сообщению.\n\n"
+        text += f"🔗 Для создания кликабельных ссылок используйте HTML:\n"
+        text += f"<code>&lt;a href=\"ВАША_ССЫЛКА\"&gt;ТЕКСТ&lt;/a&gt;</code>\n\n"
+        text += f"Примеры ссылок:\n"
+        text += f"• <code>https://t.me/channel</code> - публичный канал\n"
+        text += f"• <code>https://t.me/+invite</code> - приватный канал\n"
+        text += f"• <code>https://donate.url</code> - донат"
+
         await safe_edit_callback_message(
             callback_query,
-            f"Текущая приписка: {current_footer or 'Нет'}\n\nВведите новую приписку (или 'убрать' для удаления):",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_settings")]])
+            text,
+            reply_markup=keyboard
+        )
+        return
+
+    elif data == "forward_footer_links":
+        # Помогаем редактировать ссылки в существующей приписке
+        current_footer = user_states[user_id]['forward_settings'].get('footer_text', '')
+
+        if not current_footer:
+            await callback_query.answer("❌ Приписка не установлена! Сначала создайте приписку.", show_alert=True)
+            return
+
+        import re
+        # Ищем все ссылки в приписке
+        links = re.findall(r'<a href=["\']([^"\']+)["\'][^>]*>([^<]*)</a>', current_footer)
+
+        if not links:
+            text = f"🔗 В приписке нет ссылок для редактирования\n\n"
+            text += f"Текущая приписка: {current_footer}\n\n"
+            text += f"Используйте 'Изменить текст' чтобы добавить ссылки."
+        else:
+            text = f"🔗 Найденные ссылки в приписке:\n\n"
+            for i, (url, link_text) in enumerate(links, 1):
+                text += f"{i}. {link_text}\n   {url}\n\n"
+
+            text += f"Чтобы изменить ссылки, используйте 'Изменить текст'\n"
+            text += f"и замените YOUR_CHANNEL на свои значения."
+
+        await safe_edit_callback_message(
+            callback_query,
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="forward_footer")]])
+        )
+        return
+
+    elif data == "forward_footer_edit":
+        # Запрашиваем ввод новой приписки
+        current_footer = user_states[user_id]['forward_settings'].get('footer_text', '')
+        examples = [
+            '<a href="https://t.me/channel">Подписаться на канал</a>',
+            '<a href="https://t.me/+invite_link">Приватный канал</a>',
+            '<a href="https://donate.url">Поддержать автора</a>'
+        ]
+
+        text = f"✏️ Введите новую приписку\n\n"
+        text += f"Текущая: {current_footer or 'Нет'}\n\n"
+        text += f"🔗 Гиперссылки создаются с помощью HTML-тегов:\n\n"
+        text += f"Формат: <code>&lt;a href=\"ВАША_ССЫЛКА\"&gt;ТЕКСТ&lt;/a&gt;</code>\n\n"
+        text += f"Примеры:\n"
+        text += f"• Публичный канал:\n"
+        text += f"  <code>&lt;a href=\"https://t.me/channel\"&gt;Подписаться&lt;/a&gt;</code>\n\n"
+        text += f"• Приватный канал:\n"
+        text += f"  <code>&lt;a href=\"https://t.me/+invite_link\"&gt;Приватный канал&lt;/a&gt;</code>\n\n"
+        text += f"• Донат:\n"
+        text += f"  <code>&lt;a href=\"https://donate.url\"&gt;Поддержать&lt;/a&gt;</code>\n\n"
+        text += f"💡 Замените YOUR_CHANNEL на свой username канала\n\n"
+        text += f"Или введите 'убрать' для удаления приписки:"
+
+        await safe_edit_callback_message(
+            callback_query,
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="forward_footer")]])
         )
         user_states[user_id]['forward_state'] = 'footer_input'
         return
-    
+
+    elif data == "forward_footer_templates":
+        # Показываем готовые шаблоны
+        templates = [
+            ('📢 Подписаться на канал', '📢 <a href="https://t.me/YOUR_CHANNEL">Подпишись на новый канал</a> 📢'),
+            ('🔒 Приватный канал', '🔒 <a href="https://t.me/+YOUR_PRIVATE_LINK">Приватный канал / Подписаться</a>'),
+            ('💰 Донат', '💰 <a href="https://donate.url">Поддержать автора</a>'),
+        ]
+
+        keyboard_buttons = []
+        for i, (name, template) in enumerate(templates):
+            keyboard_buttons.append([InlineKeyboardButton(f"{name}", callback_data=f"forward_footer_template_{i}")])
+
+        keyboard_buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="forward_footer")])
+
+        text = f"📋 Готовые шаблоны приписок\n\n"
+        text += f"Выберите шаблон и замените:\n"
+        text += f"• YOUR_CHANNEL на username вашего канала\n"
+        text += f"• YOUR_PRIVATE_LINK на invite-ссылку приватного канала\n"
+        text += f"• donate.url на вашу ссылку для донатов\n\n"
+
+        for i, (name, template) in enumerate(templates):
+            text += f"{i+1}. {name}\n   {template}\n\n"
+
+        await safe_edit_callback_message(
+            callback_query,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard_buttons)
+        )
+        # Сохраняем шаблоны в состоянии для использования в обработчиках
+        user_states[user_id]['footer_templates'] = templates
+        return
+
+    elif data == "forward_footer_delete":
+        # Удаляем приписку
+        if 'footer_text' in user_states[user_id]['forward_settings']:
+            del user_states[user_id]['forward_settings']['footer_text']
+
+        await callback_query.answer("✅ Приписка удалена!")
+        await show_forwarding_settings(client, callback_query.message, user_id)
+        return
+
+    elif data.startswith("forward_footer_template_"):
+        # Применяем выбранный шаблон
+        template_index = int(data.replace("forward_footer_template_", ""))
+
+        # Определяем шаблоны заново (чтобы не хранить в состоянии)
+        templates = [
+            ('📢 Подписаться на канал', '📢 <a href="https://t.me/YOUR_CHANNEL">Подпишись на новый канал</a> 📢'),
+            ('🔒 Приватный канал', '🔒 <a href="https://t.me/+YOUR_PRIVATE_LINK">Приватный канал / Подписаться</a>'),
+            ('💰 Донат', '💰 <a href="https://donate.url">Поддержать автора</a>'),
+        ]
+
+        if 0 <= template_index < len(templates):
+            template_name, template_text = templates[template_index]
+            user_states[user_id]['forward_settings']['footer_text'] = template_text
+
+            # Показываем сообщение с инструкцией по редактированию
+            await callback_query.answer(f"✅ Шаблон '{template_name}' применен! Отредактируйте ссылки в настройках.", show_alert=True)
+            await show_forwarding_settings(client, callback_query.message, user_id)
+        else:
+            await callback_query.answer("❌ Шаблон не найден!", show_alert=True)
+        return
+
     if data == "forward_text_mode":
         # Показываем меню выбора режима текста
         kb = InlineKeyboardMarkup([
@@ -1879,12 +2207,27 @@ async def forwarding_callback_handler(client, callback_query):
         elif state == FSM_FORWARD_MONITORING or state == FSM_FORWARD_RUNNING:
             # После запуска пересылки/мониторинга — возвращаем к статистике
             stats = await api_client.get_channel_stats(str(user_states[user_id]['forward_channel_id']))
+
+            # Получаем реальный последний ID сообщения
+            real_last_message_id = await api_client.get_channel_last_message_id(str(user_states[user_id]['forward_channel_id']))
+            if real_last_message_id is not None:
+                stats = stats.copy()  # Создаем копию чтобы не изменять оригинал
+                stats['last_message_id'] = real_last_message_id
+
             stat_text = format_channel_stats(stats)
             channel_id = user_states[user_id]['forward_channel_id']
             target_channel = user_states[user_id].get('forward_target_channel')
+
+            # Формируем текст с информацией о каналах
+            source_channel_info = f"📥 Из: {user_states[user_id]['forward_channel_title']}"
+            target_channel_info = ""
+            if target_channel:
+                target_title = user_states[user_id].get('forward_target_title', target_channel)
+                target_channel_info = f"\n📤 В: {target_title}"
+
             await safe_edit_callback_message(
                 callback_query,
-                f"📊 Статистика канала {user_states[user_id]['forward_channel_title']}:\n\n{stat_text}\n\nВыберите действие:",
+                f"📊 Статистика канала:\n{source_channel_info}{target_channel_info}\n\n{stat_text}\n\nВыберите действие:",
                 reply_markup=get_forwarding_inline_keyboard(channel_id, target_channel)
             )
             user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
@@ -2328,22 +2671,18 @@ async def forwarding_callback_handler(client, callback_query):
         # Запускаем парсинг и пересылку в фоновом режиме
         try:
             result = await start_forwarding_parsing_api(user_id)
-            if result.get("success"):
-                task_id = result.get("task_id", "")
-                message_text = result.get("message", "✅ Парсинг и пересылка запущены в фоновом режиме!")
-                if task_id:
-                    message_text += f"\n\n🆔 ID задачи: {task_id[:20]}..."
-                    await safe_edit_callback_message(callback_query, message_text, reply_markup=get_stop_last_task_inline_keyboard(task_id))
-                else:
-                    await safe_edit_callback_message(callback_query, message_text)
+            if result:  # result является bool из core.py
+                message_text = "✅ Парсинг и пересылка запущены!"
+                await safe_edit_callback_message(callback_query, message_text)
+                # Сбрасываем состояние пользователя в главное меню
+                user_states[user_id]["state"] = FSM_MAIN_MENU
                 try:
                     await callback_query.answer("✅ Задача запущена!")
                 except Exception:
                     pass
             else:
-                error_msg = result.get("error", "Неизвестная ошибка")
                 try:
-                    await callback_query.answer(f"❌ Ошибка: {error_msg}", show_alert=True)
+                    await callback_query.answer("❌ Ошибка запуска парсинга", show_alert=True)
                 except Exception:
                     pass
         except Exception as e:
@@ -2425,8 +2764,48 @@ async def forwarding_callback_handler(client, callback_query):
         if text == "Назад":
             await show_forwarding_settings(client, message, user_id)
             return
+
+        # Обработка специальных команд
+        if text.lower() == "убрать":
+            if 'footer_text' in user_states[user_id]['forward_settings']:
+                del user_states[user_id]['forward_settings']['footer_text']
+            await message.reply("✅ Приписка удалена!")
+            await show_forwarding_settings(client, message, user_id)
+            return
+
+        # Валидация HTML (простая проверка)
+        import re
+        html_tags = re.findall(r'<[^>]+>', text)
+        if html_tags:
+            # Проверяем, что все теги закрыты правильно
+            open_tags = []
+            for tag in html_tags:
+                if tag.startswith('</'):
+                    # Закрывающий тег
+                    tag_name = tag[2:-1].split()[0]  # убираем </ и >, берем имя тега
+                    if open_tags and open_tags[-1] == tag_name:
+                        open_tags.pop()
+                    else:
+                        await message.reply("❌ Ошибка в HTML: несоответствие открывающих и закрывающих тегов!")
+                        return
+                elif not tag.endswith('/>') and not tag.startswith('<!'):
+                    # Открывающий тег
+                    tag_name = tag[1:].split()[0].split('>')[0]  # убираем <, берем имя тега
+                    if tag_name not in ['br', 'img']:  # Самозакрывающиеся теги
+                        open_tags.append(tag_name)
+
+            if open_tags:
+                await message.reply(f"❌ Ошибка в HTML: незакрытые теги: {', '.join(open_tags)}")
+                return
+
+        # Сохраняем приписку
         user_states[user_id]["forward_settings"]["footer_text"] = text
-        await message.reply(f"✅ Приписка сохранена: '{text}'")
+
+        # Показываем превью
+        preview_text = f"📝 Приписка сохранена!\n\nКак будет выглядеть:\n{text}\n\n"
+        preview_text += "Примечание: HTML-ссылки будут кликабельными в Telegram."
+
+        await message.reply(preview_text)
         await show_forwarding_settings(client, message, user_id)
         return
 
@@ -2435,15 +2814,133 @@ async def forwarding_callback_handler(client, callback_query):
     if data == "forward_back_to_stats":
         # Возвращаемся к статистике канала
         stats = await api_client.get_channel_stats(str(user_states[user_id]['forward_channel_id']))
+
+        # Получаем реальный последний ID сообщения
+        real_last_message_id = await api_client.get_channel_last_message_id(str(user_states[user_id]['forward_channel_id']))
+        if real_last_message_id is not None:
+            stats = stats.copy()  # Создаем копию чтобы не изменять оригинал
+            stats['last_message_id'] = real_last_message_id
+
         stat_text = format_channel_stats(stats)
         channel_id = user_states[user_id]['forward_channel_id']
         target_channel = user_states[user_id].get('forward_target_channel')
+
+        # Формируем текст с информацией о каналах
+        source_channel_info = f"📥 Из: {user_states[user_id]['forward_channel_title']}"
+        target_channel_info = ""
+        if target_channel:
+            target_title = user_states[user_id].get('forward_target_title', target_channel)
+            target_channel_info = f"\n📤 В: {target_title}"
+
         await safe_edit_callback_message(
             callback_query,
-            f"📊 Статистика канала {user_states[user_id]['forward_channel_title']}:\n\n{stat_text}\n\nВыберите действие:",
+            f"📊 Статистика канала:\n{source_channel_info}{target_channel_info}\n\n{stat_text}\n\nВыберите действие:",
             reply_markup=get_forwarding_inline_keyboard(channel_id, target_channel)
         )
         user_states[user_id]["state"] = FSM_FORWARD_SETTINGS
+        return
+
+    if data == "forward_reactions":
+        # Показываем меню настройки реакций
+        settings = user_states[user_id].get('forward_settings', {})
+        reactions_enabled = settings.get('reactions_enabled', False)
+        emojis = settings.get('reaction_emojis', [])
+
+        text = "🎭 Настройка автоматических реакций\n\n"
+        if reactions_enabled:
+            text += f"Статус: Включено\n"
+            text += f"Эмодзи: {' '.join(emojis) if emojis else 'Не заданы'}"
+        else:
+            text += "Статус: Отключено"
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Включить" if not reactions_enabled else "❌ Отключить", callback_data="forward_reactions_toggle")],
+            [InlineKeyboardButton("😀 Изменить эмодзи", callback_data="forward_reactions_emojis")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_settings")]
+        ])
+        await safe_edit_callback_message(
+            callback_query,
+            text,
+            reply_markup=kb
+        )
+        return
+
+    if data == "forward_reactions_toggle":
+        settings = user_states[user_id].get('forward_settings', {})
+        settings['reactions_enabled'] = not settings.get('reactions_enabled', False)
+        if settings['reactions_enabled'] and not settings.get('reaction_emojis'):
+            settings['reaction_emojis'] = ['❤️', '😘', '😍']
+        await callback_query.answer(f"Реакции {'включены' if settings['reactions_enabled'] else 'отключены'}!")
+        
+        # Re-show reactions menu
+        settings = user_states[user_id].get('forward_settings', {})
+        reactions_enabled = settings.get('reactions_enabled', False)
+        emojis = settings.get('reaction_emojis', [])
+
+        text = "🎭 Настройка автоматических реакций\n\n"
+        if reactions_enabled:
+            text += f"Статус: Включено\n"
+            text += f"Эмодзи: {' '.join(emojis) if emojis else 'Не заданы'}"
+        else:
+            text += "Статус: Отключено"
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Включить" if not reactions_enabled else "❌ Отключить", callback_data="forward_reactions_toggle")],
+            [InlineKeyboardButton("😀 Изменить эмодзи", callback_data="forward_reactions_emojis")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="forward_back_to_settings")]
+        ])
+        await safe_edit_callback_message(
+            callback_query,
+            text,
+            reply_markup=kb
+        )
+        return
+
+    if data == "forward_reactions_emojis":
+        await safe_edit_callback_message(
+            callback_query,
+            "Введите один или несколько эмодзи через пробел:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="forward_reactions")]])
+        )
+        user_states[user_id]['forward_state'] = 'reactions_emojis_input'
+        return
+
+    # --- Обработка управления выбранными каналами ---
+    if data == "add_target_channel":
+        await callback_query.message.delete()
+        kb = await get_target_channel_history_keyboard(user_id)
+        sent = await client.send_message(
+            chat_id=user_id,
+            text="Выберите канал для добавления в список пересылки или введите новый:",
+            reply_markup=kb or ReplyKeyboardRemove()
+        )
+        if sent:
+            user_states[user_id]['last_msg_id'] = sent.id
+        user_states[user_id]["state"] = FSM_FORWARD_TARGET
+        await callback_query.answer()
+        return
+
+    if data == "forward_to_settings":
+        # Переходим к меню пересылки с кнопками мониторинга, парсинга и т.д.
+        await show_forwarding_menu(client, callback_query.message, user_id)
+        await callback_query.answer()
+        return
+
+    if data.startswith("remove_target_channel:"):
+        # Удаляем канал из списка
+        try:
+            index = int(data.split(":")[1])
+            target_channels = user_states[user_id].get('forward_target_channels', [])
+            if 0 <= index < len(target_channels):
+                removed_channel = target_channels.pop(index)
+                await callback_query.answer(f"Канал '{removed_channel['title']}' удален")
+            else:
+                await callback_query.answer("Ошибка: индекс канала вне диапазона")
+        except Exception as e:
+            await callback_query.answer(f"Ошибка удаления канала: {e}")
+
+        # Показываем обновленный список
+        await show_target_channels_management(client, callback_query.message, user_id)
         return
 
 async def start_forwarding(user_id: int, channel_id: int, target_channel: int) -> bool:
@@ -2535,11 +3032,83 @@ def extract_numeric_id(channel_id_str):
         
     return None
 
+# --- Функция для нормализации входных данных канала ---
+def normalize_channel_input(text: str) -> str:
+    """Нормализует входные данные пользователя для канала
+
+    Поддерживает форматы:
+    - t.me/username -> username
+    - @username -> username
+    - username -> username
+    - -100xxxxxxxxx -> -100xxxxxxxxx
+    - xxxxxxxxxx -> xxxxxxxxxx (если число)
+    - Название (ID: -100xxxxxxxxx, @username) -> username или ID
+    """
+    text = text.strip()
+
+    # Удаляем https:// если есть
+    if text.startswith('https://'):
+        text = text[8:]
+    elif text.startswith('http://'):
+        text = text[7:]
+
+    # Обрабатываем t.me/username
+    if text.startswith('t.me/'):
+        username = text[5:]  # убираем 't.me/'
+        # Удаляем query параметры если есть
+        if '?' in username:
+            username = username.split('?')[0]
+        return username
+
+    # Обрабатываем @username
+    if text.startswith('@'):
+        return text[1:]  # убираем '@'
+
+    # Обрабатываем формат "Название (ID: -100xxxxxxxxx, @username)"
+    import re
+    channel_pattern = re.search(r'\(ID:\s*(-?\d+),\s*@([^)]+)\)', text)
+    if channel_pattern:
+        channel_id = channel_pattern.group(1)
+        username = channel_pattern.group(2)
+        # Предпочитаем использовать username, так как он более читаемый
+        if username:
+            return username
+        # Если username пустой, используем ID
+        return channel_id
+
+    # Если это число или начинается с -100, возвращаем как есть
+    if text.isdigit() or (text.startswith('-') and text[1:].isdigit()):
+        return text
+
+    # Иначе считаем что это username
+    return text
+
 # --- Функция для нормализации канала ---
 async def resolve_channel(api_client, text):
-    stats = await api_client.get_channel_stats(text)
-    if stats and stats.get("id") and not stats.get("error"):
-        return stats
+    # Сначала нормализуем входные данные
+    normalized_text = normalize_channel_input(text)
+    print(f"[DEBUG] resolve_channel: input='{text}' -> normalized='{normalized_text}'")
+
+    stats = await api_client.get_channel_stats(normalized_text)
+    print(f"[DEBUG] resolve_channel: stats from api: {stats}")
+
+    # Проверяем, что получили валидный ответ
+    if stats and stats.get("id"):
+        channel_id = stats.get("id")
+        title = stats.get("title", "")
+        username = stats.get("username", "")
+
+        # Если канал найден, id будет числом (числовой ID Telegram)
+        # Если канал не найден, id будет строкой (username или то что ввел пользователь)
+        if isinstance(channel_id, int) or (isinstance(channel_id, str) and channel_id.startswith("-")):
+            print(f"[DEBUG] resolve_channel: канал найден: id={channel_id}, title='{title}', username='{username}'")
+            return stats
+        else:
+            # Канал не найден - id остался строковым username'ом
+            print(f"[DEBUG] resolve_channel: канал '{normalized_text}' не найден")
+            return None
+
+    print(f"[DEBUG] resolve_channel: нет валидного ответа от API")
     return None  # Возвращаем None если канал не найден или есть ошибка
 
 # --- Функция для нормализации группы ---
@@ -2601,15 +3170,15 @@ async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings,
     def safe(val):
         if val is None or val == "N/A":
             return "—"
-        return html.escape(str(val))
-    msg = "<b>📊 Статус задач и мониторингов:</b>\n\n"
+        return str(val)
+    msg = "*📊 Статус задач и мониторингов:*\n\n"
     if updated:
         now = datetime.now().strftime("%H:%M:%S")
-        msg += f"<i>🔄 Список обновлен: {now}</i>\n\n"
+        msg += f"_🔄 Список обновлен: {now}_\n\n"
     buttons = []
     # Мониторинги
     if monitorings:
-        msg += "<b>📡 Мониторинги:</b>\n"
+        msg += "*📡 Мониторинги:*\n"
         for idx, m in enumerate(monitorings, 1):
             cfg = m.get("config", {})
             channel_id = m.get("channel_id")
@@ -2623,19 +3192,19 @@ async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings,
             active = m.get("active", False)
             task_running = m.get("task_running", False)
             status = "🟢 Активен" if active and task_running else "🔴 Остановлен"
-            msg += f"{idx}. <b>Канал:</b> {safe(channel_info)}\n"
-            msg += f"   <b>Статус:</b> {status}\n"
-            msg += f"   <b>Цель:</b> {safe(target_info)}\n"
-            msg += f"   <b>Режим:</b> {safe(cfg.get('parse_mode'))}\n"
-            msg += f"   <b>Хэштег:</b> {safe(cfg.get('hashtag_filter'))}\n"
-            msg += f"   <b>Лимит:</b> {safe(cfg.get('max_posts'))}\n"
-            msg += f"   <b>Платные:</b> {safe(cfg.get('paid_content_stars'))}⭐\n\n"
+            msg += f"{idx}. *Канал:* {safe(channel_info)}\n"
+            msg += f"   *Статус:* {status}\n"
+            msg += f"   *Цель:* {safe(target_info)}\n"
+            msg += f"   *Режим:* {safe(cfg.get('parse_mode'))}\n"
+            msg += f"   *Хэштег:* {safe(cfg.get('hashtag_filter'))}\n"
+            msg += f"   *Лимит:* {safe(cfg.get('max_posts'))}\n"
+            msg += f"   *Платные:* {safe(cfg.get('paid_content_stars'))}⭐\n\n"
             # Кнопка остановки мониторинга если есть оба id (даже если нет в истории)
             if active and task_running and channel_id is not None and target_channel_id is not None:
                 buttons.append([InlineKeyboardButton(f"⏹️ Остановить мониторинг {idx}", callback_data=f"stop_monitoring:{channel_id}:{target_channel_id}")])
     # Задачи парсинг+пересылки
     if tasks:
-        msg += "<b>🚀 Задачи парсинг+пересылки:</b>\n"
+        msg += "*🚀 Задачи парсинг+пересылки:*\n"
         for idx, task in enumerate(tasks, 1):
             task_id = task.get("task_id")
             source_id = task.get("source_channel")
@@ -2652,22 +3221,22 @@ async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings,
                 "stopped": "⏹️",
                 "error": "❌"
             }.get(status, "❓")
-            msg += f"<b>{idx}. Задача {safe(task_id)[:15]}...</b>\n"
-            msg += f"   📤 <b>Источник:</b> {safe(source)}\n"
-            msg += f"   📥 <b>Цель:</b> {safe(target)}\n"
-            msg += f"   {status_emoji} <b>Статус:</b> {status}\n"
-            msg += f"   🕐 <b>Запущена:</b> {started_at}\n"
+            msg += f"*{idx}. Задача {safe(task_id)[:15]}...*\n"
+            msg += f"   📤 *Источник:* {safe(source)}\n"
+            msg += f"   📥 *Цель:* {safe(target)}\n"
+            msg += f"   {status_emoji} *Статус:* {status}\n"
+            msg += f"   🕐 *Запущена:* {started_at}\n"
             if completed_at and completed_at != "—":
-                msg += f"   ✅ <b>Завершена:</b> {completed_at}\n"
+                msg += f"   ✅ *Завершена:* {completed_at}\n"
             if error and error != "—":
-                msg += f"   ❌ <b>Ошибка:</b> {error[:50]}...\n"
+                msg += f"   ❌ *Ошибка:* {error[:50]}...\n"
             msg += "\n"
             if status == "running" and task_id:
                 buttons.append([InlineKeyboardButton(f"⏹️ Остановить задачу {idx}", callback_data=f"stop_task:{task_id}")])
     
     # Задачи реакций
     if reaction_tasks:
-        msg += "<b>💫 Задачи реакций:</b>\n"
+        msg += "*💫 Задачи реакций:*\n"
         for idx, task in enumerate(reaction_tasks, 1):
             task_id = task.get("task_id")
             chat_id = task.get("chat_id")
@@ -2684,26 +3253,27 @@ async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings,
                 "stopped": "⏹️",
                 "error": "❌"
             }.get(status, "❓")
-            msg += f"<b>{idx}. Задача реакций {safe(task_id)[:15]}...</b>\n"
-            msg += f"   📺 <b>Канал:</b> {safe(chat_id)}\n"
-            msg += f"   😊 <b>Эмодзи:</b> {', '.join(emojis) if emojis else '—'}\n"
-            msg += f"   🎯 <b>Режим:</b> {safe(mode)}\n"
+            msg += f"*{idx}. Задача реакций {safe(task_id)[:15]}...*\n"
+            msg += f"   📺 *Канал:* {safe(chat_id)}\n"
+            msg += f"   😊 *Эмодзи:* {', '.join(emojis) if emojis else '—'}\n"
+            msg += f"   🎯 *Режим:* {safe(mode)}\n"
             if count:
-                msg += f"   📊 <b>Количество:</b> {safe(count)}\n"
-            msg += f"   {status_emoji} <b>Статус:</b> {status}\n"
-            msg += f"   🕐 <b>Запущена:</b> {started_at}\n"
+                msg += f"   📊 *Количество:* {safe(count)}\n"
+            msg += f"   {status_emoji} *Статус:* {status}\n"
+            msg += f"   🕐 *Запущена:* {started_at}\n"
             if completed_at and completed_at != "—":
-                msg += f"   ✅ <b>Завершена:</b> {completed_at}\n"
+                msg += f"   ✅ *Завершена:* {completed_at}\n"
             if error and error != "—":
-                msg += f"   ❌ <b>Ошибка:</b> {error[:50]}...\n"
+                msg += f"   ❌ *Ошибка:* {error[:50]}...\n"
             msg += "\n"
             if status == "running" and task_id:
                 buttons.append([InlineKeyboardButton(f"⏹️ Остановить реакцию {idx}", callback_data=f"stop_reaction_task:{task_id}")])
     
     # Задачи публичных групп
     if public_groups_tasks:
-        msg += "<b>📢 Пересылка в публичные группы:</b>\n"
+        msg += "*📢 Пересылка в публичные группы:*\n"
         for idx, task in enumerate(public_groups_tasks, 1):
+            task_id = task.get("task_id")
             source = safe(task.get("source_channel"))
             target = safe(task.get("target_group"))
             status = task.get("status", "unknown")
@@ -2718,14 +3288,18 @@ async def build_tasks_monitorings_status_text_and_keyboard(user_id, monitorings,
                 "error": "❌"
             }.get(status, "❓")
             msg += (
-                f"{idx}. <b>Источник:</b> {source}\n"
-                f"   <b>Цель:</b> {target}\n"
-                f"   {status_emoji} <b>Статус:</b> {status}\n"
-                f"   📤 <b>Переслано:</b> {forwarded}\n"
-                f"   👁️ <b>Лимит просмотров:</b> {views_limit}\n"
-                f"   🔢 <b>Диапазон:</b> {posts_count}\n"
+                f"{idx}. *Источник:* {source}\n"
+                f"   *Цель:* {target}\n"
+                f"   {status_emoji} *Статус:* {status}\n"
+                f"   📤 *Переслано:* {forwarded}\n"
+                f"   👁️ *Лимит просмотров:* {views_limit}\n"
+                f"   🔢 *Диапазон:* {posts_count}\n"
                 "\n"
             )
+            
+            # Добавляем кнопку остановки для запущенных задач
+            if status == "running" and task_id:
+                buttons.append([InlineKeyboardButton(f"⏹️ Остановить публичную группу {idx}", callback_data=f"stop_public_task:{task_id}")])
     
     # Кнопка остановить все
     has_running_tasks = (
@@ -2781,24 +3355,16 @@ async def send_or_edit_status_message(message=None, callback_query=None, back_to
     msg, keyboard = await build_tasks_monitorings_status_text_and_keyboard(
         user_id, monitorings, tasks, reaction_tasks, public_groups_tasks, updated=updated, back_to=back_to)
     logger.info(f"[STATUS_UNIFIED] Итоговое сообщение: {msg}")
+    # Отправляем без parse_mode, так как Telegram может не поддерживать Markdown в некоторых случаях
     try:
         if callback_query:
-            await callback_query.edit_message_text(msg, reply_markup=keyboard, parse_mode="html")
+            await callback_query.edit_message_text(msg, reply_markup=keyboard)
         elif message:
-            await message.reply(msg, reply_markup=keyboard, parse_mode="html")
+            await message.reply(msg, reply_markup=keyboard)
     except MessageNotModified:
         logger.warning("[STATUS_UNIFIED] MESSAGE_NOT_MODIFIED: текст не изменился")
     except Exception as e:
-        logger.error(f"[STATUS_UNIFIED] Ошибка при отправке/редактировании с parse_mode=html: {e}")
-        try:
-            if callback_query:
-                await callback_query.edit_message_text(msg, reply_markup=keyboard)
-            elif message:
-                await message.reply(msg, reply_markup=keyboard)
-        except MessageNotModified:
-            logger.warning("[STATUS_UNIFIED] MESSAGE_NOT_MODIFIED: текст не изменился (fallback)")
-        except Exception as e2:
-            logger.error(f"[STATUS_UNIFIED] Ошибка при отправке/редактировании без parse_mode: {e2}")
+        logger.error(f"[STATUS_UNIFIED] Ошибка при отправке/редактировании: {e}")
 
 # Отдельная функция для статуса задач реакций
 async def send_or_edit_reaction_status_message(message=None, callback_query=None):
@@ -2848,6 +3414,25 @@ async def stop_reaction_task_callback(client: Client, callback_query):
     except Exception as e:
         logger.error(f"Ошибка при остановке задачи реакций: {e}")
         await callback_query.answer("❌ Ошибка при остановке задачи реакций")
+
+# Обработчик остановки задачи публичной группы
+async def stop_public_task_callback(client: Client, callback_query):
+    try:
+        data = callback_query.data
+        if data.startswith("stop_public_task:"):
+            task_id = data.split(":", 1)[1]
+            logger.info(f"[STOP_PUBLIC_TASK] Остановка задачи {task_id}")
+            result = await api_client.stop_public_groups_forwarding(task_id)
+            logger.info(f"[STOP_PUBLIC_TASK] Результат: {result}")
+            if result.get("status") == "success":
+                await callback_query.answer("✅ Задача публичной группы остановлена!")
+                await check_tasks_status_callback(client, callback_query)
+            else:
+                error_msg = result.get("message", "Неизвестная ошибка")
+                await callback_query.answer(f"❌ Ошибка: {error_msg}")
+    except Exception as e:
+        logger.error(f"[STOP_PUBLIC_TASK] Ошибка при остановке задачи: {e}")
+        await callback_query.answer("❌ Ошибка при остановке задачи")
 
 # Обработчик остановки мониторинга
 async def stop_monitoring_callback(client, callback_query):
@@ -2932,6 +3517,59 @@ async def process_callback_query(client, callback_query):
     # Проверяем все специализированные обработчики
     if data is None:
         return False
+
+    # Session management callbacks
+    if data == "assign_session":
+        from bot.session_handlers import assign_session_callback
+        await assign_session_callback(client, callback_query)
+        return True
+    if data.startswith("select_session:"):
+        from bot.session_handlers import select_session_callback
+        await select_session_callback(client, callback_query)
+        return True
+    if data.startswith("assign_task:"):
+        from bot.session_handlers import assign_task_callback
+        await assign_task_callback(client, callback_query)
+        return True
+    if data.startswith("remove_task:"):
+        from bot.session_handlers import remove_task_callback
+        await remove_task_callback(client, callback_query)
+        return True
+    if data == "delete_session":
+        from bot.session_handlers import delete_session_callback
+        await delete_session_callback(client, callback_query)
+        return True
+    if data.startswith("confirm_delete:"):
+        from bot.session_handlers import confirm_delete_callback
+        await confirm_delete_callback(client, callback_query)
+        return True
+    if data.startswith("delete_confirmed:"):
+        from bot.session_handlers import delete_confirmed_callback
+        await delete_confirmed_callback(client, callback_query)
+        return True
+    if data == "cancel_session_action":
+        from bot.session_handlers import cancel_session_action_callback
+        await cancel_session_action_callback(client, callback_query)
+        return True
+    if data.startswith("resend_code:"):
+        from bot.session_handlers import resend_code_callback
+        await resend_code_callback(client, callback_query)
+        return True
+    if data == "add_session":
+        from bot.session_handlers import add_session_callback
+        await add_session_callback(client, callback_query)
+        return True
+    if data == "add_reaction":
+        from bot.session_handlers import add_reaction_callback
+        await add_reaction_callback(client, callback_query)
+        return True
+
+    # Reaction callbacks
+    if data.startswith("reaction_"):
+        from bot.reaction_master import reaction_callback_handler
+        await reaction_callback_handler(client, callback_query)
+        return True
+
     # stop_monitoring
     if data.startswith("stop_monitoring:"):
         # Импортируем и вызываем напрямую
@@ -2945,6 +3583,14 @@ async def process_callback_query(client, callback_query):
     if data.startswith("stop_task:"):
         await stop_task_callback(client, callback_query)
         return True
+    # stop_reaction_task
+    if data.startswith("stop_reaction_task:"):
+        await stop_reaction_task_callback(client, callback_query)
+        return True
+    # stop_public_task
+    if data.startswith("stop_public_task:"):
+        await stop_public_task_callback(client, callback_query)
+        return True
     # check_tasks_status
     if data == "check_tasks_status":
         await check_tasks_status_callback(client, callback_query)
@@ -2952,6 +3598,296 @@ async def process_callback_query(client, callback_query):
     # check_reaction_tasks_status
     if data == "check_reaction_tasks_status":
         await check_reaction_tasks_status_callback(client, callback_query)
+        return True
+    # text_edit_settings
+    if data == "text_edit_settings":
+        user_id = callback_query.from_user.id
+        await show_text_edit_settings(client, callback_query.message, user_id)
+        await callback_query.answer()
+        return True
+    # text_edit_change_text
+    if data == "text_edit_change_text":
+        user_id = callback_query.from_user.id
+        user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_LINK_TEXT, "last_msg_id": None}
+        await callback_query.message.reply("📝 **Введите текст для гиперссылки:**\n\nНапример: 'Подписаться на канал'", reply_markup=ReplyKeyboardRemove())
+        await callback_query.answer()
+        return True
+    # text_edit_change_url
+    if data == "text_edit_change_url":
+        user_id = callback_query.from_user.id
+        user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_LINK_URL, "last_msg_id": None}
+        await callback_query.message.reply("🔗 **Введите URL для гиперссылки:**\n\nНапример: https://t.me/example", reply_markup=ReplyKeyboardRemove())
+        await callback_query.answer()
+        return True
+    # text_edit_change_limit
+    if data == "text_edit_change_limit":
+        user_id = callback_query.from_user.id
+        user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_LIMIT, "last_msg_id": None}
+        await callback_query.message.reply("📊 **Введите максимальное количество постов для обработки:**\n\nНапример: 100", reply_markup=ReplyKeyboardRemove())
+        await callback_query.answer()
+        return True
+    # text_edit_settings_done
+    if data == "text_edit_settings_done":
+        user_id = callback_query.from_user.id
+        # Запускаем задачу редактирования с текущими настройками
+        await start_text_editing_task(client, callback_query.message, user_id)
+        await callback_query.answer()
+        return True
+    # text_edit_settings_back
+    if data == "text_edit_settings_back":
+        user_id = callback_query.from_user.id
+        # Возвращаемся в главное меню редактирования текста
+        await callback_query.message.reply(
+            "🛠 **Редактирование текста постов**\n\n"
+            "Этот режим позволяет добавлять новые гиперссылки ко всем постам в канале.\n\n"
+            "Выберите действие:",
+            reply_markup=get_text_edit_menu_keyboard()
+        )
+        user_states[user_id] = {**user_states.get(user_id, {}), "state": "text_edit_menu"}
+        await callback_query.answer()
+        return True
+    # text_edit_start
+    if data == "text_edit_start":
+        user_id = callback_query.from_user.id
+        await start_text_editing_task(client, callback_query.message, user_id)
+        await callback_query.answer()
+        return True
+    # text_edit_back_to_channel
+    if data == "text_edit_back_to_channel":
+        user_id = callback_query.from_user.id
+        kb = await get_channel_history_keyboard(user_id)
+        await callback_query.message.reply(
+            "📺 **Выбор канала для редактирования текста**\n\n"
+            "Выберите канал из истории или введите ID/ссылку канала:",
+            reply_markup=kb or ReplyKeyboardRemove()
+        )
+        user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_CHANNEL}
+        await callback_query.answer()
+        return True
+    # text_edit_back
+    if data == "text_edit_back":
+        user_id = callback_query.from_user.id
+        await show_main_menu(client, callback_query.message)
+        await callback_query.answer()
+        return True
+    # check_text_edit_tasks_status
+    if data == "check_text_edit_tasks_status":
+        user_id = callback_query.from_user.id
+        await show_text_edit_tasks_status(client, callback_query.message, user_id)
+        await callback_query.answer()
+        return True
+    # text_edit_footer
+    if data == "text_edit_footer":
+        user_id = callback_query.from_user.id
+        # Показываем меню настройки приписки для редактора текста
+        text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+        current_footer = text_edit_settings.get('footer_text', '')
+        footer_preview = current_footer if current_footer else "Приписка не установлена"
+
+        # Создаем клавиатуру с опциями
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Изменить текст", callback_data="text_edit_footer_edit")],
+            [InlineKeyboardButton("📋 Шаблоны", callback_data="text_edit_footer_templates")],
+            [InlineKeyboardButton("🔗 Редактировать ссылки", callback_data="text_edit_footer_links")],
+            [InlineKeyboardButton("🗑️ Удалить", callback_data="text_edit_footer_delete")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="text_edit_settings")]
+        ])
+
+        text = f"📝 Настройка приписки к сообщениям\n\n"
+        text += f"Текущая приписка:\n{footer_preview}\n\n"
+        text += f"Приписка добавляется к каждому редактируемому сообщению.\n\n"
+        text += f"🔗 Для создания кликабельных ссылок используйте HTML:\n"
+        text += f"<code>&lt;a href=\"ВАША_ССЫЛКА\"&gt;ТЕКСТ&lt;/a&gt;</code>\n\n"
+        text += f"Примеры ссылок:\n"
+        text += f"• <code>https://t.me/channel</code> - публичный канал\n"
+        text += f"• <code>https://t.me/+invite</code> - приватный канал\n"
+        text += f"• <code>https://donate.url</code> - донат"
+
+        await safe_edit_callback_message(
+            callback_query,
+            text,
+            reply_markup=keyboard
+        )
+        await callback_query.answer()
+        return True
+    # text_edit_footer_links
+    if data == "text_edit_footer_links":
+        user_id = callback_query.from_user.id
+        text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+        footer_text = text_edit_settings.get('footer_text', '')
+
+        if not footer_text:
+            await safe_edit_callback_message(
+                callback_query,
+                "❌ Приписка не установлена. Сначала установите текст приписки.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="text_edit_footer")]])
+            )
+            await callback_query.answer()
+            return True
+
+        # Ищем ссылки в тексте
+        import re
+        links = re.findall(r'href="([^"]*)"', footer_text)
+        text_links = re.findall(r'<a[^>]*>([^<]*)</a>', footer_text)
+
+        if not links:
+            await safe_edit_callback_message(
+                callback_query,
+                f"🔗 Ссылки не найдены в приписке:\n\n{footer_text}\n\nИспользуйте HTML-теги для создания ссылок.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="text_edit_footer")]])
+            )
+            await callback_query.answer()
+            return True
+
+        text = f"🔗 Найденные ссылки в приписке:\n\n"
+        for i, (link_text, url) in enumerate(zip(text_links, links)):
+            text += f"{i+1}. {link_text} → {url}\n"
+
+        text += f"\n💡 Для редактирования используйте 'Изменить текст' и замените ссылки вручную."
+
+        await safe_edit_callback_message(
+            callback_query,
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="text_edit_footer")]])
+        )
+        await callback_query.answer()
+        return True
+    # text_edit_footer_edit
+    if data == "text_edit_footer_edit":
+        user_id = callback_query.from_user.id
+        text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+        current_footer = text_edit_settings.get('footer_text', '')
+
+        # Устанавливаем состояние для ввода footer
+        user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_FOOTER_EDIT, "last_msg_id": None}
+
+        await callback_query.message.reply(
+            f"✏️ Введите новый текст приписки:\n\n"
+            f"Текущая приписка:\n{current_footer if current_footer else 'Не установлена'}\n\n"
+            f"💡 Используйте HTML для ссылок:\n"
+            f"<code>&lt;a href=\"ссылка\"&gt;текст&lt;/a&gt;</code>",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="text_edit_footer")]])
+        )
+        await callback_query.answer()
+        return True
+    # text_edit_footer_templates
+    if data == "text_edit_footer_templates":
+        user_id = callback_query.from_user.id
+        # Показываем готовые шаблоны
+        templates = [
+            ('📢 Подписаться на канал', '📢 <a href="https://t.me/YOUR_CHANNEL">Подпишись на новый канал</a> 📢'),
+            ('🔒 Приватный канал', '🔒 <a href="https://t.me/+YOUR_PRIVATE_LINK">Приватный канал / Подписаться</a>'),
+            ('💰 Донат', '💰 <a href="https://donate.url">Поддержать автора</a>'),
+        ]
+
+        keyboard_buttons = []
+        for i, (name, template) in enumerate(templates):
+            keyboard_buttons.append([InlineKeyboardButton(f"{name}", callback_data=f"text_edit_footer_template_{i}")])
+
+        keyboard_buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="text_edit_footer")])
+
+        text = f"📋 Готовые шаблоны приписок\n\n"
+        text += f"Выберите шаблон и замените:\n"
+        text += f"• YOUR_CHANNEL на username вашего канала\n"
+        text += f"• YOUR_PRIVATE_LINK на invite-ссылку приватного канала\n"
+        text += f"• donate.url на вашу ссылку для донатов\n\n"
+
+        for i, (name, template) in enumerate(templates):
+            text += f"{i+1}. {name}\n   {template}\n\n"
+
+        await safe_edit_callback_message(
+            callback_query,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard_buttons)
+        )
+        # Сохраняем шаблоны в состоянии для использования в обработчиках
+        user_states[user_id]['text_edit_footer_templates'] = templates
+        await callback_query.answer()
+        return True
+    # text_edit_footer_delete
+    if data == "text_edit_footer_delete":
+        user_id = callback_query.from_user.id
+        # Удаляем приписку
+        text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+        if 'footer_text' in text_edit_settings:
+            del text_edit_settings['footer_text']
+            user_states[user_id]['text_edit_settings'] = text_edit_settings
+
+        await callback_query.answer("✅ Приписка удалена!")
+        await show_text_edit_settings(client, callback_query.message, user_id)
+        return True
+    # text_edit_footer_template_*
+    if data.startswith("text_edit_footer_template_"):
+        user_id = callback_query.from_user.id
+        template_index = int(data.replace("text_edit_footer_template_", ""))
+        templates = user_states[user_id].get('text_edit_footer_templates', [])
+
+        if template_index < len(templates):
+            _, template_text = templates[template_index]
+            # Сохраняем шаблон как footer_text
+            text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+            text_edit_settings['footer_text'] = template_text
+            user_states[user_id]['text_edit_settings'] = text_edit_settings
+
+            await callback_query.answer("✅ Шаблон применен!")
+            await show_text_edit_settings(client, callback_query.message, user_id)
+        else:
+            await callback_query.answer("❌ Шаблон не найден!")
+        return True
+    # text_edit_require_hashtags
+    if data == "text_edit_require_hashtags":
+        user_id = callback_query.from_user.id
+        text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+        current_value = text_edit_settings.get('require_hashtags', False)
+        text_edit_settings['require_hashtags'] = not current_value
+        user_states[user_id]['text_edit_settings'] = text_edit_settings
+
+        await callback_query.answer(f"🏷️ Требовать хэштеги: {'Да' if not current_value else 'Нет'}")
+        await show_text_edit_settings(client, callback_query.message, user_id)
+        return True
+    # text_edit_require_text
+    if data == "text_edit_require_text":
+        user_id = callback_query.from_user.id
+        text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+        current_value = text_edit_settings.get('require_specific_text', False)
+
+        if current_value:
+            # Выключаем требование текста
+            text_edit_settings['require_specific_text'] = False
+            user_states[user_id]['text_edit_settings'] = text_edit_settings
+            await callback_query.answer("🔤 Требование текста отключено")
+            await show_text_edit_settings(client, callback_query.message, user_id)
+        else:
+            # Включаем требование текста и просим ввести текст
+            user_states[user_id] = {**user_states.get(user_id, {}), "state": FSM_TEXT_EDIT_SPECIFIC_TEXT, "last_msg_id": None}
+
+            await callback_query.message.reply(
+                "🔤 Введите текст, который должен содержаться в сообщении для редактирования:\n\n"
+                "💡 Примеры:\n"
+                "• #hashtag\n"
+                "• определенное слово\n"
+                "• _TSSH_Fans_\n"
+                "• Приватный канал",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Отмена", callback_data="text_edit_settings")]])
+            )
+            await callback_query.answer()
+        return True
+    # text_edit_require_old_footer
+    if data == "text_edit_require_old_footer":
+        user_id = callback_query.from_user.id
+        text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+        current_value = text_edit_settings.get('require_old_footer', True)
+        text_edit_settings['require_old_footer'] = not current_value
+        user_states[user_id]['text_edit_settings'] = text_edit_settings
+
+        await callback_query.answer(f"📝 Заменять старую приписку: {'Да' if not current_value else 'Нет'}")
+        await show_text_edit_settings(client, callback_query.message, user_id)
+        return True
+
+    # Public groups callbacks
+    if data.startswith("public_"):
+        from bot.public_groups_manager import handle_public_groups_callback
+        await handle_public_groups_callback(client, callback_query)
         return True
 
     # ... можно добавить другие кастомные обработчики ...
@@ -2971,10 +3907,25 @@ async def start_text_editing_task(client, message, user_id):
     """Запуск задачи редактирования текста"""
     try:
         channel_id = user_states[user_id].get('text_edit_channel_id')
-        link_text = user_states[user_id].get('text_edit_link_text')
-        link_url = user_states[user_id].get('text_edit_link_url')
-        limit = user_states[user_id].get('text_edit_limit')
-        
+        # Получаем настройки из text_edit_settings
+        text_edit_settings = user_states[user_id].get('text_edit_settings', {})
+        footer_text = text_edit_settings.get('footer_text', '')
+        limit = text_edit_settings.get('max_posts', 100)
+        require_hashtags = text_edit_settings.get('require_hashtags', False)
+        require_specific_text = text_edit_settings.get('require_specific_text', False)
+        specific_text = text_edit_settings.get('specific_text', '')
+        require_old_footer = text_edit_settings.get('require_old_footer', True)
+
+        # Проверяем заполненность настроек
+        if not footer_text.strip():
+            await message.reply(
+                "❌ **Невозможно запустить редактирование**\n\n"
+                "Необходимо настроить приписку в настройках.\n"
+                "Нажмите '⚙️ Настройки' для настройки параметров.",
+                reply_markup=get_text_edit_inline_keyboard(channel_id=channel_id)
+            )
+            return
+
         # Убеждаемся, что channel_id - это число
         if not isinstance(channel_id, int):
             numeric_id = extract_numeric_id(channel_id)
@@ -2982,13 +3933,16 @@ async def start_text_editing_task(client, message, user_id):
                 await message.reply("❌ Ошибка: некорректный ID канала")
                 return
             channel_id = numeric_id
-        
+
         text_editor = TextEditorManager()
         result = await text_editor.start_text_editing(
             channel_id=channel_id,
-            link_text=link_text,
-            link_url=link_url,
-            max_posts=limit
+            footer_text=footer_text,
+            max_posts=limit,
+            require_hashtags=require_hashtags,
+            require_specific_text=require_specific_text,
+            specific_text=specific_text,
+            require_old_footer=require_old_footer
         )
         
         if result.get('status') == 'success':
@@ -3017,6 +3971,55 @@ async def start_text_editing_task(client, message, user_id):
             reply_markup=get_text_edit_menu_keyboard()
         )
         user_states[user_id] = {**user_states.get(user_id, {}), "state": "text_edit_menu"}
+
+async def show_text_edit_settings(client, message, user_id):
+    """Показать меню настроек редактирования текста"""
+    # Получаем текущие настройки редактирования или устанавливаем значения по умолчанию
+    text_edit_settings = user_states[user_id].get('text_edit_settings', {
+        'link_text': '',
+        'link_url': '',
+        'max_posts': 100
+    })
+
+    # Форматируем настройки для отображения
+    footer_text = text_edit_settings.get('footer_text', '')
+    require_hashtags = text_edit_settings.get('require_hashtags', False)
+    require_specific_text = text_edit_settings.get('require_specific_text', False)
+    specific_text = text_edit_settings.get('specific_text', '')
+    require_old_footer = text_edit_settings.get('require_old_footer', True)
+
+    settings_text = "⚙️ **Настройки редактирования текста:**\n\n"
+    settings_text += f"📝 **Приписка:** {footer_text[:50]}{'...' if len(footer_text) > 50 else '' if footer_text else 'Не установлена'}\n"
+    settings_text += f"📊 **Максимум постов:** {text_edit_settings.get('max_posts', 100)}\n"
+    settings_text += f"🏷️ **Требовать хэштеги:** {'Да' if require_hashtags else 'Нет'}\n"
+    settings_text += f"🔤 **Требовать текст:** {'Да' if require_specific_text else 'Нет'}\n"
+    if require_specific_text and specific_text:
+        settings_text += f"📄 **Текст для поиска:** {specific_text[:30]}{'...' if len(specific_text) > 30 else ''}\n"
+    settings_text += f"📝 **Заменять старую приписку:** {'Да' if require_old_footer else 'Нет'}\n\n"
+    settings_text += "Выберите параметр для изменения:"
+
+    # Создаем inline клавиатуру для настроек редактирования
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📝 Приписка и ссылки", callback_data="text_edit_footer")
+        ],
+        [
+            InlineKeyboardButton("🏷️ Хэштеги", callback_data="text_edit_require_hashtags"),
+            InlineKeyboardButton("🔤 Текст", callback_data="text_edit_require_text")
+        ],
+        [
+            InlineKeyboardButton("📝 Старая приписка", callback_data="text_edit_require_old_footer"),
+            InlineKeyboardButton("📊 Лимит постов", callback_data="text_edit_change_limit")
+        ],
+        [
+            InlineKeyboardButton("✅ Готово", callback_data="text_edit_settings_done"),
+            InlineKeyboardButton("🔙 Назад", callback_data="text_edit_settings_back")
+        ]
+    ])
+
+    sent = await message.reply(settings_text, reply_markup=kb)
+    if sent is not None:
+        user_states[user_id]['last_msg_id'] = sent.id
 
 async def show_text_edit_tasks_status(client, message, user_id):
     """Показать статус всех задач редактирования текста"""

@@ -273,11 +273,82 @@ async def reaction_callback_handler(client, callback_query: CallbackQuery):
     await callback_query.answer("Неизвестное действие", show_alert=True)
 
 # --- Вспомогательная функция для resolve_channel ---
+def normalize_channel_input(text: str) -> str:
+    """Нормализует входные данные пользователя для канала
+
+    Поддерживает форматы:
+    - t.me/username -> username
+    - @username -> username
+    - username -> username
+    - -100xxxxxxxxx -> -100xxxxxxxxx
+    - xxxxxxxxxx -> xxxxxxxxxx (если число)
+    - Название (ID: -100xxxxxxxxx, @username) -> username или ID
+    """
+    text = text.strip()
+
+    # Удаляем https:// если есть
+    if text.startswith('https://'):
+        text = text[8:]
+    elif text.startswith('http://'):
+        text = text[7:]
+
+    # Обрабатываем t.me/username
+    if text.startswith('t.me/'):
+        username = text[5:]  # убираем 't.me/'
+        # Удаляем query параметры если есть
+        if '?' in username:
+            username = username.split('?')[0]
+        return username
+
+    # Обрабатываем @username
+    if text.startswith('@'):
+        return text[1:]  # убираем '@'
+
+    # Обрабатываем формат "Название (ID: -100xxxxxxxxx, @username)"
+    import re
+    channel_pattern = re.search(r'\(ID:\s*(-?\d+),\s*@([^)]+)\)', text)
+    if channel_pattern:
+        channel_id = channel_pattern.group(1)
+        username = channel_pattern.group(2)
+        # Предпочитаем использовать username, так как он более читаемый
+        if username:
+            return username
+        # Если username пустой, используем ID
+        return channel_id
+
+    # Если это число или начинается с -100, возвращаем как есть
+    if text.isdigit() or (text.startswith('-') and text[1:].isdigit()):
+        return text
+
+    # Иначе считаем что это username
+    return text
+
 async def resolve_channel(api_client, text):
-    stats = await api_client.get_channel_stats(text)
-    if stats and stats.get("id") and not stats.get("error"):
-        return stats
-    return None
+    # Сначала нормализуем входные данные
+    normalized_text = normalize_channel_input(text)
+    logging.info(f"[REACTION][resolve_channel] input='{text}' -> normalized='{normalized_text}'")
+
+    stats = await api_client.get_channel_stats(normalized_text)
+    logging.info(f"[REACTION][resolve_channel] stats from api: {stats}")
+
+    # Проверяем, что получили валидный ответ
+    if stats and stats.get("id"):
+        channel_id = stats.get("id")
+        title = stats.get("title", "")
+        username = stats.get("username", "")
+
+        # Если канал найден, id будет числом (числовой ID Telegram)
+        # Если канал не найден, id будет строкой (username или то что ввел пользователь)
+        if isinstance(channel_id, int) or (isinstance(channel_id, str) and channel_id.startswith("-")):
+            logging.info(f"[REACTION][resolve_channel] канал найден: id={channel_id}, title='{title}', username='{username}'")
+            return channel_id, title, username
+        else:
+            # Канал не найден - id остался строковым username'ом
+            logging.info(f"[REACTION][resolve_channel] канал '{normalized_text}' не найден")
+            return None, None, None
+
+    logging.info(f"[REACTION][resolve_channel] нет валидного ответа от API")
+    return None, None, None  # Возвращаем None если канал не найден или есть ошибка
 
 # --- Вспомогательная функция для форматирования статистики канала ---
 def format_channel_stats(stats):

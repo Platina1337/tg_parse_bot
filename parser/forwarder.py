@@ -1,4 +1,5 @@
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 from shared.models import ParseConfig, ParseMode, Message
 import logging
 import os
@@ -14,11 +15,15 @@ import traceback
 from datetime import datetime
 from parser.session_manager import SessionManager
 from parser.config import config
+import random
+from pyrogram.raw.functions.messages import GetMessagesViews
+from parser.watermark_processor import watermark_processor
 
 # Импорты для python-telegram-bot
 try:
-    from telegram import Bot as TgBot, InputPaidMediaPhoto, InputPaidMediaVideo
+    from telegram import Bot as TgBot, InputPaidMediaPhoto, InputPaidMediaVideo, InputFile
     from telegram.constants import ParseMode as TgParseMode
+    from telegram.error import TelegramError, TimedOut, NetworkError, BadRequest
     import telegram
     TG_BOT_AVAILABLE = True
 except ImportError:
@@ -77,10 +82,12 @@ async def ensure_peer_resolved(userbot, bot, channel_id, username=None):
 class TelegramForwarder:
     """Класс для пересылки сообщений без скачивания"""
     
-    def __init__(self, db_instance, userbot=None, bot_token=None, session_manager=None):
+    def __init__(self, db_instance, userbot=None, bot_token=None, session_manager=None, reaction_manager=None):
         logger.info(f"[FORWARDER] 🔍 Инициализация TelegramForwarder")
         self.session_manager = session_manager
+        self.reaction_manager = reaction_manager
         self._userbot = userbot
+        self.watermark_processor = watermark_processor
         if userbot:
             logger.info(f"[FORWARDER] userbot передан явно: {self._userbot}")
         elif self.session_manager:
@@ -142,6 +149,31 @@ class TelegramForwarder:
         self._monitoring_targets: Dict[Tuple[int, str], str] = {}  # (channel_id, target_channel_id) -> target_channel
         self._handlers = {}  # (source_channel, target_channel) -> handler
     
+    def _is_post_paid(self, config, is_media_group, messages, counters):
+        paid_content_mode = config.get("paid_content_mode", "off")
+        paid_content_hashtag = config.get("paid_content_hashtag")
+        paid_content_chance = config.get("paid_content_chance", 100)
+
+        is_paid = False
+
+        if paid_content_mode == "hashtag" and paid_content_hashtag:
+            text_to_check = ""
+            if is_media_group:
+                for msg in messages:
+                    text_to_check += (getattr(msg, 'caption', "") or "") + " "
+            else:
+                msg = messages[0]
+                text_to_check = (getattr(msg, 'text', "") or "") + " " + (getattr(msg, 'caption', "") or "")
+
+            if paid_content_hashtag in text_to_check:
+                is_paid = True
+
+        elif paid_content_mode == "random":
+            if random.random() < (paid_content_chance / 100):
+                is_paid = True
+
+        return is_paid, counters
+
     async def get_userbot(self, task: str = "parsing"):
         if self.session_manager:
             sessions = await self.session_manager.get_sessions_for_task(task)
@@ -166,6 +198,36 @@ class TelegramForwarder:
             return None
         logger.error(f"[FORWARDER][get_userbot] Не удалось получить userbot для задачи {task} - нет session_manager")
         return None
+
+    async def get_userbot_with_fallback(self, task: str = "parsing", current_session_alias: str = None):
+        """
+        Получить userbot с поддержкой переключения на другую сессию при FloodWait.
+
+        Args:
+            task: Задача для которой нужен userbot
+            current_session_alias: Текущая сессия (для переключения)
+
+        Returns:
+            tuple: (userbot_client, session_alias) или (None, None)
+        """
+        if not self.session_manager:
+            logger.error(f"[FORWARDER][get_userbot_with_fallback] Нет session_manager")
+            return None, None
+
+        # Получаем следующую доступную сессию
+        client = await self.session_manager.get_next_parsing_session(current_session_alias)
+
+        if client:
+            session_alias = getattr(client, 'name', 'unknown')
+            if hasattr(client, 'name') and client.name:
+                # Извлекаем alias из пути сессии
+                session_alias = os.path.basename(client.name).replace('.session', '')
+
+            logger.info(f"[FORWARDER][get_userbot_with_fallback] Получен userbot для задачи {task}, сессия: {session_alias}")
+            return client, session_alias
+
+        logger.error(f"[FORWARDER][get_userbot_with_fallback] Не удалось получить userbot для задачи {task}")
+        return None, None
 
     async def start(self):
         logger.info(f"[FORWARDER] Вход в start(). self._userbot: {self._userbot}")
@@ -266,10 +328,8 @@ class TelegramForwarder:
                     logger.warning(f"Не удалось разрешить целевой канал {target_channel} через username {target_username}: {e}")
             channel_id = channel.id
             key = (channel_id, str(target_channel))
-            # --- Остановить все мониторинги, у которых target_channel не совпадает с новым ---
-            for (src_id, tgt_id) in list(self._monitoring_tasks.keys()):
-                if tgt_id != str(target_channel):
-                    await self.stop_forwarding(src_id, tgt_id)
+            # --- Для поддержки нескольких каналов НЕ останавливаем другие мониторинги для того же source_channel ---
+            # (логика остановки других target_channels убрана)
             # Если уже есть monitoring для этой пары, обновляем настройки
             if key in self._monitoring_tasks:
                 logger.info(f"[FORWARDER] Monitoring для {channel_id} -> {target_channel} уже существует, обновляем настройки")
@@ -294,6 +354,7 @@ class TelegramForwarder:
             self._forwarding_active[channel_id] = True
             if channel_id not in self._counters:
                 self._counters[channel_id] = {
+                    'forwarded_count': 0,
                     'hashtag_paid_counter': 0,
                     'select_paid_counter': 0,
                     'media_group_paid_counter': 0,
@@ -326,12 +387,6 @@ class TelegramForwarder:
             if not target_channel:
                 raise Exception("Не указан целевой канал для пересылки")
             self._forwarding_active[channel_id] = True
-            self._counters[channel_id] = self._counters.get(channel_id, {
-                'hashtag_paid_counter': 0,
-                'select_paid_counter': 0,
-                'media_group_paid_counter': 0,
-                'media_group_hashtag_paid_counter': 0
-            })
             if channel_id not in self._media_group_buffers:
                 self._media_group_buffers[channel_id] = {}
             if channel_id not in self._media_group_timeouts:
@@ -339,11 +394,14 @@ class TelegramForwarder:
             processed_groups = set()
             media_groups = self._media_group_buffers[channel_id]
             logger.info(f"[FORWARDER] 🔄 Мониторинг запущен для канала {channel_name} -> {target_channel}")
-            forwarded_count = 0
-            select_paid_counter = 0
-            hashtag_paid_counter = 0
-            media_group_paid_counter = 0
-            media_group_hashtag_paid_counter = 0
+
+            # Используем общий счетчик для всех target_channels одного source_channel
+            counters = self._counters[channel_id]
+            forwarded_count = counters.get('forwarded_count', 0)
+            select_paid_counter = counters.get('select_paid_counter', 0)
+            hashtag_paid_counter = counters.get('hashtag_paid_counter', 0)
+            media_group_paid_counter = counters.get('media_group_paid_counter', 0)
+            media_group_hashtag_paid_counter = counters.get('media_group_hashtag_paid_counter', 0)
             @userbot.on_message(filters.chat(channel_id))
             async def handle_new_message(client, message):
                 logger.info(f"[FORWARDER][HANDLER] Вызван handler для channel_id={channel_id}, message_id={getattr(message, 'id', None)}")
@@ -445,16 +503,18 @@ class TelegramForwarder:
                                             add_footer,
                                             forward_mode,
                                             hide_sender,
-                                            max_posts,
-                                            callback,
                                             paid_content_stars if group_is_paid else 0,
-                                            group_messages,  # <-- передаем явно
-                                            config  # <-- добавляем config для форматирования гиперссылки
+                                            config,
+                                            group_messages=group_messages,
+                                            callback=callback,
+                                            max_posts=max_posts
                                         )
                                         logger.info(f"[FORWARDER][DEBUG] Возврат из forward_media_group для {group_id}")
                                         
                                         # Увеличиваем счетчик для медиагрупп
                                         forwarded_count += 1
+                                        # Обновляем общий счетчик
+                                        self._counters[channel_id]['forwarded_count'] = forwarded_count
                                         logger.info(f"[FORWARDER] Медиагруппа {group_id} переслана, счетчик: {forwarded_count}/{max_posts}")
                                         
                                         # Проверяем лимит после медиагруппы
@@ -530,22 +590,64 @@ class TelegramForwarder:
                             is_paid = False
                         logger.info(f"[FORWARDER] 🔍 Вызываем _forward_single_message с paid_content_stars={paid_content_stars if is_paid else 0} (тип: {type(paid_content_stars)})")
                         logger.info(f"[FORWARDER][HANDLER] Перед вызовом _forward_single_message для message_id={getattr(message, 'id', None)}")
-                        await self._forward_single_message(
+
+                        # Получаем результат пересылки
+                        forward_result = await self._forward_single_message(
                             message,
                             target_channel,
                             hide_sender,
                             add_footer,
                             forward_mode,
+                            config,
                             text_mode,
                             paid_content_stars if is_paid else 0
                         )
-                        logger.info(f"[FORWARDER][HANDLER] Успешно переслано сообщение {getattr(message, 'id', None)} в {target_channel}")
-                        if delay_seconds and delay_seconds > 0:
-                            await asyncio.sleep(delay_seconds)
-                        forwarded_count += 1
-                        if callback:
-                            await callback(message)
-                        last_message_id = message.id
+
+                        if forward_result:
+                            logger.info(f"[FORWARDER][HANDLER] Успешно переслано сообщение {getattr(message, 'id', None)} в {target_channel}")
+                            
+                            # --- ДОБАВЛЕНО: Автоматическое проставление реакций ---
+                            reactions_enabled = config.get('reactions_enabled', False)
+                            reaction_emojis = config.get('reaction_emojis', [])
+
+                            logger.info(f"[FORWARDER][REACTIONS] Проверка реакций: enabled={reactions_enabled}, emojis={reaction_emojis}, manager={self.reaction_manager is not None}")
+
+                            if reactions_enabled and reaction_emojis and self.reaction_manager:
+                                try:
+                                    # Получаем ID пересланного сообщения
+                                    # forward_result может содержать объект Message или True.
+                                    # Если это объект Message, у него будет message_id
+                                    forwarded_message_id = None
+                                    if hasattr(forward_result, 'id'):
+                                        forwarded_message_id = forward_result.id
+                                    
+                                    if forwarded_message_id:
+                                        logger.info(f"[FORWARDER][REACTIONS] Умное проставление реакций на сообщение {forwarded_message_id} в канале {target_channel}")
+                                        # Используем умное проставление реакций (автоматически выбирает разные эмодзи для дублирующихся аккаунтов)
+                                        await self.reaction_manager.add_reactions_smart(
+                                            chat_id=target_channel,
+                                            message_id=forwarded_message_id,
+                                            available_reactions=reaction_emojis
+                                            # session_names не указываем, чтобы использовать все доступные
+                                        )
+                                    else:
+                                        logger.warning(f"[FORWARDER][REACTIONS] Не удалось получить ID пересланного сообщения, реакция не будет поставлена.")
+                                        
+                                except Exception as reaction_error:
+                                    logger.error(f"[FORWARDER][REACTIONS] Ошибка при проставлении реакции: {reaction_error}")
+                            # --- КОНЕЦ БЛОКА РЕАКЦИЙ ---
+                            
+                            if delay_seconds and delay_seconds > 0:
+                                await asyncio.sleep(delay_seconds)
+                            forwarded_count += 1
+                            # Обновляем общий счетчик
+                            self._counters[channel_id]['forwarded_count'] = forwarded_count
+                            if callback:
+                                await callback(message)
+                            last_message_id = message.id
+                        else:
+                            logger.warning(f"[FORWARDER][HANDLER] Не удалось пересласть сообщение {getattr(message, 'id', None)} - пропускаем")
+                            # Для FloodWait не делаем задержку, продолжаем сразу
                 except Exception as e:
                     logger.error(f"[FORWARDER] Ошибка при обработке сообщения {message.id}: {e}")
                     logger.error(f"[FORWARDER] Полная ошибка: {traceback.format_exc()}")
@@ -580,7 +682,23 @@ class TelegramForwarder:
                 return
             
             logger.info(f"[FORWARDER] 🔍 Вызываем forward_media_group для группы {group_id} с paid_content_stars={paid_content_stars}")
-            await self.forward_media_group(channel_id, group_id, target_channel, text_mode, add_footer, forward_mode, hide_sender, max_posts, callback, paid_content_stars, None, config)
+
+            # Получаем результат пересылки медиагруппы
+            media_group_result = await self.forward_media_group(channel_id, group_id, target_channel, text_mode, add_footer, forward_mode, hide_sender, paid_content_stars, config, group_messages=None, callback=callback, max_posts=max_posts)
+
+            if media_group_result and media_group_result > 0:
+                logger.info(f"[FORWARDER][HANDLER] Успешно переслана медиагруппа {group_id}")
+                # Получаем delay_seconds из config
+                delay_seconds = config.get('delay_seconds', 0) if config else 0
+                if delay_seconds and delay_seconds > 0:
+                    await asyncio.sleep(delay_seconds)
+                forwarded_count += media_group_result  # forward_media_group возвращает количество пересланных сообщений
+                if callback:
+                    # Для медиагруппы вызываем callback с количеством файлов
+                    for _ in range(media_group_result):
+                        await callback(None)
+            else:
+                logger.warning(f"[FORWARDER][HANDLER] Не удалось пересласть медиагруппу {group_id} - пропускаем")
         except asyncio.CancelledError:
             logger.info(f"[FORWARDER] Таймаут медиагруппы {group_id} отменен")
         except Exception as e:
@@ -647,11 +765,12 @@ class TelegramForwarder:
                     pass
             return False
 
-    async def _forward_single_message(self, message, target_channel, hide_sender, add_footer, forward_mode, text_mode="hashtags_only", paid_content_stars=0):
+    async def _forward_single_message(self, message, target_channel, hide_sender, add_footer, forward_mode, config: dict, text_mode="hashtags_only", paid_content_stars=0):
         """Пересылка одиночного сообщения"""
         logger.info(f"[FORWARDER][DEBUG] Используемая приписка (add_footer): {add_footer!r}")
         logger.info(f"[FORWARDER] 🔍 _forward_single_message: paid_content_stars={paid_content_stars} (тип: {type(paid_content_stars)})")
-        
+        sent_message = None  # Инициализируем переменную в начале метода
+
         # --- ДОБАВЛЕНО: Проверка и инициализация userbot ---
         if not self._userbot or not getattr(self._userbot, 'is_connected', False):
             logger.warning("[FORWARDER] userbot не инициализирован или не подключён, пробую получить и запустить...")
@@ -673,15 +792,7 @@ class TelegramForwarder:
         
         # Обработка текста сообщения
         original_text = message.text or message.caption or ""
-        if text_mode == "hashtags_only":
-            hashtags = re.findall(r"#\w+", original_text)
-            processed_text = " ".join(hashtags) if hashtags else ""
-        elif text_mode == "as_is":
-            processed_text = original_text
-        elif text_mode == "no_text":
-            processed_text = ""
-        else:
-            processed_text = original_text
+        processed_text = self._process_message_text(original_text, text_mode)
         
         # Добавляем приписку
         if add_footer:
@@ -796,30 +907,45 @@ class TelegramForwarder:
                     parse_mode = "html" if (entities and len(entities) > 0) or (caption_entities and len(caption_entities) > 0) else None
                     logger.info(f"[FORWARDER][DEBUG] Итоговый parse_mode для медиа: {parse_mode}")
                     
+                    sent_message = None
                     if media_type == 'photo':
-                        logger.info(f"[FORWARDER][DEBUG] send_photo params: photo={message.photo.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                        await self._userbot.send_photo(photo=message.photo.file_id, caption=processed_text, chat_id=target_channel)
+                        # Проверяем, нужно ли применить watermark
+                        watermarked_path = None
+                        if self._should_apply_watermark(message, config):
+                            logger.info(f"[FORWARDER] Применяем watermark к фото")
+                            watermarked_path = await self._apply_watermark_to_photo(message, config)
+                        
+                        if watermarked_path:
+                            # Отправляем обработанное фото
+                            logger.info(f"[FORWARDER][DEBUG] send_photo (с watermark) params: photo={watermarked_path}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
+                            sent_message = await self._userbot.send_photo(photo=watermarked_path, caption=processed_text, chat_id=target_channel)
+                            # Удаляем временный файл
+                            self.watermark_processor.cleanup_temp_files(watermarked_path)
+                        else:
+                            # Отправляем оригинальное фото
+                            logger.info(f"[FORWARDER][DEBUG] send_photo params: photo={message.photo.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
+                            sent_message = await self._userbot.send_photo(photo=message.photo.file_id, caption=processed_text, chat_id=target_channel)
                     elif media_type == 'video':
                         logger.info(f"[FORWARDER][DEBUG] send_video params: video={message.video.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                        await self._userbot.send_video(video=message.video.file_id, caption=processed_text, chat_id=target_channel)
+                        sent_message = await self._userbot.send_video(video=message.video.file_id, caption=processed_text, chat_id=target_channel)
                     elif media_type == 'document':
                         logger.info(f"[FORWARDER][DEBUG] send_document params: document={message.document.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                        await self._userbot.send_document(document=message.document.file_id, caption=processed_text, chat_id=target_channel)
+                        sent_message = await self._userbot.send_document(document=message.document.file_id, caption=processed_text, chat_id=target_channel)
                     elif media_type == 'audio':
                         logger.info(f"[FORWARDER][DEBUG] send_audio params: audio={message.audio.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                        await self._userbot.send_audio(audio=message.audio.file_id, caption=processed_text, chat_id=target_channel)
+                        sent_message = await self._userbot.send_audio(audio=message.audio.file_id, caption=processed_text, chat_id=target_channel)
                     elif media_type == 'voice':
                         logger.info(f"[FORWARDER][DEBUG] send_voice params: voice={message.voice.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                        await self._userbot.send_voice(voice=message.voice.file_id, caption=processed_text, chat_id=target_channel)
+                        sent_message = await self._userbot.send_voice(voice=message.voice.file_id, caption=processed_text, chat_id=target_channel)
                     elif media_type == 'video_note':
                         logger.info(f"[FORWARDER][DEBUG] send_video_note params: video_note={message.video_note.file_id}, chat_id={target_channel}")
-                        await self._userbot.send_video_note(video_note=message.video_note.file_id, chat_id=target_channel)
+                        sent_message = await self._userbot.send_video_note(video_note=message.video_note.file_id, chat_id=target_channel)
                     elif media_type == 'animation':
                         logger.info(f"[FORWARDER][DEBUG] send_animation params: animation={message.animation.file_id}, caption={processed_text}, chat_id={target_channel}, parse_mode={parse_mode}")
-                        await self._userbot.send_animation(animation=message.animation.file_id, caption=processed_text, chat_id=target_channel)
+                        sent_message = await self._userbot.send_animation(animation=message.animation.file_id, caption=processed_text, chat_id=target_channel)
                     elif media_type == 'sticker':
                         logger.info(f"[FORWARDER][DEBUG] send_sticker params: sticker={message.sticker.file_id}, chat_id={target_channel}")
-                        await self._userbot.send_sticker(sticker=message.sticker.file_id, chat_id=target_channel)
+                        sent_message = await self._userbot.send_sticker(sticker=message.sticker.file_id, chat_id=target_channel)
                     elif media_type == 'poll':
                         logger.warning(f"[FORWARDER] Неподдерживаемый тип медиа: {media_type}, пропускаем!")
                         return False
@@ -837,13 +963,35 @@ class TelegramForwarder:
                     # Исправлено: parse_mode только если реально есть entities
                     parse_mode = "html" if entities and len(entities) > 0 and self._should_use_parse_mode(entities) else None
                     logger.info(f"[FORWARDER][DEBUG] Итоговый parse_mode для send_message: {parse_mode}")
-                    await self._userbot.send_message(text=processed_text or original_text, chat_id=target_channel, parse_mode=parse_mode)
+                    sent_message = await self._userbot.send_message(text=processed_text or original_text, chat_id=target_channel, parse_mode=parse_mode)
             
             logger.info(f"[FORWARDER] ✅ Переслано одиночное сообщение {message.id}")
-            return True
+            return sent_message
             
         except Exception as e:
-            if "CHAT_FORWARDS_RESTRICTED" in str(e):
+            if "FLOOD_WAIT" in str(e):
+                wait_time = int(re.search(r'(\d+)', str(e)).group(1))
+                logger.warning(f"[FORWARDER] FloodWait при пересылке одиночного сообщения {message.id}: пытаемся переключить сессию (ожидание {wait_time} секунд)")
+
+                # Пытаемся переключиться на другую сессию парсинга
+                try:
+                    new_userbot, new_session_alias = await self.get_userbot_with_fallback(task="parsing", current_session_alias=getattr(self._userbot, 'name', None))
+                    if new_userbot and new_userbot != self._userbot:
+                        logger.info(f"[FORWARDER] Переключаемся на сессию {new_session_alias} для повтора отправки сообщения {message.id}")
+                        self._userbot = new_userbot
+                        if not hasattr(self._userbot, 'is_connected') or not self._userbot.is_connected:
+                            await self._userbot.start()
+
+                        # Повторяем отправку с новой сессией
+                        await asyncio.sleep(min(wait_time, 10))  # Ждем не больше 10 секунд
+                        return await self._forward_single_message(message, target_channel, hide_sender, add_footer, forward_mode, config, text_mode, paid_content_stars)
+                    else:
+                        logger.warning(f"[FORWARDER] Нет доступных сессий для переключения, пропускаем сообщение {message.id}")
+                        return False
+                except Exception as switch_error:
+                    logger.error(f"[FORWARDER] Ошибка при переключении сессии: {switch_error}")
+                    return False
+            elif "CHAT_FORWARDS_RESTRICTED" in str(e):
                 logger.error(f"[FORWARDER] ❌ Канал {target_channel} запрещает пересылку контента: {e}")
                 logger.info(f"[FORWARDER] 💡 Попробуйте использовать режим 'copy' вместо 'forward' или убедитесь, что бот имеет права администратора в целевом канале")
             else:
@@ -857,7 +1005,6 @@ class TelegramForwarder:
         
         if text_mode == "hashtags_only":
             # Извлекаем только хэштеги
-            import re
             hashtags = re.findall(r'#\w+', text)
             return ' '.join(hashtags)
         elif text_mode == "no_text":
@@ -868,7 +1015,6 @@ class TelegramForwarder:
             return text
         else:
             # По умолчанию - только хэштеги
-            import re
             hashtags = re.findall(r'#\w+', text)
             return ' '.join(hashtags)
     
@@ -993,6 +1139,7 @@ class TelegramForwarder:
             self._forwarding_active[channel_id] = False
             if channel_id in self._counters:
                 self._counters[channel_id] = {
+                    'forwarded_count': 0,
                     'hashtag_paid_counter': 0,
                     'select_paid_counter': 0,
                     'media_group_paid_counter': 0,
@@ -1110,422 +1257,184 @@ class TelegramForwarder:
                 "last_activity": "N/A"
             }
 
-    async def forward_media_group(self, channel_id, group_id, target_channel, text_mode, add_footer, forward_mode, hide_sender, max_posts, callback=None, paid_content_stars=0, group_messages=None, config=None):
-        # --- ДОБАВЛЕНО: Проверка и инициализация userbot ---
+    async def forward_media_group(self, channel_id, group_id, target_channel, text_mode, add_footer, forward_mode, hide_sender, paid_content_stars, config, group_messages=None, callback=None, max_posts=None):
         if not self._userbot or not getattr(self._userbot, 'is_connected', False):
-            logger.warning("[FORWARDER] userbot не инициализирован или не подключён, пробую получить и запустить...")
-            self._userbot = await self.get_userbot(task="parsing")
-            if self._userbot and not getattr(self._userbot, 'is_connected', False):
-                await self._userbot.start()
+            logger.warning("[FORWARDER] userbot не инициализирован, попытка запуска...")
+            self._userbot, _ = await self.get_userbot_with_fallback(task="parsing")
             if not self._userbot or not getattr(self._userbot, 'is_connected', False):
-                logger.error("[FORWARDER] Не удалось инициализировать userbot для пересылки медиагруппы!")
-                return
-        # --- конец добавленного блока ---
-        logger.info(f"[FORWARDER] 🔍 forward_media_group: paid_content_stars={paid_content_stars} (тип: {type(paid_content_stars)})")
-        logger.info(f"[FORWARDER][DEBUG] Используемая приписка для медиагруппы (add_footer): {add_footer!r}")
-        if group_messages is not None:
-            group_msgs = group_messages
-        else:
-            group_msgs = self._media_group_buffers.get(channel_id, {}).get(str(group_id), [])
-        # Реальная проверка админа бота
-        is_bot_admin = False
-        if channel_id:
-            if channel_id not in self._is_bot_admin_cache:
-                self._is_bot_admin_cache[channel_id] = await self._is_bot_admin(channel_id)
-            is_bot_admin = self._is_bot_admin_cache[channel_id]
-        # --- Фильтрация по хэштегу только для режима парсинг+пересылка ---
-        if config and config.get('parse_mode') == 'hashtags' and config.get('hashtag_filter'):
-            if not self.group_has_hashtag(group_msgs, config['hashtag_filter']):
-                logger.info(f"[FORWARDER] В медиагруппе {group_id} нет сообщений с хэштегом '{config['hashtag_filter']}', пропускаем группу")
+                logger.error("[FORWARDER] Не удалось запустить userbot для медиагруппы!")
                 return 0
-        logger.info(f"[FORWARDER][DEBUG] Перед пересылкой медиагруппы {group_id}: {len(group_msgs)} файлов")
-        if not group_msgs or len(group_msgs) < 2:
-            logger.warning(f"[FORWARDER][SKIP] Медиагруппа {group_id} содержит менее 2 файлов после фильтрации, пропускаем!")
+
+        group_msgs = group_messages if group_messages is not None else self.media_groups.get(group_id, [])
+        
+        # Фильтрация и сортировка
+        original_count = len(group_msgs)
+        group_msgs = [msg for msg in group_msgs if (hasattr(msg, 'date') and msg.date is not None) or (hasattr(msg, 'edit_date') and msg.edit_date is not None)]
+        if not group_msgs:
+            logger.warning(f"[FORWARDER] Медиагруппа {group_id} не содержит валидных сообщений после фильтрации (было {original_count}).")
             return 0
-        group_msgs = sorted(group_msgs, key=lambda m: m.date)
-        group_caption = None
+        group_msgs.sort(key=lambda m: m.date if hasattr(m, 'date') and m.date is not None else m.edit_date)
+        
+        # Получаем оригинальный текст группы
+        group_caption = ""
         for m in group_msgs:
             if getattr(m, 'caption', None):
                 group_caption = m.caption
                 break
-        if text_mode == "no_text":
-            group_caption = ""
-        elif text_mode == "hashtags_only":
-            import re
-            hashtags = re.findall(r'#\w+', group_caption or "")
-            group_caption = " ".join(hashtags)
-        # Получаем настройки гиперссылки из конфигурации
-        footer_link = config.get("footer_link") if config else None
-        footer_link_text = config.get("footer_link_text") if config else None
-        footer_full_link = config.get("footer_full_link", False) if config else False
-        
-        logger.info(f"[FORWARDER][DEBUG] Config передан: {config is not None}")
-        logger.info(f"[FORWARDER][DEBUG] Настройки гиперссылки: footer_link={footer_link}, footer_link_text={footer_link_text}, footer_full_link={footer_full_link}")
-        
-        # Форматируем приписку с гиперссылкой, если настроена
+
+        # Обработка текста группы в соответствии с text_mode
+        logger.info(f"[FORWARDER] 📝 Оригинальный текст медиагруппы: {group_caption!r}")
+        group_caption = self._process_message_text(group_caption, text_mode)
+        logger.info(f"[FORWARDER] 📝 Обработанный текст медиагруппы (text_mode={text_mode}): {group_caption!r}")
+
+        # Добавляем приписку
         if add_footer:
-            logger.info(f"[FORWARDER][DEBUG] Исходная приписка: {add_footer!r}")
-            formatted_footer = self._format_footer_with_link(add_footer, footer_link, footer_link_text, footer_full_link)
-            logger.info(f"[FORWARDER][DEBUG] Отформатированная приписка: {formatted_footer!r}")
-            if group_caption:
-                group_caption = f"{group_caption}\n\n{formatted_footer}"
-            else:
-                group_caption = formatted_footer
-        group_message_ids = []
-        try:
-            if forward_mode == "forward":
-                # Пересылаем все сообщения медиагруппы одним вызовом
-                message_ids = [m.id for m in group_msgs]
-                await self._userbot.forward_messages(
+            group_caption = f"{group_caption}\n{add_footer}".strip()
+
+        sent_messages = []
+        
+        # --- ЛОГИКА ПЛАТНОГО КОНТЕНТА ДЛЯ МЕДИАГРУПП ---
+        if paid_content_stars > 0 and self.tg_bot:
+            is_bot_admin = await self._check_bot_admin_status(target_channel)
+            if is_bot_admin:
+                logger.info(f"[FORWARDER] 🌟 Попытка отправить медиагруппу {group_id} как платный контент ({paid_content_stars} звезд) в {target_channel}")
+                sent_messages = await self._send_paid_media_group(
                     chat_id=target_channel,
-                    from_chat_id=channel_id,
-                    message_ids=message_ids,
-                    hide_sender=hide_sender
+                    media_group=group_msgs,
+                    caption=group_caption,
+                    stars=paid_content_stars
                 )
-                group_message_ids.extend(message_ids)
-            else:
-                # Проверяем, нужно ли отправлять как платный контент
-                should_send_paid = paid_content_stars > 0 and self.tg_bot is not None
-                logger.info(f"[FORWARDER] 🎯 Должен ли отправлять платный контент для медиагруппы: {should_send_paid}, is_bot_admin={is_bot_admin}")
-                
-                if should_send_paid:
-                    logger.info(f"[FORWARDER] 🎯 Отправляем платную медиагруппу: {paid_content_stars} звезд")
-                    # Проверяем доступность чата для python-telegram-bot
-                    try:
-                        # Преобразуем target_channel в строку для Bot API
-                        target_channel_str = str(target_channel)
-                        await self.tg_bot.get_chat(target_channel_str)
-                    except Exception as e:
-                        if "Chat not found" in str(e) or "chat not found" in str(e):
-                            logger.warning(f"[FORWARDER] python-telegram-bot не может найти чат {target_channel}, используем Pyrogram")
-                            # Fallback на Pyrogram
-                            paid_content_stars = 0
-                        else:
-                            raise e
-                    
-                    if paid_content_stars > 0:
-                        # Отправляем через python-telegram-bot как платный контент
-                        media_list = []
-                        temp_files = []
-                        for m in group_msgs:
-                            if m.photo:
-                                media_type = 'photo'
-                                file_id = m.photo.file_id
-                                temp_file_path = None
-                                # Для платного контента всегда нужно скачивать файл, независимо от админства бота
-                                import tempfile
-                                ext = '.jpg'
-                                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                                    temp_file_path = tmp.name
-                                temp_file_path = await self._userbot.download_media(m, file_name=temp_file_path)
-                                if not temp_file_path or not os.path.exists(temp_file_path):
-                                    logger.error(f"[FORWARDER] Не удалось скачать файл для платного поста: message_id={getattr(m, 'id', None)}, media_type={media_type}")
-                                    continue
-                                temp_files.append(temp_file_path)
-                                media_list.append((media_type, file_id, temp_file_path))
-                            elif m.video:
-                                media_type = 'video'
-                                file_id = m.video.file_id
-                                temp_file_path = None
-                                # Для платного контента всегда нужно скачивать файл, независимо от админства бота
-                                import tempfile
-                                ext = '.mp4'
-                                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                                    temp_file_path = tmp.name
-                                temp_file_path = await self._userbot.download_media(m, file_name=temp_file_path)
-                                if not temp_file_path or not os.path.exists(temp_file_path):
-                                    logger.error(f"[FORWARDER] Не удалось скачать файл для платного поста: message_id={getattr(m, 'id', None)}, media_type={media_type}")
-                                    continue
-                                temp_files.append(temp_file_path)
-                                media_list.append((media_type, file_id, temp_file_path))
-                            elif getattr(m, 'document', None) and getattr(m.document, 'mime_type', None):
-                                if m.document.mime_type.startswith('image/'):
-                                    media_type = 'photo'
-                                    file_id = m.document.file_id
-                                    temp_file_path = None
-                                    # Для платного контента всегда нужно скачивать файл, независимо от админства бота
-                                    import tempfile
-                                    ext = '.jpg'
-                                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                                        temp_file_path = tmp.name
-                                    temp_file_path = await self._userbot.download_media(m, file_name=temp_file_path)
-                                    if not temp_file_path or not os.path.exists(temp_file_path):
-                                        logger.error(f"[FORWARDER] Не удалось скачать файл для платного поста: message_id={getattr(m, 'id', None)}, media_type={media_type}")
-                                        continue
-                                    temp_files.append(temp_file_path)
-                                    media_list.append((media_type, file_id, temp_file_path))
-                                elif m.document.mime_type.startswith('video/'):
-                                    media_type = 'video'
-                                    file_id = m.document.file_id
-                                    temp_file_path = None
-                                    # Для платного контента всегда нужно скачивать файл, независимо от админства бота
-                                    import tempfile
-                                    ext = '.mp4'
-                                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                                        temp_file_path = tmp.name
-                                    temp_file_path = await self._userbot.download_media(m, file_name=temp_file_path)
-                                    if not temp_file_path or not os.path.exists(temp_file_path):
-                                        logger.error(f"[FORWARDER] Не удалось скачать файл для платного поста: message_id={getattr(m, 'id', None)}, media_type={media_type}")
-                                        continue
-                                    temp_files.append(temp_file_path)
-                                    media_list.append((media_type, file_id, temp_file_path))
-                                else:
-                                    logger.warning(f"[FORWARDER] Документ {getattr(m, 'id', None)} с mime-type {m.document.mime_type} не поддерживается для платного контента")
-                                    continue
-                            else:
-                                logger.warning(f"[FORWARDER] Сообщение {getattr(m, 'id', None)} не поддерживается для платного контента: media={getattr(m, 'media', None)}, type={type(m)}")
-                                continue
-                        # Добавлено: если нет поддерживаемых файлов, не отправлять платную медиагруппу
-                        if not media_list:
-                            logger.warning(f"[FORWARDER] В медиагруппе {group_id} нет поддерживаемых файлов для платного контента (photo/video), пропускаем платную отправку.")
-                            return 0
-                        if media_list:
-                            try:
-                                # Формируем объекты для отправки (всегда используем файлы для платного контента)
-                                tg_media = []
-                                for mt, fid, tf in media_list:
-                                    if tf is None:
-                                        logger.warning(f"[FORWARDER] temp_file_path is None для {mt}, пропускаем")
-                                        continue
-                                    if mt == 'photo':
-                                        tg_media.append(InputPaidMediaPhoto(media=open(tf, 'rb')))
-                                    else:
-                                        tg_media.append(InputPaidMediaVideo(media=open(tf, 'rb')))
-                                # Проверяем, что есть медиа для отправки
-                                if not tg_media:
-                                    logger.warning(f"[FORWARDER] Нет медиа для отправки платного контента (все temp_file_path=None), отправляем как обычный контент")
-                                    paid_content_stars = 0
-                                else:
-                                    # Проверяем наличие HTML-разметки в caption
-                                    contains_html = "<a href=" in group_caption or "<b>" in group_caption or "<i>" in group_caption or "<code>" in group_caption
-                                    
-                                    result = await self.tg_bot.send_paid_media(
-                                        chat_id=str(target_channel),  # Преобразуем в строку для Bot API
-                                        star_count=paid_content_stars,
-                                        media=tg_media,
-                                        caption=group_caption,
-                                        parse_mode="html" if contains_html else None
-                                    )
-                                logger.info(f"[FORWARDER] ✅ Платная медиагруппа {group_id} отправлена через python-telegram-bot с {paid_content_stars} звездами")
-                                # Удаляем временные файлы после отправки платного контента
-                                for tf in temp_files:
-                                    try:
-                                        os.remove(tf)
-                                        logger.info(f"[FORWARDER] Временный файл удалён: {tf}")
-                                    except Exception as e:
-                                        logger.warning(f"[FORWARDER] Не удалось удалить временный файл {tf}: {e}")
-                            except Exception as e:
-                                if "Invalid paid media file specified" in str(e):
-                                    logger.warning(f"[FORWARDER][FALLBACK] Ошибка 'Invalid paid media file specified' при отправке платной медиагруппы {group_id}, отправляем как обычную через Pyrogram")
-                                    paid_content_stars = 0
-                                elif "Chat not found" in str(e) or "chat not found" in str(e):
-                                    logger.warning(f"[FORWARDER] Ошибка отправки платного поста через python-telegram-bot: {e}, используем Pyrogram")
-                                    group_message_ids = []
-                                    paid_content_stars = 0
-                                else:
-                                    # Удаляем временные файлы при ошибке
-                                    for tf in temp_files:
-                                        try:
-                                            os.remove(tf)
-                                        except Exception:
-                                            pass
-                                    raise e
-                        # Если платный контент не удался или был сброшен, отправляем через Pyrogram
-                        if paid_content_stars == 0:
-                            logger.info(f"[FORWARDER] 🔄 Отправляем медиагруппу через Pyrogram как обычный контент")
-                            # Отправляем через Pyrogram как обычный контент
-                            media_objs = []
-                            for i, m in enumerate(group_msgs):
-                                caption = group_caption if i == 0 and group_caption else None
-                                caption_entities = getattr(m, 'caption_entities', None)
-                                if m.photo:
-                                    media_obj = InputMediaPhoto(
-                                        media=m.photo.file_id,
-                                        caption=caption
-                                    )
-                                elif m.video:
-                                    media_obj = InputMediaVideo(
-                                        media=m.video.file_id,
-                                        caption=caption
-                                    )
-                                elif m.document:
-                                    media_obj = InputMediaDocument(
-                                        media=m.document.file_id,
-                                        caption=caption
-                                    )
-                                elif m.audio:
-                                    media_obj = InputMediaAudio(
-                                        media=m.audio.file_id,
-                                        caption=caption
-                                    )
-                                elif m.animation:
-                                    media_obj = InputMediaAnimation(
-                                        media=m.animation.file_id,
-                                        caption=caption
-                                    )
-                                else:
-                                    continue
-                                media_objs.append(media_obj)
-                                group_message_ids.append(m.id)
-                            
-                            if media_objs:
-                                logger.info(f"[FORWARDER][DEBUG] media_objs для отправки: {[type(obj).__name__ + ':' + getattr(obj, 'media', 'NO_MEDIA') for obj in media_objs]}")
-                                await self._userbot.send_media_group(
-                                    chat_id=target_channel,
-                                    media=media_objs
-                                )
-                            else:
-                                logger.warning(f"[FORWARDER][SKIP] media_objs пустой, медиагруппа {group_id} не будет отправлена!")
+                if sent_messages:
+                     logger.info(f"[FORWARDER] ✅ Платная медиагруппа {group_id} успешно отправлена.")
                 else:
-                    logger.info(f"[FORWARDER] 🔄 Отправляем медиагруппу через Pyrogram как обычный контент (paid_content_stars={paid_content_stars}, tg_bot={self.tg_bot is not None})")
-                    # Отправляем через Pyrogram как обычный контент
-                    media_objs = []
-                    for i, m in enumerate(group_msgs):
-                        caption = group_caption if i == 0 and group_caption else None
-                        caption_entities = getattr(m, 'caption_entities', None)
-                        if m.photo:
-                            media_obj = InputMediaPhoto(
-                                media=m.photo.file_id,
-                                caption=caption
-                            )
-                        elif m.video:
-                            media_obj = InputMediaVideo(
-                                media=m.video.file_id,
-                                caption=caption
-                            )
-                        elif m.document:
-                            media_obj = InputMediaDocument(
-                                media=m.document.file_id,
-                                caption=caption
-                            )
-                        elif m.audio:
-                            media_obj = InputMediaAudio(
-                                media=m.audio.file_id,
-                                caption=caption
-                            )
-                        elif m.animation:
-                            media_obj = InputMediaAnimation(
-                                media=m.animation.file_id,
-                                caption=caption
-                            )
-                        else:
-                            continue
-                        media_objs.append(media_obj)
-                        group_message_ids.append(m.id)
-                    
-                    if media_objs:
-                        logger.info(f"[FORWARDER][DEBUG] media_objs для отправки: {[type(obj).__name__ + ':' + getattr(obj, 'media', 'NO_MEDIA') for obj in media_objs]}")
-                        await self._userbot.send_media_group(
-                            chat_id=target_channel,
-                            media=media_objs
-                        )
-                    else:
-                        logger.warning(f"[FORWARDER][SKIP] media_objs пустой, медиагруппа {group_id} не будет отправлена!")
-            
-            paid_text = f" с платным контентом: {paid_content_stars} звездочек" if paid_content_stars > 0 else ""
-            logger.info(f"[FORWARDER] Медиагруппа {group_id} с {len(group_msgs)} файлами переслана в {target_channel}{paid_text}")
-            await self.db.save_media_group(channel_id, group_id, group_message_ids)
-            for msg_id in group_message_ids:
-                await self.db.mark_message_as_forwarded(channel_id, msg_id, target_channel)
-            self._media_group_buffers[channel_id].pop(group_id, None)
-            await self._save_to_posts_json(group_msgs, group_caption, channel_id)
-            if callback:
-                callback(1)
-            return 1
-        except Exception as e:
-            if "FLOOD_WAIT" in str(e):
-                import re
-                wait_time = int(re.search(r'(\d+)', str(e)).group(1))
-                logger.warning(f"[FORWARDER] FloodWait при пересылке медиагруппы {group_id}: ожидаем {wait_time} секунд")
-                await asyncio.sleep(wait_time)
-                return await self.forward_media_group(channel_id, group_id, target_channel, text_mode, add_footer, forward_mode, hide_sender, max_posts, callback, paid_content_stars, group_msgs, config)
-            elif "CHAT_FORWARDS_RESTRICTED" in str(e):
-                logger.error(f"[FORWARDER] ❌ Канал {target_channel} запрещает пересылку контента для медиагруппы {group_id}: {e}")
-                logger.info(f"[FORWARDER] 💡 Попробуйте использовать режим 'copy' вместо 'forward' или убедитесь, что бот имеет права администратора в целевом канале")
-                logger.info(f"[FORWARDER] 🔄 Пытаемся отправить медиагруппу через tg_bot как fallback...")
-                
-                # Fallback: попытка отправки через tg_bot, если доступен
-                if self.tg_bot:
-                    try:
-                        is_bot_admin = await self._check_bot_admin_status(target_channel)
-                        if is_bot_admin:
-                            logger.info(f"[FORWARDER] Отправляем медиагруппу {group_id} через tg_bot")
-                            for i, m in enumerate(group_msgs):
-                                caption = group_caption if i == 0 and group_caption else None
-                                if m.photo:
-                                    await self.tg_bot.send_photo(
-                                        chat_id=target_channel,
-                                        photo=m.photo.file_id,
-                                        caption=caption,
-                                        parse_mode='HTML' if caption else None
-                                    )
-                                elif m.video:
-                                    await self.tg_bot.send_video(
-                                        chat_id=target_channel,
-                                        video=m.video.file_id,
-                                        caption=caption,
-                                        parse_mode='HTML' if caption else None
-                                    )
-                                elif m.document:
-                                    await self.tg_bot.send_document(
-                                        chat_id=target_channel,
-                                        document=m.document.file_id,
-                                        caption=caption,
-                                        parse_mode='HTML' if caption else None
-                                    )
-                                # Небольшая задержка между сообщениями в группе
-                                if i < len(group_msgs) - 1:
-                                    await asyncio.sleep(0.5)
-                            
-                            logger.info(f"[FORWARDER] ✅ Медиагруппа {group_id} отправлена через tg_bot как fallback")
-                            await self.db.save_media_group(channel_id, group_id, group_message_ids)
-                            for msg_id in group_message_ids:
-                                await self.db.mark_message_as_forwarded(channel_id, msg_id, target_channel)
-                            self._media_group_buffers[channel_id].pop(group_id, None)
-                            await self._save_to_posts_json(group_msgs, group_caption, channel_id)
-                            if callback:
-                                callback(1)
-                            return 1
-                        else:
-                            logger.error(f"[FORWARDER] Бот не является админом в канале {target_channel}, не можем отправить медиагруппу")
-                    except Exception as fallback_error:
-                        logger.error(f"[FORWARDER] Ошибка fallback отправки через tg_bot: {fallback_error}")
-                
-                logger.info(f"[FORWARDER] Медиагруппа {group_id} с {len(group_msgs)} файлами НЕ переслана из-за ограничений канала")
-                return 0
+                    logger.warning(f"[FORWARDER] ⚠️ Не удалось отправить медиагруппу {group_id} как платный контент. Попытка отправки как обычный пост...")
             else:
-                logger.error(f"[FORWARDER] Ошибка при пересылке медиагруппы {group_id}: {e}")
-                logger.error(f"[FORWARDER] Полная ошибка: {traceback.format_exc()}")
+                 logger.warning(f"[FORWARDER] Бот не является админом в {target_channel}, не могу отправить платный контент.")
+
+        # --- ОБЫЧНАЯ ПЕРЕСЫЛКА (ЕСЛИ НЕ ПЛАТНЫЙ КОНТЕНТ) ---
+        if not sent_messages:
+            try:
+                media_objs = []
+                watermarked_files = []  # Список для отслеживания временных файлов
+                
+                for i, m in enumerate(group_msgs):
+                    caption_to_send = group_caption if i == 0 else None
+                    
+                    if m.photo:
+                        # Проверяем, нужно ли применить watermark
+                        watermarked_path = None
+                        if self._should_apply_watermark(m, config):
+                            logger.info(f"[FORWARDER] Применяем watermark к фото {i+1} в медиагруппе {group_id}")
+                            watermarked_path = await self._apply_watermark_to_photo(m, config)
+                            if watermarked_path:
+                                watermarked_files.append(watermarked_path)
+                        
+                        if watermarked_path:
+                            media_objs.append(InputMediaPhoto(watermarked_path, caption=caption_to_send))
+                        else:
+                            media_objs.append(InputMediaPhoto(m.photo.file_id, caption=caption_to_send))
+                    elif m.video:
+                        media_objs.append(InputMediaVideo(m.video.file_id, caption=caption_to_send))
+
+                if media_objs:
+                    sent_messages = await self._userbot.send_media_group(chat_id=target_channel, media=media_objs)
+                    
+                    # Удаляем временные файлы после отправки
+                    if watermarked_files:
+                        self.watermark_processor.cleanup_temp_files(*watermarked_files)
+            
+            except Exception as e:
+                logger.error(f"[FORWARDER] ❌ Ошибка пересылки медиагруппы {group_id} в канал {target_channel}: {e}")
                 return 0
 
-    async def start_forwarding_parsing(self, source_channel: str, target_channel: str, config: dict, callback: Optional[Callable] = None):
-        """Запуск парсинга + пересылки (background task)"""
-        userbot = await self.get_userbot(task="parsing")
-        sessions = await self.session_manager.get_sessions_for_task("parsing") if self.session_manager else []
-        alias = sessions[0].alias if sessions else 'unknown'
-        logger.info(f"[FORWARDER][PARSING] Используется сессионный файл: {getattr(userbot, 'name', None)}, alias: {alias}, is_connected: {getattr(userbot, 'is_connected', None)}")
-        if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
-            await userbot.start()
-        task_id = self.create_parse_forward_task(source_channel, target_channel, config)
+        # --- ОБРАБОТКА РЕЗУЛЬТАТА ---
+        if sent_messages:
+            if not isinstance(sent_messages, list):
+                sent_messages = [sent_messages]
+
+            logger.info(f"[FORWARDER] ✅ Медиагруппа {group_id} ({len(group_msgs)} файлов) переслана в {target_channel}.")
+            reactions_enabled = config.get('reactions_enabled', False)
+            reaction_emojis = config.get('reaction_emojis', [])
+            
+            if reactions_enabled and reaction_emojis and self.reaction_manager:
+                try:
+                    if sent_messages and hasattr(sent_messages[0], 'id'):
+                        first_message_id = sent_messages[0].id
+                        logger.info(f"[REACTIONS] Умное проставление реакций на медиагруппу: канал {target_channel}, сообщение {first_message_id}")
+                        await self.reaction_manager.add_reactions_smart(
+                            chat_id=target_channel,
+                            message_id=first_message_id,
+                            available_reactions=reaction_emojis
+                        )
+                    else:
+                        logger.warning(f"[REACTIONS] Не удалось получить ID сообщения для реакции на медиагруппу в канале {target_channel}.")
+                except Exception as e:
+                    logger.error(f"[REACTIONS] Ошибка реакции на медиагруппу: {e}")
+            return 1
+        
+        return 0
+
+    async def start_forwarding_parsing(self, source_channel: str, target_channels: List[str], config: dict, callback: Optional[Callable] = None):
+        """Запуск парсинга + пересылки (background task) с поддержкой переключения сессий при FloodWait"""
+        task_id = self.create_parse_forward_task(source_channel, target_channels, config)
         task_info = self._parse_forward_tasks[task_id]
         
-        # Создаем background task
+        # Создаем background task с поддержкой переключения сессий
         async def run_parse_forward():
+            current_session_alias = None
+            userbot = None
+            forwarded_count = 0
+
             try:
-                # ДОБАВЛЕНО: Проверка и запуск userbot внутри таска (на всякий случай)
+                # Получаем первую сессию для парсинга
+                userbot, current_session_alias = await self.get_userbot_with_fallback(task="parsing")
+                if not userbot:
+                    raise Exception("Не удалось получить userbot для парсинга")
+
+                # Запускаем сессию если нужно
                 if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
                     await userbot.start()
+
                 logger.info(f"[FORWARDER] 🚀 ЗАПУСК ПАРСИНГА + ПЕРЕСЫЛКИ (НЕ МОНИТОРИНГА!)")
-                logger.info(f"[FORWARDER] Источник: {source_channel} -> Цель: {target_channel}")
+                logger.info(f"[FORWARDER] Источник: {source_channel} -> Цели: {target_channels}")
                 logger.info(f"[FORWARDER] Конфигурация: {config}")
                 logger.info(f"[FORWARDER] 🔍 ПЛАТНЫЕ ЗВЕЗДЫ: {config.get('paid_content_stars', 0)} (тип: {type(config.get('paid_content_stars', 0))})")
                 logger.info(f"[FORWARDER] 🔍 Все ключи конфигурации: {list(config.keys())}")
-                
-                # Получаем информацию о канале
-                if str(source_channel).startswith("-100"):
-                    channel = await userbot.get_chat(int(source_channel))
-                else:
-                    channel = await userbot.get_chat(source_channel)
+                logger.info(f"[FORWARDER] 🔍 Используется сессия: {current_session_alias}")
+
+                # Функция для получения информации о канале с обработкой FloodWait
+                async def get_channel_info_with_retry():
+                    nonlocal userbot, current_session_alias
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            if str(source_channel).startswith("-100"):
+                                channel = await userbot.get_chat(int(source_channel))
+                            else:
+                                channel = await userbot.get_chat(source_channel)
+                            return channel
+                        except FloodWait as e:
+                            logger.warning(f"[FORWARDER] FloodWait при получении информации о канале (попытка {attempt + 1}/{max_retries}): {e}")
+                            if attempt < max_retries - 1:
+                                # Переключаемся на следующую сессию
+                                new_userbot, new_alias = await self.get_userbot_with_fallback(task="parsing", current_session_alias=current_session_alias)
+                                if new_userbot:
+                                    userbot = new_userbot
+                                    current_session_alias = new_alias
+                                    if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
+                                        await userbot.start()
+                                    await asyncio.sleep(e.value)  # Ждем время FloodWait
+                                else:
+                                    raise Exception("Нет доступных сессий для переключения")
+                            else:
+                                raise e
+                        except Exception as e:
+                            if attempt == max_retries - 1:
+                                raise e
+                            logger.warning(f"[FORWARDER] Ошибка при получении информации о канале (попытка {attempt + 1}/{max_retries}): {e}")
+
+                # Получаем информацию о канале с повторными попытками
+                channel = await get_channel_info_with_retry()
                 channel_id = channel.id
                 channel_name = channel.username or str(channel_id)
                 channel_title = getattr(channel, "title", None)
@@ -1556,78 +1465,103 @@ class TelegramForwarder:
                 paid_content_stars = config.get("paid_content_stars", 0)
                 
                 # --- Новые настройки режимов парсинга ---
-                parse_direction = config.get("parse_direction", "forward")  # "forward" или "backward"
-                media_filter = config.get("media_filter", "all")  # "all" или "media_only"
+                parse_direction = config.get("parse_direction", "backward")  # "forward" или "backward" - по умолчанию backward для избежания FloodWait
+                media_filter = config.get("media_filter", "media_only")  # "all" или "media_only"
                 range_mode = config.get("range_mode", "all")  # "all" или "range"
                 range_start_id = config.get("range_start_id")
                 range_end_id = config.get("range_end_id")
+
+                limit = 0
+                if max_posts and max_posts > 0:
+                    # Умножаем на 5, чтобы получить достаточное количество сообщений для поиска нужного числа постов
+                    limit = max_posts * 5
+                elif range_mode != 'range':
+                    # Если нет лимита и не режим диапазона, ставим большой лимит для парсинга
+                    limit = 2000
                 
-                logger.info(f"[FORWARDER] ⚙️ Настройки: режим={parse_mode}, хэштег='{hashtag_filter}', лимит={max_posts}, задержка={delay_seconds}с, платные={paid_content_stars}⭐")
-                logger.info(f"[FORWARDER] 🔍 Новые режимы: направление={parse_direction}, фильтр медиа={media_filter}, диапазон={range_mode}")
-                if range_mode == "range":
-                    logger.info(f"[FORWARDER] 🔍 Диапазон: с {range_start_id} по {range_end_id}")
-                logger.info(f"[FORWARDER] 🔍 ПЛАТНЫЕ ЗВЕЗДЫ В НАСТРОЙКАХ: {paid_content_stars} (тип: {type(paid_content_stars)})")
+                logger.info(f"[FORWARDER] 🔍 Настройки парсинга: лимит сообщений={limit}, направление='{parse_direction}', фильтр='{media_filter}', диапазон='{range_mode}'")
                 
-                if not target_channel:
-                    raise Exception("Не указан целевой канал для пересылки")
-                
-                logger.info(f"[FORWARDER] 🔍 Начинаем получение истории сообщений из канала {channel_name}...")
-                
-                forwarded_count = 0
-                last_message_id = None
-                
-                
-                # Сначала собираем сообщения и группируем медиагруппы
+                # --- Получение сообщений ---
                 all_messages = []
                 media_groups = {}
                 try:
                     # Определяем лимит сообщений в зависимости от направления парсинга
                     if parse_direction == "forward":
-                        # Для направления "от старых к новым" получаем ВСЕ сообщения
-                        logger.info(f"[FORWARDER] 🔍 Направление 'от старых к новым' - получаем ВСЕ сообщения из канала {channel_id}...")
-                        history_limit = None
-                    else:
-                        # Для направления "от новых к старым" получаем только нужное количество
+                        # Для направления "от старых к новым" используем большой лимит вместо полного обхода
+                        # Это предотвращает FloodWait от полного обхода канала
                         if max_posts and max_posts > 0:
-                            # Берем в 2-3 раза больше лимита для учета медиагрупп и фильтров
-                            history_limit = max_posts * 3
-                            logger.info(f"[FORWARDER] 🔍 Направление 'от новых к старым' - получаем {history_limit} сообщений (лимит {max_posts} * 3) из канала {channel_id}...")
+                            history_limit = min(max_posts * 20, 50000)  # Максимум 50к сообщений для безопасности
+                            logger.info(f"[FORWARDER] 🔍 Направление 'от старых к новым' - получаем до {history_limit} сообщений (лимит {max_posts} постов * 20) из канала {channel_id}...")
+                        else:
+                            # Если лимит постов не задан, используем разумное ограничение
+                            history_limit = 10000  # 10к сообщений максимум для избежания FloodWait
+                            logger.info(f"[FORWARDER] 🔍 Направление 'от старых к новым' без лимита постов - получаем до {history_limit} сообщений из канала {channel_id}...")
+                            logger.warning(f"[FORWARDER] ⚠️  ВНИМАНИЕ: Получение большого количества сообщений может вызвать FloodWait! Рассмотрите установку лимита постов.")
+                    else:
+                        # Для направления "от новых к старым" получаем достаточное количество
+                        if max_posts and max_posts > 0:
+                            # Берем значительно больше лимита для учета фильтров и медиагрупп
+                            # Увеличиваем множитель до 10, чтобы учесть фильтрацию по медиа и хэштегам
+                            history_limit = max_posts * 10
+                            logger.info(f"[FORWARDER] 🔍 Направление 'от новых к старым' - получаем {history_limit} сообщений (лимит {max_posts} постов * 10) из канала {channel_id}...")
                         else:
                             # Если лимит не задан, берем разумное количество последних сообщений
                             history_limit = 1000
                             logger.info(f"[FORWARDER] 🔍 Направление 'от новых к старым' без лимита - получаем {history_limit} последних сообщений из канала {channel_id}...")
                     
                     message_count = 0
-                    
-                    # Получаем сообщения с учетом лимита
-                    async for message in userbot.get_chat_history(channel_id, limit=history_limit):
+
+                    # Функция для получения сообщений с поддержкой FloodWait
+                    async def get_chat_history_with_retry():
+                        nonlocal userbot, current_session_alias
+                        messages_collected = []
+                        media_groups_collected = {}
+
                         try:
-                            all_messages.append(message)
-                            message_count += 1
-                            
-                            # Логируем прогресс
-                            if history_limit is None:
-                                # Для получения всех сообщений логируем каждую тысячу
-                                if message_count % 1000 == 0:
-                                    logger.info(f"[FORWARDER] 📊 Получено {message_count} сообщений, текущее: ID {message.id}, дата: {message.date}")
+                            async for message in userbot.get_chat_history(channel_id, limit=history_limit):
+                                try:
+                                    messages_collected.append(message)
+                                    nonlocal message_count
+                                    message_count += 1
+
+                                    # Логируем прогресс
+                                    # Для ограниченного количества логируем каждые 100 или 500 сообщений
+                                    log_interval = min(500, max(100, history_limit // 10))
+                                    if message_count % log_interval == 0:
+                                        logger.info(f"[FORWARDER] 📊 Получено {message_count}/{history_limit} сообщений, текущее: ID {message.id}, дата: {message.date}")
+
+                                    # Группируем сообщения по media_group_id
+                                    if getattr(message, 'media_group_id', None):
+                                        group_id = message.media_group_id
+                                        if group_id not in media_groups_collected:
+                                            media_groups_collected[group_id] = []
+                                        media_groups_collected[group_id].append(message)
+                                except (ValueError, KeyError) as e:
+                                    if ("Peer id invalid" in str(e)) or ("ID not found" in str(e)):
+                                        logger.warning(f"[FORWARDER][SKIP] Сообщение пропущено из-за ошибки peer: {e}")
+                                        continue
+                                    else:
+                                        raise
+                        except FloodWait as e:
+                            logger.warning(f"[FORWARDER] FloodWait при получении истории сообщений: {e}")
+                            # Переключаемся на следующую сессию
+                            new_userbot, new_alias = await self.get_userbot_with_fallback(task="parsing", current_session_alias=current_session_alias)
+                            if new_userbot:
+                                userbot = new_userbot
+                                current_session_alias = new_alias
+                                if not hasattr(userbot, 'is_connected') or not userbot.is_connected:
+                                    await userbot.start()
+                                logger.info(f"[FORWARDER] Переключились на сессию {current_session_alias}, ждем {e.value} секунд")
+                                await asyncio.sleep(e.value)
+                                # Рекурсивно продолжаем с новой сессии
+                                return await get_chat_history_with_retry()
                             else:
-                                # Для ограниченного количества логируем каждые 100 или 500 сообщений
-                                log_interval = min(500, max(100, history_limit // 10))
-                                if message_count % log_interval == 0:
-                                    logger.info(f"[FORWARDER] 📊 Получено {message_count}/{history_limit} сообщений, текущее: ID {message.id}, дата: {message.date}")
-                            
-                            # Группируем сообщения по media_group_id
-                            if getattr(message, 'media_group_id', None):
-                                group_id = message.media_group_id
-                                if group_id not in media_groups:
-                                    media_groups[group_id] = []
-                                media_groups[group_id].append(message)
-                        except (ValueError, KeyError) as e:
-                            if ("Peer id invalid" in str(e)) or ("ID not found" in str(e)):
-                                logger.warning(f"[FORWARDER][SKIP] Сообщение пропущено из-за ошибки peer: {e}")
-                                continue
-                            else:
-                                raise
+                                raise Exception("Нет доступных сессий для переключения при FloodWait")
+
+                        return messages_collected, media_groups_collected
+
+                    # Получаем сообщения с поддержкой FloodWait
+                    all_messages, media_groups = await get_chat_history_with_retry()
                     
                     # Показываем информацию о самом старом и новом сообщении
                     if all_messages:
@@ -1635,19 +1569,16 @@ class TelegramForwarder:
                         newest_msg = max(all_messages, key=lambda x: x.date)
                         logger.info(f"[FORWARDER] 📅 Самое старое сообщение: ID {oldest_msg.id}, дата: {oldest_msg.date}")
                         logger.info(f"[FORWARDER] 📅 Самое новое сообщение: ID {newest_msg.id}, дата: {newest_msg.date}")
-                    
-                    if history_limit is None:
-                        logger.info(f"[FORWARDER] ✅ Собрано {len(all_messages)} сообщений (все из канала), найдено {len(media_groups)} медиагрупп")
-                    else:
-                        logger.info(f"[FORWARDER] ✅ Собрано {len(all_messages)} сообщений (лимит: {history_limit}), найдено {len(media_groups)} медиагрупп")
+
+                    logger.info(f"[FORWARDER] ✅ Собрано {len(all_messages)} сообщений (лимит: {history_limit}), найдено {len(media_groups)} медиагрупп")
+                    if parse_direction == "forward" and not max_posts:
+                        logger.info(f"[FORWARDER] ℹ️  Для получения большего количества сообщений установите лимит постов в настройках")
                     # Явно заполняем буфер медиагрупп ДО пересылки
                     if channel_id not in self._media_group_buffers:
                         self._media_group_buffers[channel_id] = {}
                     temp_media_groups = {str(group_id): msgs for group_id, msgs in media_groups.items()}
                     self._media_group_buffers[channel_id] = temp_media_groups
-                    for group_id, msgs in temp_media_groups.items():
-                        logger.info(f"[FORWARDER][DEBUG] Буфер для медиагруппы {group_id}: {len(msgs)} файлов")
-                    logger.info(f"[FORWARDER][DEBUG] Буфер медиагрупп заполнен: {len(self._media_group_buffers[channel_id])} групп для канала {channel_id}")
+                    logger.debug(f"[FORWARDER] Буфер медиагрупп заполнен: {len(self._media_group_buffers[channel_id])} групп для канала {channel_id}")
                 except Exception as e:
                     logger.error(f"[FORWARDER] Ошибка при сборе истории: {e}")
                     task_info["status"] = "error"
@@ -1665,7 +1596,7 @@ class TelegramForwarder:
                         self.media_groups[group_id].append(message)
                 # --- ВАЖНО: Заполняем буфер медиагрупп ДО пересылки ---
                 self._media_group_buffers[channel_id] = {str(gid): msgs for gid, msgs in self.media_groups.items()}
-                logger.info(f"[FORWARDER] Буфер медиагрупп заполнен: {len(self._media_group_buffers[channel_id])} групп для канала {channel_id}")
+                logger.debug(f"[FORWARDER] Буфер медиагрупп заполнен: {len(self._media_group_buffers[channel_id])} групп для канала {channel_id}")
                 # --- Применяем новые фильтры и сортировку ---
                 
                 # 1. Фильтрация по диапазону ID
@@ -1679,23 +1610,69 @@ class TelegramForwarder:
                     all_messages = [msg for msg in all_messages if msg.media is not None]
                     after_count = len(all_messages)
                     logger.info(f"[FORWARDER] 🔍 После фильтрации по медиа: {after_count} сообщений (исключено {before_count - after_count} текстовых)")
-                    
+
+                    # Подсчитываем медиагруппы среди оставшихся сообщений
+                    media_groups_count = len(set(msg.media_group_id for msg in all_messages if getattr(msg, 'media_group_id', None)))
+                    single_media_count = len([msg for msg in all_messages if msg.media and not getattr(msg, 'media_group_id', None)])
+                    total_posts_estimated = media_groups_count + single_media_count
+                    logger.info(f"[FORWARDER] 📊 После фильтрации: {media_groups_count} медиагрупп + {single_media_count} одиночных = ~{total_posts_estimated} постов")
+
                     # Показываем информацию о первых пропущенных сообщениях
                     if before_count > after_count:
-                        # ИСПРАВЛЕНО: Получаем исходный список ДО фильтрации для анализа
-                        async for msg in userbot.get_chat_history(channel_id, limit=20):
-                            if msg.media is None:
-                                no_media_messages = [msg for msg in [msg] if msg.media is None]  # Временный список для примера
-                                if no_media_messages:
-                                    logger.info(f"[FORWARDER] 📝 Пример пропущенного текстового сообщения:")
-                                    msg = no_media_messages[0]
-                                    preview = (msg.text or "")[:50] + "..." if len(msg.text or "") > 50 else (msg.text or "")
-                                    logger.info(f"[FORWARDER]   ID {msg.id}: '{preview}'")
-                                    break
+                        logger.info(f"[FORWARDER] 📝 Исключено {before_count - after_count} текстовых сообщений")
                 else:
-                    logger.info(f"[FORWARDER] 🔍 Фильтр медиа отключен: {len(all_messages)} сообщений")
+                    # Подсчитываем потенциальные посты без фильтрации
+                    all_groups_count = len(set(msg.media_group_id for msg in all_messages if getattr(msg, 'media_group_id', None)))
+                    all_single_count = len([msg for msg in all_messages if msg.media and not getattr(msg, 'media_group_id', None)])
+                    all_text_count = len([msg for msg in all_messages if not msg.media])
+                    logger.info(f"[FORWARDER] 🔍 Фильтр медиа отключен: {len(all_messages)} сообщений ({all_groups_count} групп + {all_single_count} медиа + {all_text_count} текста)")
                 
-                # 3. Сортировка по направлению
+                # 3. Проверяем количество доступных постов после фильтрации
+                if max_posts and max_posts > 0 and parse_direction == "backward":
+                    # Подсчитываем доступные посты
+                    available_groups = set(msg.media_group_id for msg in all_messages if getattr(msg, 'media_group_id', None))
+                    available_singles = len([msg for msg in all_messages if msg.media and not getattr(msg, 'media_group_id', None)])
+                    total_available_posts = len(available_groups) + available_singles
+
+                    logger.info(f"[FORWARDER] 📊 Доступно постов после фильтрации: {total_available_posts} (лимит: {max_posts})")
+
+                    # Если доступных постов меньше лимита и мы можем получить больше сообщений
+                    if total_available_posts < max_posts and history_limit and len(all_messages) >= history_limit:
+                        additional_limit = (max_posts - total_available_posts) * 5  # Получаем дополнительные сообщения
+                        logger.info(f"[FORWARDER] 🔄 Недостаточно постов ({total_available_posts} < {max_posts}), получаем дополнительные {additional_limit} сообщений...")
+
+                        additional_messages = []
+                        oldest_message = min(all_messages, key=lambda x: x.date) if all_messages else None
+
+                        if oldest_message:
+                            async for message in userbot.get_chat_history(channel_id, limit=additional_limit, offset_id=oldest_message.id):
+                                if message.date < oldest_message.date:  # Только более старые сообщения
+                                    additional_messages.append(message)
+
+                            if additional_messages:
+                                logger.info(f"[FORWARDER] ➕ Получено {len(additional_messages)} дополнительных сообщений")
+
+                                # Применяем фильтры к дополнительным сообщениям
+                                if media_filter == "media_only":
+                                    additional_messages = [msg for msg in additional_messages if msg.media is not None]
+
+                                if range_mode == "range" and range_start_id and range_end_id:
+                                    additional_messages = [msg for msg in additional_messages if range_start_id <= msg.id <= range_end_id]
+
+                                # Добавляем к основному списку
+                                all_messages.extend(additional_messages)
+
+                                # Перегруппировываем медиагруппы
+                                for message in additional_messages:
+                                    if getattr(message, 'media_group_id', None):
+                                        group_id = message.media_group_id
+                                        if group_id not in media_groups:
+                                            media_groups[group_id] = []
+                                        media_groups[group_id].append(message)
+
+                                logger.info(f"[FORWARDER] ✅ После добавления: {len(all_messages)} сообщений, {len(media_groups)} медиагрупп")
+
+                # 4. Сортировка по направлению
                 if parse_direction == "backward":
                     # От новых к старым (по умолчанию)
                     all_messages.sort(key=lambda x: x.date, reverse=True)
@@ -1707,271 +1684,95 @@ class TelegramForwarder:
                 
                 logger.info(f"[FORWARDER] 🚀 Начинаем пересылку сообщений (направление: {parse_direction}, фильтр: {media_filter}, диапазон: {range_mode})...")
                 
-                # Показываем информацию о первом и последнем сообщении для проверки
-                if all_messages:
-                    first_msg = all_messages[0]
-                    last_msg = all_messages[-1]
-                    logger.info(f"[FORWARDER] 📊 Первое сообщение: ID {first_msg.id}, дата: {first_msg.date}")
-                    logger.info(f"[FORWARDER] 📊 Последнее сообщение: ID {last_msg.id}, дата: {last_msg.date}")
-                    if parse_direction == "forward":
-                        logger.info(f"[FORWARDER] ✅ Подтверждение: парсинг начнется с ID {first_msg.id} (самое старое)")
-                    else:
-                        logger.info(f"[FORWARDER] ✅ Подтверждение: парсинг начнется с ID {first_msg.id} (самое новое)")
-                
-                print(f'=== [DEBUG] Начинаем цикл по сообщениям (направление: {parse_direction}, фильтр: {media_filter}) ===')
-                # --- ОБРАБАТЫВАЕМ ВСЕ СООБЩЕНИЯ В ХРОНОЛОГИЧЕСКОМ ПОРЯДКЕ ---
                 processed_groups = set()
-                hashtag_paid_counter = 0
-                select_paid_counter = 0
-                media_group_paid_counter = 0
-                self._parsing_group_hashtag_paid_counter = 0
-                
-                # Подсчитываем, сколько сообщений могут быть платными
-                paid_eligible_count = 0
-                for msg in all_messages:
-                    if msg.media:
-                        media_type = msg.media.value
-                        if media_type in ['photo', 'video']:
-                            paid_eligible_count += 1
-                
-                logger.info(f"[FORWARDER] 📊 Всего сообщений: {len(all_messages)}, могут быть платными: {paid_eligible_count}")
-                if paid_content_mode == "select":
-                    paid_content_every = config.get('paid_content_every', 1)
-                    if paid_content_every > 0:
-                        expected_paid = paid_eligible_count // paid_content_every
-                        logger.info(f"[FORWARDER] 📊 Ожидается платных постов: {expected_paid} (каждый {paid_content_every}-й из {paid_eligible_count} подходящих)")
-                
-                # Обрабатываем все сообщения в хронологическом порядке
+                posts_to_forward = []
+
+                # --- ЭТАП 1: СБОР ПОСТОВ ДЛЯ ПЕРЕСЫЛКИ ---
+                posts_to_forward = []
+                processed_groups = set()
+                logger.info(f"[FORWARDER] --- НАЧАЛО ЭТАПА 1: СБОР ПОСТОВ (лимит: {max_posts}) ---")
+
                 for message in all_messages:
-                    try:
-                        # Проверяем лимит
-                        if max_posts and max_posts > 0 and forwarded_count >= max_posts:
-                            logger.info(f"[FORWARDER] Достигнут лимит пересылок ({max_posts}), останавливаем парсинг")
-                            break
-                        
-                        # Проверяем, не пересылали ли уже это сообщение
-                        try:
-                            is_forwarded = await self.db.is_message_forwarded(message.chat.id, message.id, target_channel)
-                        except (ValueError, KeyError) as e:
-                            if ("Peer id invalid" in str(e)) or ("ID not found" in str(e)):
-                                logger.warning(f"[FORWARDER][SKIP] Сообщение {getattr(message, 'id', None)} пропущено из-за ошибки peer: {e}")
-                                continue
-                            else:
-                                raise
-                        if is_forwarded:
-                            logger.info(f"[FORWARDER] Сообщение {message.id} уже переслано, пропускаем")
-                            continue
-                        
-                        # --- ДОБАВЛЕНО: фильтр одиночных сообщений по media_only ---
-                        if media_filter == "media_only" and not getattr(message, 'media', None):
-                            logger.info(f"[FORWARDER] Сообщение {getattr(message, 'id', None)} без медиа, пропускаем (media_only, мониторинг)")
-                            return
-                        
-                        # --- ОБРАБОТКА МЕДИАГРУПП ---
-                        if getattr(message, 'media_group_id', None):
-                            group_id = message.media_group_id
-                            
-                            # Если медиагруппа уже обработана, пропускаем
-                            if group_id in processed_groups:
-                                continue
-                            
-                            # Получаем все сообщения медиагруппы
-                            group_msgs = media_groups.get(group_id, [])
-                            if not group_msgs:
-                                logger.warning(f"[FORWARDER] Медиагруппа {group_id} не найдена в буфере, пропускаем")
-                                continue
-                            
-                            print(f'=== [DEBUG] Обработка медиагруппы {group_id}, файлов: {len(group_msgs)} ===')
-                            
-                            # --- Фильтрация по хэштегу ---
-                            if parse_mode == "hashtags" and hashtag_filter and hashtag_filter.strip():
-                                if not self.group_has_hashtag(group_msgs, hashtag_filter):
-                                    logger.info(f"[FORWARDER] Медиагруппа {group_id} не содержит хэштег '{hashtag_filter}', пропускаем всю группу")
-                                    processed_groups.add(group_id)
-                                    continue
-                            
-                            # --- Определяем платность медиагруппы ---
-                            group_is_paid = False
-                            if paid_content_mode == "off" or not paid_content_mode:
-                                group_is_paid = False
-                            elif paid_content_mode == "hashtag":
-                                for m in group_msgs:
-                                    t = (m.text or m.caption or "").lower()
-                                    if paid_content_hashtag and paid_content_hashtag.lower() in t:
-                                        group_is_paid = True
-                                        break
-                            elif paid_content_mode == "random":
-                                import random
-                                if paid_content_chance and random.randint(1, 10) <= int(paid_content_chance):
-                                    group_is_paid = True
-                            elif paid_content_mode == "hashtag_random":
-                                import random
-                                for m in group_msgs:
-                                    t = (m.text or m.caption or "").lower()
-                                    if paid_content_hashtag and paid_content_hashtag.lower() in t:
-                                        if paid_content_chance and random.randint(1, 10) <= int(paid_content_chance):
-                                            group_is_paid = True
-                                            break
-                            elif paid_content_mode == "select":
-                                # Проверяем, может ли медиагруппа быть платной (только если содержит фото/видео)
-                                can_be_paid = False
-                                for m in group_msgs:
-                                    if m.media:
-                                        media_type = m.media.value
-                                        if media_type in ['photo', 'video']:
-                                            can_be_paid = True
-                                            break
-                                
-                                if can_be_paid:
-                                    media_group_paid_counter += 1
-                                    every = config.get('paid_content_every', 1)
-                                    try:
-                                        every = int(every)
-                                    except Exception:
-                                        every = 1
-                                    if every > 0 and (media_group_paid_counter % every == 0):
-                                        group_is_paid = True
-                                        logger.info(f"[FORWARDER] 🎯 Медиагруппа {group_id} будет платной (счетчик: {media_group_paid_counter}, каждый: {every})")
-                                    else:
-                                        logger.info(f"[FORWARDER] 🔄 Медиагруппа {group_id} будет обычной (счетчик: {media_group_paid_counter}, каждый: {every})")
-                                else:
-                                    logger.info(f"[FORWARDER] ⚠️ Медиагруппа {group_id} не может быть платной (нет фото/видео)")
-                            elif paid_content_mode == "hashtag_select":
-                                group_hashtag = False
-                                for m in group_msgs:
-                                    t = (m.text or m.caption or "").lower()
-                                    if paid_content_hashtag and paid_content_hashtag.lower() in t:
-                                        group_hashtag = True
-                                        break
-                                if group_hashtag:
-                                    self._parsing_group_hashtag_paid_counter += 1
-                                    every = config.get('paid_content_every', 1)
-                                    try:
-                                        every = int(every)
-                                    except Exception:
-                                        every = 1
-                                    if every > 0 and (self._parsing_group_hashtag_paid_counter % every == 0):
-                                        group_is_paid = True
-                            else:
-                                group_is_paid = False
-                            
-                            logger.info(f"[FORWARDER] Обрабатываем медиагруппу {group_id} с {len(group_msgs)} файлами, платная: {group_is_paid}")
-                            
-                            # Пересылаем медиагруппу
-                            try:
-                                await self.forward_media_group(
-                                    channel_id,
-                                    group_id,
-                                    target_channel,
-                                    text_mode,
-                                    add_footer,
-                                    forward_mode,
-                                    hide_sender,
-                                    max_posts,
-                                    callback,
-                                    paid_content_stars if group_is_paid else 0,
-                                    group_msgs,
-                                    config
-                                )
-                                forwarded_count += 1
-                                logger.info(f"[FORWARDER] Медиагруппа {group_id} с {len(group_msgs)} файлами переслана в {target_channel}")
-                            except Exception as e:
-                                logger.error(f"[FORWARDER] Ошибка при пересылке медиагруппы {group_id}: {e}")
-                                logger.error(f"[FORWARDER] Полная ошибка: {traceback.format_exc()}")
-                            
+                    if max_posts and len(posts_to_forward) >= max_posts:
+                        logger.info(f"Собрано достаточно постов ({len(posts_to_forward)}), прекращаем сбор.")
+                        break
+                    
+                    group_id = getattr(message, 'media_group_id', None)
+                    if group_id:
+                        if group_id not in processed_groups:
+                            posts_to_forward.append({'type': 'media_group', 'id': group_id, 'messages': self.media_groups.get(group_id, [])})
                             processed_groups.add(group_id)
-                            
-                        else:
-                            # --- ОБРАБОТКА ОДИНОЧНЫХ СООБЩЕНИЙ ---
-                            # --- Фильтрация по хэштегу ---
-                            if parse_mode == "hashtags" and hashtag_filter and hashtag_filter.strip():
-                                text = (message.text or message.caption or "").lower()
-                                if hashtag_filter.lower() not in text:
-                                    logger.info(f"[FORWARDER] Сообщение {message.id} не содержит хэштег '{hashtag_filter}', пропускаем")
-                                    continue
-                            
-                            # --- Определяем платность одиночного сообщения ---
-                            is_paid = False
-                            text = (message.text or message.caption or "").lower()
-                            if paid_content_mode == "off" or not paid_content_mode:
-                                is_paid = False
-                            elif paid_content_mode == "hashtag":
-                                if paid_content_hashtag and paid_content_hashtag.lower() in text:
-                                    is_paid = True
-                            elif paid_content_mode == "random":
-                                import random
-                                if paid_content_chance and random.randint(1, 10) <= int(paid_content_chance):
-                                    is_paid = True
-                            elif paid_content_mode == "hashtag_random":
-                                import random
-                                if paid_content_hashtag and paid_content_hashtag.lower() in text:
-                                    if paid_content_chance and random.randint(1, 10) <= int(paid_content_chance):
-                                        is_paid = True
-                            elif paid_content_mode == "select":
-                                # Проверяем, может ли это сообщение быть платным (только медиа-сообщения)
-                                can_be_paid = False
-                                if message.media:
-                                    media_type = message.media.value
-                                    if media_type in ['photo', 'video']:
-                                        can_be_paid = True
-                                
-                                if can_be_paid:
-                                    select_paid_counter += 1
-                                    every = config.get('paid_content_every', 1)
-                                    try:
-                                        every = int(every)
-                                    except Exception:
-                                        every = 1
-                                    if every > 0 and (select_paid_counter % every == 0):
-                                        is_paid = True
-                                        logger.info(f"[FORWARDER] 🎯 Сообщение {message.id} будет платным (счетчик: {select_paid_counter}, каждый: {every})")
-                                    else:
-                                        logger.info(f"[FORWARDER] 🔄 Сообщение {message.id} будет обычным (счетчик: {select_paid_counter}, каждый: {every})")
-                                else:
-                                    logger.info(f"[FORWARDER] ⚠️ Сообщение {message.id} не может быть платным (тип медиа: {getattr(message.media, 'value', 'none')})")
-                            elif paid_content_mode == "hashtag_select":
-                                if paid_content_hashtag and paid_content_hashtag.lower() in text:
-                                    hashtag_paid_counter += 1
-                                    every = config.get('paid_content_every', 1)
-                                    try:
-                                        every = int(every)
-                                    except Exception:
-                                        every = 1
-                                    if every > 0 and (hashtag_paid_counter % every == 0):
-                                        is_paid = True
-                            else:
-                                is_paid = False
-                            
-                            # Пересылаем одиночное сообщение
-                            try:
-                                await self._forward_single_message(
-                                    message,
-                                    target_channel,
-                                    hide_sender,
-                                    add_footer,
-                                    forward_mode,
-                                    text_mode,
-                                    paid_content_stars if is_paid else 0
-                                )
-                                forwarded_count += 1
-                                logger.info(f"[FORWARDER] Одиночное сообщение {message.id} переслано в {target_channel}")
-                            except Exception as e:
-                                logger.error(f"[FORWARDER] Ошибка при пересылке одиночного сообщения {message.id}: {e}")
-                                logger.error(f"[FORWARDER] Полная ошибка: {traceback.format_exc()}")
-                            
-                            if delay_seconds and delay_seconds > 0:
-                                await asyncio.sleep(delay_seconds)
-                        
-                        last_message_id = message.id
-                        
-                    except Exception as e:
-                        logger.error(f"[FORWARDER] Ошибка при обработке сообщения {message.id}: {e}")
-                        logger.error(f"[FORWARDER] Полная ошибка: {traceback.format_exc()}")
+                    else:
+                        # Убедимся, что одиночное сообщение прошло медиа-фильтр (если он включен)
+                        if media_filter == "media_only" and not message.media:
+                            continue
+                        posts_to_forward.append({'type': 'single', 'message': message})
                 
+                logger.info(f"[FORWARDER] --- ЗАВЕРШЕНИЕ ЭТАПА 1: Собрано {len(posts_to_forward)} постов для пересылки ---")
+                
+                # --- ЭТАП 2: ПЕРЕСЫЛКА ПОСТОВ ---
+                logger.info(f"[FORWARDER] --- НАЧАЛО ЭТАПА 2: ПЕРЕСЫЛКА {len(posts_to_forward)} ПОСТОВ ---")
+                
+                # Инициализируем счетчики перед началом пересылки
+                self._counters[channel_id] = self._counters.get(channel_id, {
+                    'hashtag_paid_counter': 0,
+                    'select_paid_counter': 0,
+                    'media_group_paid_counter': 0,
+                    'media_group_hashtag_paid_counter': 0
+                })
+
+                for post in posts_to_forward:
+                    # Пересылаем пост во все целевые каналы
+                    for target_channel in target_channels:
+                        if post['type'] == 'single':
+                            message = post['message']
+                            is_paid = self._is_post_paid(config, False, [message], self._counters[channel_id])
+                            forward_result = await self._forward_single_message(message, target_channel, hide_sender, add_footer, forward_mode, config, text_mode, paid_content_stars if is_paid else 0)
+
+                            # --- РЕАКЦИИ ДЛЯ ОДИНОЧНЫХ ПОСТОВ ---
+                            reactions_enabled = config.get('reactions_enabled', False)
+                            reaction_emojis = config.get('reaction_emojis', [])
+                            if reactions_enabled and reaction_emojis and self.reaction_manager:
+                                try:
+                                    # Получаем ID отправленного сообщения из истории чата
+                                    # (аналогично медиагруппам, так как tg_bot не возвращает объект с ID)
+                                    try:
+                                        recent_messages = []
+                                        async for msg in self._userbot.get_chat_history(target_channel, limit=5):
+                                            recent_messages.append(msg)
+                                        if recent_messages:
+                                            sent_message_id = recent_messages[0].id
+                                            logger.info(f"[REACTIONS] Получен ID последнего сообщения для реакции: {sent_message_id}")
+                                            logger.info(f"[REACTIONS] Умное проставление реакций на одиночный пост: канал {target_channel}, сообщение {sent_message_id}")
+                                            await self.reaction_manager.add_reactions_smart(
+                                                chat_id=target_channel,
+                                                message_id=sent_message_id,
+                                                available_reactions=reaction_emojis
+                                            )
+                                        else:
+                                            logger.warning("[REACTIONS] Не удалось получить последние сообщения для определения ID")
+                                    except Exception as hist_error:
+                                        logger.error(f"[REACTIONS] Не удалось получить историю для определения ID: {hist_error}")
+                                except Exception as e:
+                                    logger.error(f"[REACTIONS] Ошибка реакции на одиночный пост: {e}")
+
+                        elif post['type'] == 'media_group':
+                            group_id = post['id']
+                            group_messages = post['messages']
+                            is_paid_group = self._is_post_paid(config, True, group_messages, self._counters[channel_id])
+                            forwarded_in_group = await self.forward_media_group(channel_id, group_id, target_channel, text_mode, add_footer, forward_mode, hide_sender, paid_content_stars if is_paid_group else 0, config, group_messages=group_messages, callback=None, max_posts=max_posts)
+                            # forward_media_group возвращает количество пересланных сообщений в группе
+
+                        if delay_seconds > 0:
+                            await asyncio.sleep(delay_seconds)
+
+                    # Увеличиваем счетчик постов только после пересылки во все каналы
+                    forwarded_count += 1
+
                 # Завершаем задачу
                 task_info["status"] = "completed"
                 task_info["completed_at"] = datetime.now().isoformat()
-                logger.info(f"[FORWARDER] ✅ Парсинг+пересылка завершены. Переслано {forwarded_count} сообщений.")
+                logger.info(f"[FORWARDER] ✅ Парсинг+пересылка завершены. Переслано {forwarded_count} постов (медиагруппы и одиночные сообщения).")
                 
             except Exception as e:
                 logger.error(f"[FORWARDER] Критическая ошибка в парсинг+пересылке: {e}")
@@ -1991,7 +1792,7 @@ class TelegramForwarder:
         try:
             from sqlalchemy import create_engine
             from sqlalchemy.orm import sessionmaker
-            from models import ForwardingConfig
+            from shared.models import ForwardingConfig
             
             engine = create_engine('sqlite:///parser.db')
             SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -2045,6 +1846,110 @@ class TelegramForwarder:
                 'delay_seconds': 0,
                 'paid_content_stars': 0
             }
+
+    def _should_apply_watermark(self, message: PyrogramMessage, config: dict) -> bool:
+        """
+        Проверить, нужно ли применять watermark к данному сообщению
+        
+        Args:
+            message: Pyrogram сообщение
+            config: Конфигурация пересылки с настройками watermark
+        
+        Returns:
+            True если нужно применить watermark, False иначе
+        """
+        # Проверяем, включен ли watermark
+        if not config.get('watermark_enabled', False):
+            return False
+        
+        # Проверяем, есть ли фото в сообщении
+        if not message.photo:
+            logger.debug("[FORWARDER] Нет фото в сообщении, watermark не применяется")
+            return False
+        
+        watermark_mode = config.get('watermark_mode', 'all')
+        
+        # Режим "all" - применяем ко всем фото
+        if watermark_mode == 'all':
+            return True
+        
+        # Режим "random" - случайное применение
+        if watermark_mode == 'random':
+            chance = config.get('watermark_chance', 100)
+            return random.randint(1, 100) <= chance
+        
+        # Режим "hashtag" - применяем если есть хэштег
+        if watermark_mode == 'hashtag':
+            hashtag = config.get('watermark_hashtag')
+            if hashtag and message.text:
+                # Убеждаемся, что хэштег начинается с #
+                if not hashtag.startswith('#'):
+                    hashtag = f'#{hashtag}'
+                return hashtag.lower() in message.text.lower()
+            return False
+        
+        # Режим "manual" - пока не реализован, возвращаем False
+        if watermark_mode == 'manual':
+            logger.debug("[FORWARDER] Режим manual пока не поддерживается")
+            return False
+        
+        return False
+    
+    async def _apply_watermark_to_photo(
+        self,
+        message: PyrogramMessage,
+        config: dict
+    ) -> Optional[str]:
+        """
+        Применить watermark к фото из сообщения
+        
+        Args:
+            message: Pyrogram сообщение с фото
+            config: Конфигурация watermark
+        
+        Returns:
+            Путь к обработанному изображению или None в случае ошибки
+        """
+        try:
+            logger.info(f"[FORWARDER] Применяем watermark к сообщению {message.id}")
+            
+            # Скачиваем фото
+            photo_path = await self._userbot.download_media(message.photo.file_id)
+            if not photo_path:
+                logger.error("[FORWARDER] Не удалось скачать фото для watermark")
+                return None
+            
+            logger.info(f"[FORWARDER] Фото скачано: {photo_path}")
+            
+            # Подготавливаем конфигурацию watermark
+            watermark_config = {
+                'watermark_text': config.get('watermark_text'),
+                'watermark_image_path': config.get('watermark_image_path'),
+                'watermark_position': config.get('watermark_position', 'bottom_right'),
+                'watermark_opacity': config.get('watermark_opacity', 128),
+                'watermark_scale': config.get('watermark_scale', 0.3)
+            }
+            
+            # Применяем watermark
+            watermarked_path = self.watermark_processor.apply_watermark(
+                photo_path,
+                watermark_config
+            )
+            
+            # Удаляем оригинальный файл если watermark применен успешно
+            if watermarked_path != photo_path:
+                try:
+                    os.remove(photo_path)
+                except Exception as e:
+                    logger.warning(f"[FORWARDER] Не удалось удалить оригинальный файл: {e}")
+            
+            logger.info(f"[FORWARDER] Watermark применен: {watermarked_path}")
+            return watermarked_path
+            
+        except Exception as e:
+            logger.error(f"[FORWARDER] Ошибка применения watermark: {e}")
+            logger.exception(e)
+            return None
 
     def _should_use_parse_mode(self, entities):
         """Возвращает True, если среди entities есть форматирующие сущности, иначе False"""
@@ -2121,13 +2026,13 @@ class TelegramForwarder:
         self._task_counter += 1
         return f"parse_forward_{self._task_counter}_{int(asyncio.get_event_loop().time())}"
 
-    def create_parse_forward_task(self, source_channel: str, target_channel: str, config: dict) -> str:
+    def create_parse_forward_task(self, source_channel: str, target_channels: List[str], config: dict) -> str:
         """Создает новую задачу парсинг+пересылки и возвращает task_id."""
         task_id = self._generate_task_id()
         task_info = {
             "task_id": task_id,
             "source_channel": source_channel,
-            "target_channel": target_channel,
+            "target_channels": target_channels,
             "config": config,
             "status": "running",
             "started_at": datetime.now().isoformat(),
@@ -2140,25 +2045,34 @@ class TelegramForwarder:
 
     def get_parse_forward_task_status(self, task_id: str) -> dict:
         """Возвращает статус задачи парсинг+пересылки по task_id."""
+        logger.info(f"[FORWARDER] Получение статуса задачи {task_id}")
         task_info = self._parse_forward_tasks.get(task_id)
         if not task_info:
+            logger.warning(f"[FORWARDER] Задача {task_id} не найдена")
             return {"error": "Task not found"}
-        
+
         # Проверяем, завершился ли task
         if task_info["task"] and task_info["task"].done():
             if task_info["status"] == "running":
                 task_info["status"] = "completed"
                 task_info["completed_at"] = datetime.now().isoformat()
-        
-        return {
+
+        # Используем target_channels вместо target_channel
+        target_channels = task_info.get("target_channels", [])
+        target_channel = target_channels[0] if target_channels else None
+
+        result = {
             "task_id": task_id,
             "source_channel": task_info["source_channel"],
-            "target_channel": task_info["target_channel"],
+            "target_channel": target_channel,  # Исправлено: используем target_channels
+            "target_channels": target_channels,  # Добавляем для совместимости
             "status": task_info["status"],
             "started_at": task_info["started_at"],
             "completed_at": task_info["completed_at"],
             "error": task_info["error"]
         }
+        logger.debug(f"[FORWARDER] Статус задачи {task_id}: {result}")
+        return result
 
     def stop_parse_forward_task(self, task_id: str) -> bool:
         """Останавливает задачу парсинг+пересылки по task_id."""
@@ -2175,23 +2089,42 @@ class TelegramForwarder:
 
     def get_all_parse_forward_tasks(self) -> list:
         """Возвращает список всех задач парсинг+пересылки."""
+        logger.info(f"[FORWARDER] Получение списка всех задач парсинг+пересылки. Всего задач: {len(self._parse_forward_tasks)}")
         result = []
         for task_id, task_info in self._parse_forward_tasks.items():
-            # Проверяем, завершился ли task
-            if task_info["task"] and task_info["task"].done():
-                if task_info["status"] == "running":
-                    task_info["status"] = "completed"
-                    task_info["completed_at"] = datetime.now().isoformat()
-            
-            result.append({
-                "task_id": task_id,
-                "source_channel": task_info["source_channel"],
-                "target_channel": task_info["target_channel"],
-                "status": task_info["status"],
-                "started_at": task_info["started_at"],
-                "completed_at": task_info["completed_at"],
-                "error": task_info["error"]
-            })
+            try:
+                # Проверяем, завершился ли task
+                if task_info["task"] and task_info["task"].done():
+                    if task_info["status"] == "running":
+                        task_info["status"] = "completed"
+                        task_info["completed_at"] = datetime.now().isoformat()
+
+                # Используем target_channels вместо target_channel
+                target_channels = task_info.get("target_channels", [])
+                target_channel = target_channels[0] if target_channels else None
+
+                task_data = {
+                    "task_id": task_id,
+                    "source_channel": task_info["source_channel"],
+                    "target_channel": target_channel,  # Исправлено: используем target_channels
+                    "target_channels": target_channels,  # Добавляем для совместимости
+                    "status": task_info["status"],
+                    "started_at": task_info["started_at"],
+                    "completed_at": task_info["completed_at"],
+                    "error": task_info["error"]
+                }
+                result.append(task_data)
+                logger.debug(f"[FORWARDER] Задача {task_id}: source={task_info['source_channel']}, target={target_channel}, status={task_info['status']}")
+            except KeyError as e:
+                logger.error(f"[FORWARDER] Ошибка при обработке задачи {task_id}: отсутствует ключ {e}")
+                logger.error(f"[FORWARDER] Данные задачи: {task_info}")
+                # Пропускаем проблемную задачу
+                continue
+            except Exception as e:
+                logger.error(f"[FORWARDER] Неожиданная ошибка при обработке задачи {task_id}: {e}")
+                continue
+
+        logger.info(f"[FORWARDER] Возвращено {len(result)} задач из {len(self._parse_forward_tasks)}")
         return result
 
     def _update_source_handler(self, channel_id):
@@ -2279,11 +2212,11 @@ class TelegramForwarder:
                                         config.get('footer_text', ''),
                                         config.get('forward_mode', 'copy'),
                                         config.get('hide_sender', True),
-                                        config.get('max_posts', 0),
-                                        None,
                                         paid_content_stars if group_is_paid else 0,
-                                        group_messages,
-                                        config  # <-- добавляем config для гиперссылок
+                                        config,
+                                        group_messages=group_messages,
+                                        callback=None,
+                                        max_posts=config.get('max_posts', 0)
                                     )
                                     if result > 0:
                                         logger.info(f"[FORWARDER][HANDLER] Медиагруппа {group_id} успешно переслана в {tgt_id2}")
@@ -2329,6 +2262,7 @@ class TelegramForwarder:
                             hide_sender,
                             add_footer,
                             forward_mode,
+                            config,
                             text_mode,
                             paid_content_stars if is_paid else 0
                         )
@@ -2395,4 +2329,76 @@ class TelegramForwarder:
         except Exception as e:
             logger.warning(f"[FORWARDER] Не удалось проверить админство бота в канале {target_channel}: {e}")
             return False
+
+    async def _send_paid_media_group(self, chat_id, media_group, caption, stars):
+        """Отправка платной медиагруппы через python-telegram-bot."""
+        logger.info(f"[FORWARDER] 🎯 _send_paid_media_group: chat_id={chat_id}, stars={stars}, items={len(media_group)}")
+        if not self.tg_bot:
+            logger.error("[FORWARDER] python-telegram-bot не инициализирован!")
+            return None
+
+        media_payload = []
+        sent_messages = None
+
+        try:
+            # 1. Формируем InputPaidMedia используя file_id из оригинальных сообщений
+            for i, msg in enumerate(media_group):
+                try:
+                    if msg.photo:
+                        # Используем file_id напрямую - файл уже на серверах Telegram
+                        media_payload.append(InputPaidMediaPhoto(media=msg.photo.file_id))
+                        logger.info(f"[FORWARDER] 📎 Используем file_id для фото: {msg.photo.file_id}")
+                    elif msg.video:
+                        # Используем file_id напрямую - файл уже на серверах Telegram
+                        media_payload.append(InputPaidMediaVideo(media=msg.video.file_id))
+                        logger.info(f"[FORWARDER] 📎 Используем file_id для видео: {msg.video.file_id}")
+                    else:
+                        logger.warning(f"[FORWARDER] ⚠️ Неподдерживаемый тип медиа в сообщении {msg.id}, пропускаем")
+                        continue
+
+                except Exception as e:
+                    logger.error(f"[FORWARDER] ❌ Ошибка обработки медиа из сообщения {getattr(msg, 'id', 'N/A')}: {e}")
+                    raise
+
+            if not media_payload:
+                logger.warning("[FORWARDER] Не удалось создать медиа для платной отправки.")
+                return None
+
+            # 3. Отправляем через bot api с повторными попытками при таймауте
+            logger.info(f"[FORWARDER] 🚀 Отправляем платную медиагруппу с {stars} звездами...")
+            contains_html = "</a>" in caption or "<b>" in caption or "<i>" in caption
+
+            max_retries = 3
+            retry_delay = 5  # секунды
+
+            for attempt in range(max_retries):
+                try:
+                    sent_messages = await self.tg_bot.send_paid_media(
+                        chat_id=str(chat_id),
+                        star_count=stars,
+                        media=media_payload,
+                        caption=caption,
+                        parse_mode="HTML" if contains_html else None
+                    )
+                    break  # Успешно отправили, выходим из цикла
+                except (TimedOut, NetworkError, BadRequest) as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"[FORWARDER] ⏰ Сетевая ошибка при отправке платной медиагруппы (попытка {attempt + 1}/{max_retries}): {e}. Повтор через {retry_delay} сек...")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Экспоненциальная задержка
+                    else:
+                        logger.error(f"[FORWARDER] ❌ Все попытки отправки платной медиагруппы завершились сетевыми ошибками")
+                        raise  # Передаем ошибку выше для обработки
+            logger.info(f"[FORWARDER] ✅ Платная медиагруппа отправлена.")
+            return sent_messages
+
+        except (TelegramError, TimedOut, NetworkError, BadRequest) as e:
+            logger.error(f"[FORWARDER] ❌ Ошибка Telegram API при отправке платной медиагруппы: {e}")
+            logger.error(f"[FORWARDER] Полная ошибка: {traceback.format_exc()}")
+            return None
+        except Exception as e:
+            logger.error(f"[FORWARDER] ❌ Ошибка отправки платной медиагруппы: {e}")
+            logger.error(f"[FORWARDER] Полная ошибка: {traceback.format_exc()}")
+            return None
+    
 

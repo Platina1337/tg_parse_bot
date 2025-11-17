@@ -65,12 +65,19 @@ async def sessions_command(client: Client, message_or_query):
             text += "No sessions available.\n"
         
         text += "\n**Current assignments:**\n"
-        for task, session in assignments.items():
+        for task, session_data in assignments.items():
             if task == "reactions":
                 reaction_sessions = assignments.get("reactions", [])
                 text += f"- Reactions: {', '.join(reaction_sessions) if reaction_sessions else 'none'}\n"
+            elif task == "parsing":
+                # Parsing может иметь несколько сессий
+                if isinstance(session_data, list):
+                    parsing_sessions = session_data
+                else:
+                    parsing_sessions = [session_data] if session_data else []
+                text += f"- Parsing: {', '.join(parsing_sessions) if parsing_sessions else 'none'}\n"
             else:
-                text += f"- {task.capitalize()}: `{session}`\n"
+                text += f"- {task.capitalize()}: `{session_data}`\n"
         
         # Create keyboard
         keyboard = InlineKeyboardMarkup([
@@ -109,22 +116,23 @@ async def assign_session_callback(client, callback_query):
     logger.info(f"[ASSIGN_SESSION_CALLBACK] Вызван assign_session_callback | user_id={user_id} | callback_data={callback_query.data}")
     # Check if user is admin
     if user_id not in ADMIN_IDS:
+        logger.warning(f"[ASSIGN_SESSION_CALLBACK] User {user_id} is not admin")
         await callback_query.answer("You don't have permission to manage sessions.", show_alert=True)
         return
-    
+
     # Get list of sessions
     try:
         response = await api_client.list_sessions()
         if not response.get("success", False):
             await callback_query.answer(f"Error: {response.get('error', 'Unknown error')}", show_alert=True)
             return
-        
+
         sessions = response.get("sessions", [])
-        
+
         if not sessions:
             await callback_query.answer("No sessions available.", show_alert=True)
             return
-        
+
         # Create keyboard with sessions
         keyboard = []
         for session in sessions:
@@ -132,6 +140,7 @@ async def assign_session_callback(client, callback_query):
             safe_alias = re.sub(r'[^a-zA-Z0-9_-]', '', alias)[:32]
             keyboard.append([InlineKeyboardButton(alias, callback_data=f"select_session:{safe_alias}")])
         keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel_session_action")])
+
         await callback_query.edit_message_text(
             "Select a session to assign:",
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -164,6 +173,10 @@ async def select_session_callback(client, callback_query):
             InlineKeyboardButton("Reactions", callback_data=f"assign_task:reactions:{session_name}"),
             InlineKeyboardButton("Public Groups", callback_data=f"assign_task:public_groups:{session_name}")
         ],
+        [
+            InlineKeyboardButton("❌ Remove from Parsing", callback_data=f"remove_task:parsing:{session_name}"),
+            InlineKeyboardButton("❌ Remove from Monitoring", callback_data=f"remove_task:monitoring:{session_name}")
+        ],
         [InlineKeyboardButton("Cancel", callback_data="cancel_session_action")]
     ])
     
@@ -171,6 +184,37 @@ async def select_session_callback(client, callback_query):
         f"Select a task to assign session `{session_name}` to:",
         reply_markup=keyboard
     )
+
+async def remove_task_callback(client, callback_query):
+    user_id = int(callback_query.from_user.id)
+    logger.info(f"[REMOVE_TASK_CALLBACK] Вызван remove_task_callback | user_id={user_id} | callback_data={callback_query.data}")
+    parts = callback_query.data.split(":", 2)
+    logger.info(f"[REMOVE_TASK_CALLBACK] parts={parts}")
+
+    # Check if user is admin
+    if user_id not in ADMIN_IDS:
+        logger.warning(f"[REMOVE_TASK_CALLBACK][PERMISSION_DENIED] user_id={user_id} not in ADMIN_IDS={ADMIN_IDS}")
+        await callback_query.answer("You don't have permission to manage sessions.", show_alert=True)
+        return
+
+    # Get task and session name from callback data
+    task = parts[1]
+    session_name = parts[2]
+
+    # Remove session from task
+    try:
+        response = await api_client.remove_assignment(task, session_name)
+        if not response.get("success", False):
+            await callback_query.answer(f"Error: {response.get('error', 'Unknown error')}", show_alert=True)
+            return
+
+        await callback_query.answer(f"Session {session_name} removed from {task}!", show_alert=True)
+
+        # Теперь вызываем sessions_command с callback_query, чтобы user_id был корректный
+        await sessions_command(client, callback_query)
+    except Exception as e:
+        logger.error(f"Error in remove_task_callback: {e}")
+        await callback_query.answer(f"Error: {e}", show_alert=True)
 
 async def assign_task_callback(client, callback_query):
     user_id = int(callback_query.from_user.id)
@@ -190,13 +234,23 @@ async def assign_task_callback(client, callback_query):
     
     # Assign session to task
     try:
-        response = await api_client.assign_session(task, session_name)
-        if not response.get("success", False):
-            await callback_query.answer(f"Error: {response.get('error', 'Unknown error')}", show_alert=True)
-            return
-        
-        await callback_query.answer(f"Session {session_name} assigned to {task}!", show_alert=True)
-        
+        if task == "parsing":
+            # Для парсинга можно назначать несколько сессий
+            response = await api_client.assign_session(task, session_name)
+            if not response.get("success", False):
+                await callback_query.answer(f"Error: {response.get('error', 'Unknown error')}", show_alert=True)
+                return
+
+            await callback_query.answer(f"Session {session_name} added to {task}!", show_alert=True)
+        else:
+            # Для других задач заменяем сессию
+            response = await api_client.assign_session(task, session_name)
+            if not response.get("success", False):
+                await callback_query.answer(f"Error: {response.get('error', 'Unknown error')}", show_alert=True)
+                return
+
+            await callback_query.answer(f"Session {session_name} assigned to {task}!", show_alert=True)
+
         # Теперь вызываем sessions_command с callback_query, чтобы user_id был корректный
         await sessions_command(client, callback_query)
     except Exception as e:

@@ -22,12 +22,11 @@ FSM_NONE = None
 # Новые состояния для пересылки
 FSM_FORWARD_CHANNEL = "forward_channel"
 FSM_FORWARD_TARGET = "forward_target"
+FSM_FORWARD_TARGETS = "forward_targets"  # Управление списком выбранных каналов
 FSM_FORWARD_SETTINGS = "forward_settings"
 FSM_FORWARD_HASHTAG = "forward_hashtag"
 FSM_FORWARD_DELAY = "forward_delay"
 FSM_FORWARD_FOOTER = "forward_footer"
-FSM_FORWARD_FOOTER_LINK = "forward_footer_link"
-FSM_FORWARD_FOOTER_LINK_TEXT = "forward_footer_link_text"
 FSM_FORWARD_TEXT_MODE = "forward_text_mode"
 FSM_FORWARD_LIMIT = "forward_limit"
 FSM_FORWARD_DIRECTION = "forward_direction"
@@ -35,6 +34,9 @@ FSM_FORWARD_MEDIA_FILTER = "forward_media_filter"
 FSM_FORWARD_RANGE = "forward_range"
 FSM_FORWARD_RANGE_START = "forward_range_start"
 FSM_FORWARD_RANGE_END = "forward_range_end"
+FSM_FORWARD_MONITORING = "forward_monitoring"
+FSM_FORWARD_RUNNING = "forward_running"
+FSM_FORWARD_MENU = "forward_menu"
 
 # Новые состояния для реакций
 FSM_REACTION_CHANNEL = "reaction_channel"
@@ -49,10 +51,26 @@ FSM_REACTION_CONFIRM = "reaction_confirm"
 
 # Новые состояния для редактирования текста
 FSM_TEXT_EDIT_CHANNEL = "text_edit_channel"
+FSM_TEXT_EDIT_SETTINGS = "text_edit_settings"
 FSM_TEXT_EDIT_LINK_TEXT = "text_edit_link_text"
 FSM_TEXT_EDIT_LINK_URL = "text_edit_link_url"
 FSM_TEXT_EDIT_LIMIT = "text_edit_limit"
+FSM_TEXT_EDIT_FOOTER_EDIT = "text_edit_footer_edit"
+FSM_TEXT_EDIT_SPECIFIC_TEXT = "text_edit_specific_text"
 FSM_TEXT_EDIT_CONFIRM = "text_edit_confirm"
+
+# --- Новые состояния для watermark ---
+FSM_WATERMARK_MENU = "watermark_menu"
+FSM_WATERMARK_TYPE = "watermark_type"
+FSM_WATERMARK_TEXT_INPUT = "watermark_text_input"
+FSM_WATERMARK_IMAGE_UPLOAD = "watermark_image_upload"
+FSM_WATERMARK_MODE = "watermark_mode"
+FSM_WATERMARK_CHANCE = "watermark_chance"
+FSM_WATERMARK_HASHTAG = "watermark_hashtag"
+FSM_WATERMARK_POSITION = "watermark_position"
+FSM_WATERMARK_OPACITY = "watermark_opacity"
+FSM_WATERMARK_SCALE = "watermark_scale"
+FSM_WATERMARK_CHANNEL_SELECT = "watermark_channel_select"
 
 # --- Новые состояния для навигации по хэштегам ---
 FSM_NAVIGATION_MENU = "navigation_menu"
@@ -132,10 +150,7 @@ def get_forwarding_settings_keyboard():
         ],
         [
             InlineKeyboardButton("⏱️ Задержка", callback_data="forward_delay"),
-            InlineKeyboardButton("📝 Приписка", callback_data="forward_footer")
-        ],
-        [
-            InlineKeyboardButton("🔗 Гиперссылка в приписке", callback_data="forward_footer_link")
+            InlineKeyboardButton("📝 Приписка и ссылки", callback_data="forward_footer")
         ],
         [
             InlineKeyboardButton("📄 Режим текста", callback_data="forward_text_mode"),
@@ -150,7 +165,11 @@ def get_forwarding_settings_keyboard():
             InlineKeyboardButton("📷 Фильтр медиа", callback_data="forward_media_filter")
         ],
         [
-            InlineKeyboardButton("📋 Диапазон ID", callback_data="forward_range")
+            InlineKeyboardButton("📋 Диапазон ID", callback_data="forward_range"),
+            InlineKeyboardButton("🎭 Реакции", callback_data="forward_reactions")
+        ],
+        [
+            InlineKeyboardButton("🎨 Водяной знак", callback_data="watermark_settings")
         ],
         [
             InlineKeyboardButton("💾 Сохранить", callback_data="forward_save")
@@ -209,6 +228,34 @@ def format_channel_stats(stats: dict) -> str:
 📄 Описание: {stats.get('description', 'N/A')[:100] if stats.get('description') else 'N/A'}...
 """
 
+def format_footer_preview(footer_text: str) -> str:
+    """
+    Форматирование превью приписки для отображения в настройках
+    """
+    if not footer_text:
+        return "Нет"
+
+    # Убираем HTML-теги для превью, но оставляем текст ссылок
+    import re
+
+    # Проверяем, есть ли ссылки
+    has_links = bool(re.search(r'<a[^>]*href=["\'][^"\']*["\'][^>]*>([^<]*)</a>', footer_text))
+
+    # Заменяем <a href="...">text</a> на просто text
+    cleaned = re.sub(r'<a[^>]*href=["\'][^"\']*["\'][^>]*>([^<]*)</a>', r'\1', footer_text)
+    # Убираем остальные HTML-теги
+    cleaned = re.sub(r'<[^>]+>', '', cleaned)
+
+    # Ограничиваем длину
+    if len(cleaned) > 45:
+        cleaned = cleaned[:42] + "..."
+
+    # Добавляем индикатор ссылок
+    if has_links:
+        return f'"{cleaned}" 🔗'
+    else:
+        return f'"{cleaned}"'
+
 def format_forwarding_config(config: dict) -> str:
     """Форматирование конфигурации пересылки"""
     paid_content_stars = config.get('paid_content_stars', 0)
@@ -256,14 +303,23 @@ def format_forwarding_config(config: dict) -> str:
     else:
         hyperlink_info = ""
     
+    # Информация о реакциях
+    reactions_enabled = config.get('reactions_enabled', False)
+    if reactions_enabled:
+        emojis = config.get('reaction_emojis', [])
+        reactions_info = f"🎭 Реакции: {' '.join(emojis) if emojis else 'Включены'}"
+    else:
+        reactions_info = ""
+
     return f"""
 🏷️ Режим: {'По хэштегам' if config.get('parse_mode') == 'hashtags' else 'Все сообщения'}
 {'🏷️ Хэштег: ' + config.get('hashtag_filter') if config.get('hashtag_filter') else ''}
 ⏱️ Задержка: {config.get('delay_seconds', 0)} сек
-📝 Приписка: {config.get('footer_text') or 'Нет'}
+📝 Приписка: {format_footer_preview(config.get('footer_text'))}
 {hyperlink_info}
 📄 Текст: {'Удалить' if config.get('text_mode') == 'remove' else 'Как есть' if config.get('text_mode') == 'as_is' else 'Только хэштеги'}
 📊 Лимит: {limit_text}
+{reactions_info}
 ⭐️ Платные посты: {paid_content_status}
 🔄 Направление: {direction_text}
 📷 Фильтр медиа: {media_filter_text}
@@ -422,7 +478,7 @@ def get_stop_last_task_inline_keyboard(task_id):
 
 def get_forwarding_inline_keyboard(channel_id=None, target_channel=None, last_task_id=None):
     buttons = [
-        [InlineKeyboardButton("▶️ Запустить", callback_data="forward_start"),
+        [InlineKeyboardButton("📡 Мониторинг", callback_data="forward_start"),
          InlineKeyboardButton("📥 Парсинг + пересылка", callback_data="forward_parse_and_forward")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="forward_settings")],
     ]
@@ -486,12 +542,75 @@ def get_text_edit_menu_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("🆕 Запустить редактирование")],
+            [KeyboardButton("⚙️ Настройки редактирования")],
             [KeyboardButton("📊 Статус задач редактирования")],
             [KeyboardButton("⏹️ Остановить задачу")],
             [KeyboardButton("🔙 Назад в главное меню")],
         ],
         resize_keyboard=True
     )
+
+def get_text_edit_inline_keyboard(channel_id=None, last_task_id=None):
+    """Inline клавиатура для редактирования текста"""
+    buttons = [
+        [InlineKeyboardButton("▶️ Запустить", callback_data="text_edit_start")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="text_edit_settings")],
+    ]
+    if last_task_id:
+        buttons.append([InlineKeyboardButton("⏹️ Остановить задачу", callback_data=f"stop_task:{last_task_id}")])
+    buttons.append([InlineKeyboardButton("📊 Статус задач", callback_data="check_text_edit_tasks_status")])
+    buttons.append([InlineKeyboardButton("🔙 Назад к выбору канала", callback_data="text_edit_back_to_channel")])
+    return InlineKeyboardMarkup(buttons)
+
+# --- Функции для watermark ---
+
+def get_watermark_menu_keyboard():
+    """Клавиатура главного меню watermark"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔘 Вкл/Выкл", callback_data="wm_toggle"),
+            InlineKeyboardButton("📝 Тип", callback_data="wm_type")
+        ],
+        [
+            InlineKeyboardButton("⚙️ Режим", callback_data="wm_mode"),
+            InlineKeyboardButton("📍 Позиция", callback_data="wm_position")
+        ],
+        [
+            InlineKeyboardButton("💧 Прозрачность", callback_data="wm_opacity"),
+            InlineKeyboardButton("📏 Масштаб", callback_data="wm_scale")
+        ],
+        [InlineKeyboardButton("💾 Сохранить", callback_data="wm_save")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="forward_settings")]
+    ])
+
+def get_watermark_type_keyboard():
+    """Клавиатура выбора типа watermark"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Текст", callback_data="wm_type_text")],
+        [InlineKeyboardButton("🖼️ Изображение", callback_data="wm_type_image")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="wm_menu")]
+    ])
+
+def get_watermark_mode_keyboard():
+    """Клавиатура выбора режима применения watermark"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Все посты", callback_data="wm_mode_all")],
+        [InlineKeyboardButton("🎲 Случайно", callback_data="wm_mode_random")],
+        [InlineKeyboardButton("#️⃣ По хэштегу", callback_data="wm_mode_hashtag")],
+        [InlineKeyboardButton("✋ Вручную", callback_data="wm_mode_manual")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="wm_menu")]
+    ])
+
+def get_watermark_position_keyboard():
+    """Клавиатура выбора позиции watermark"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬆️ Верх слева", callback_data="wm_pos_top_left"),
+         InlineKeyboardButton("⬆️ Верх справа", callback_data="wm_pos_top_right")],
+        [InlineKeyboardButton("🎯 Центр", callback_data="wm_pos_center")],
+        [InlineKeyboardButton("⬇️ Низ слева", callback_data="wm_pos_bottom_left"),
+         InlineKeyboardButton("⬇️ Низ справа", callback_data="wm_pos_bottom_right")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="wm_menu")]
+    ])
 
 def get_text_edit_confirmation_keyboard():
     """Клавиатура подтверждения запуска редактирования"""

@@ -120,9 +120,13 @@ class ParserAPIClient:
     
     async def add_user_group(self, user_id: int, group_id: str, group_title: str, username: str = None) -> bool:
         """Добавить группу в историю пользователя"""
-        data = {"group_id": group_id, "group_title": group_title, "username": username}
-        await self._make_request("POST", f"/user/groups/{user_id}", json=data)
-        return True
+        try:
+            data = {"group_id": group_id, "group_title": group_title, "username": username}
+            await self._make_request("POST", f"/user/groups/{user_id}", json=data)
+            return True
+        except Exception as e:
+            logger.error(f"[add_user_group] Ошибка добавления группы: {e}")
+            raise  # Передаем исключение выше для обработки
     
     async def update_user_group_last_used(self, user_id: int, group_id: str) -> bool:
         """Обновить время последнего использования группы"""
@@ -237,13 +241,22 @@ class ParserAPIClient:
                 response = {}
                 
             # Обеспечиваем наличие всех необходимых полей
+            # Определяем ID канала: используем числовой ID из ответа парсера, если он есть
+            channel_real_id = response.get("id")
+            if channel_real_id is None:
+                # Если нет ID в ответе, используем то что передали
+                channel_real_id = channel_id
+            elif isinstance(channel_real_id, str) and not channel_real_id.startswith("-"):
+                # Если ID строковый и не начинается с "-", значит это username, используем то что передали
+                channel_real_id = channel_id
+
             result = {
-                "id": response.get("channel_id", channel_id),  # Используем channel_id из ответа
-                "title": response.get("channel_title", f"Канал {channel_id}"),
-                "username": response.get("username", ""),  # Исправлено: было channel_username
+                "id": channel_real_id,  # ID канала из парсера или переданный
+                "title": response.get("title", f"Канал {channel_id}"),
+                "username": response.get("username", ""),  # username из ответа парсера
                 "members_count": response.get("members_count", "N/A"),
-                "last_message_id": response.get("last_message_id", "N/A"),
-                "parsed_posts": response.get("parsed_posts", "0"),
+                "last_message_id": response.get("max_id", response.get("last_message_id", "N/A")),  # max_id или last_message_id
+                "parsed_posts": str(response.get("parsed_count", "0")),  # parsed_count из парсера
                 "description": response.get("description", "")
             }
             logger.info(f"[get_channel_stats] Возвращаем: {result}")
@@ -266,6 +279,27 @@ class ParserAPIClient:
         """Получить хэштеги канала"""
         response = await self._make_request("GET", f"/channel/hashtags/{channel_id}")
         return response.get("hashtags", [])
+
+    async def get_channel_info(self, channel_id: str) -> Dict:
+        """Получить информацию о канале для проверки доступа"""
+        try:
+            # Используем get_channel_stats для проверки доступа
+            stats = await self.get_channel_stats(channel_id)
+            if isinstance(stats, dict) and stats.get("error"):
+                return {"error": stats["error"]}
+            return {"success": True, "accessible": True}
+        except Exception as e:
+            logger.warning(f"[API] Error checking channel access for {channel_id}: {e}")
+            return {"error": str(e)}
+
+    async def get_channel_last_message_id(self, channel_id: str) -> Optional[int]:
+        """Получить ID последнего сообщения в канале"""
+        try:
+            response = await self._make_request("GET", f"/channel/last-message/{channel_id}")
+            return response.get("last_message_id")
+        except Exception as e:
+            logger.warning(f"[get_channel_last_message_id] Не удалось получить последний ID сообщения: {e}")
+            return None
     
     async def resolve_group(self, text: str) -> dict:
         """Разрешить группу по ID или username"""
@@ -487,12 +521,12 @@ class ParserAPIClient:
 
     # --- Methods for working with public groups ---
     
-    async def start_public_groups_forwarding(self, source_channel: str, target_group: str, 
+    async def start_public_groups_forwarding(self, source_channel: str, target_groups: List[str],
                                            user_id: int, settings: dict) -> dict:
         """Запустить пересылку в публичные группы"""
         data = {
             "source_channel": source_channel,
-            "target_group": target_group,
+            "target_groups": target_groups,
             "user_id": user_id,
             "settings": settings
         }
@@ -510,6 +544,43 @@ class ParserAPIClient:
     async def get_all_public_groups_tasks(self) -> dict:
         """Получить все задачи пересылки в публичные группы"""
         return await self._make_request("GET", "/public_groups/all_tasks")
+
+    async def save_watermark_settings(self, user_id: int, channel_id: str, settings: dict):
+        """Сохранить настройки водяного знака через API."""
+        try:
+            payload = {
+                "user_id": user_id,
+                "channel_id": channel_id,
+                "settings": settings
+            }
+            async with httpx.AsyncClient() as client:
+                response = await client.post(f"{self.base_url}/watermark/settings", json=payload)
+                response.raise_for_status()
+                logger.info(f"Настройки водяного знака для канала {channel_id} сохранены.")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP ошибка при сохранении настроек водяного знака: {e.response.text}")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении настроек водяного знака: {e}")
+
+    async def get_watermark_settings(self, user_id: int, channel_id: str) -> dict:
+        """Получить настройки водяного знака через API."""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{self.base_url}/watermark/settings/{user_id}/{channel_id}")
+                response.raise_for_status()
+                data = response.json()
+                return data.get("settings", {})
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP ошибка при получении настроек водяного знака: {e.response.text}")
+        except Exception as e:
+            logger.error(f"Ошибка при получении настроек водяного знака: {e}")
+        
+        # Возвращаем дефолтные настройки в случае ошибки
+        return {
+            'watermark_enabled': False, 'watermark_mode': 'all', 'watermark_chance': 100,
+            'watermark_hashtag': None, 'watermark_text': None, 'watermark_image_path': None,
+            'watermark_position': 'bottom_right', 'watermark_opacity': 128, 'watermark_scale': 0.3
+        }
 
 # Глобальный экземпляр API клиента
 api_client = ParserAPIClient() 

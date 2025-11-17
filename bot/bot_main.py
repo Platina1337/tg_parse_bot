@@ -15,11 +15,20 @@ import traceback
 sys.path.append(str(Path(__file__).parent.parent))
 
 from pyrogram import Client, filters
+from pyrogram.enums import ChatType
 from pyrogram.errors import RPCError
 from pyrogram.types import BotCommand
 from bot.config import config
-from bot.states import user_states
-from bot.handlers import start_command, text_handler, forwarding_callback_handler, monitorings_command, check_tasks_status_callback
+from bot.states import (
+    user_states,
+    FSM_WATERMARK_IMAGE_UPLOAD,
+    FSM_WATERMARK_TEXT_INPUT,
+    FSM_WATERMARK_CHANCE,
+    FSM_WATERMARK_HASHTAG,
+    FSM_WATERMARK_OPACITY,
+    FSM_WATERMARK_SCALE
+)
+from bot.handlers import start_command, text_handler, forwarding_callback_handler, monitorings_command, check_tasks_status_callback, process_callback_query
 from bot.navigation_manager import navigation_menu_handler, navigation_text_handler
 import bot.handlers  # Для регистрации всех callback-обработчиков
 from bot.session_handlers import (
@@ -28,6 +37,7 @@ from bot.session_handlers import (
     assign_session_callback,
     select_session_callback,
     assign_task_callback,
+    remove_task_callback,
     delete_session_callback,
     confirm_delete_callback,
     delete_confirmed_callback,
@@ -142,19 +152,79 @@ async def text_message_handler(client, message):
         logger.info(f"[TEXT_HANDLER] Calling text_handler for user {user_id}")
         await text_handler(client, message)
 
-# Удаляю глобальный обработчик @app.on_callback_query()
-# @app.on_callback_query()
-# async def callback_query_handler(client, callback_query):
-#     try:
-#         handled = await process_callback_query(client, callback_query)
-#         if not handled:
-#             await callback_query.answer("Неизвестное действие", show_alert=True)
-#     except RPCError as e:
-#         logger.error(f"[CALLBACK_HANDLER] RPCError: {e}\n{traceback.format_exc()}")
-#         await callback_query.answer("Ошибка Telegram API", show_alert=True)
-#     except Exception as e:
-#         logger.error(f"[CALLBACK_HANDLER] Ошибка типа {type(e)}: {e}\n{traceback.format_exc()}")
-#         await callback_query.answer(f"Внутренняя ошибка: {e}", show_alert=True)
+# Глобальный обработчик всех сообщений для отладки и обработки watermark
+@app.on_message()
+async def global_message_handler(client, message):
+    """Глобальный обработчик всех сообщений для отладки и обработки watermark"""
+    # Проверяем, что сообщение от пользователя (не служебное)
+    if not hasattr(message, 'from_user') or message.from_user is None:
+        logger.debug(f"[GLOBAL_MESSAGE] Skipping message without from_user: {type(message).__name__}")
+        return
+
+    user_id = message.from_user.id
+    chat_type = "private" if message.chat.type == ChatType.PRIVATE else f"{message.chat.type} ({message.chat.id})"
+    state = user_states.get(user_id, {}).get("state")
+
+    logger.info(f"[GLOBAL_MESSAGE] User {user_id}, chat: {chat_type}, state: {state}, message_type: {type(message).__name__}")
+
+    # Обрабатываем watermark загрузку изображений
+    if state == FSM_WATERMARK_IMAGE_UPLOAD and message.chat.type == ChatType.PRIVATE:
+        handled = False
+
+        if hasattr(message, 'photo') and message.photo:
+            logger.info(f"[GLOBAL_MESSAGE] Processing PHOTO watermark upload for user {user_id}")
+            from bot.watermark_handlers import handle_watermark_image_upload
+            await handle_watermark_image_upload(client, message)
+            handled = True
+
+        elif hasattr(message, 'document') and message.document:
+            # Проверяем, что это изображение
+            mime_type = getattr(message.document, 'mime_type', '')
+            file_name = getattr(message.document, 'file_name', '')
+
+            logger.info(f"[GLOBAL_MESSAGE] DOCUMENT received: {file_name}, mime={mime_type}")
+
+            if mime_type.startswith('image/') or file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+                logger.info(f"[GLOBAL_MESSAGE] Processing DOCUMENT watermark upload for user {user_id}")
+                from bot.watermark_handlers import handle_watermark_image_upload
+                await handle_watermark_image_upload(client, message)
+                handled = True
+
+        if handled:
+            logger.info(f"[GLOBAL_MESSAGE] Watermark upload handled, stopping further processing")
+            return  # Останавливаем дальнейшую обработку только если обработали watermark
+
+    # Продолжаем логирование для других сообщений
+    if hasattr(message, 'photo') and message.photo:
+        logger.info(f"[GLOBAL_MESSAGE] PHOTO received: size={message.photo.file_size}, unique_id={message.photo.file_unique_id}")
+    elif hasattr(message, 'document') and message.document:
+        logger.info(f"[GLOBAL_MESSAGE] DOCUMENT received: {message.document.file_name}, size={message.document.file_size}, mime={message.document.mime_type}")
+    elif hasattr(message, 'text') and message.text:
+        logger.info(f"[GLOBAL_MESSAGE] TEXT received: '{message.text[:50]}...'")
+    else:
+        logger.info(f"[GLOBAL_MESSAGE] OTHER message type: {message}")
+
+    # Не возвращаем, чтобы позволить другим обработчикам работать
+
+# Убираем отдельные обработчики, watermark обрабатывается в глобальном обработчике
+
+# Убираем отдельный обработчик документов, обрабатываем все в глобальном обработчике
+# @app.on_message(filters.document & filters.private)
+# async def document_message_handler(client, message):
+
+# Глобальный обработчик всех callback-запросов
+@app.on_callback_query()
+async def callback_query_handler(client, callback_query):
+    try:
+        handled = await process_callback_query(client, callback_query)
+        if not handled:
+            await callback_query.answer("Неизвестное действие", show_alert=True)
+    except RPCError as e:
+        logger.error(f"[CALLBACK_HANDLER] RPCError: {e}\n{traceback.format_exc()}")
+        await callback_query.answer("Ошибка Telegram API", show_alert=True)
+    except Exception as e:
+        logger.error(f"[CALLBACK_HANDLER] Ошибка типа {type(e)}: {e}\n{traceback.format_exc()}")
+        await callback_query.answer(f"Внутренняя ошибка: {e}", show_alert=True)
 
 @app.on_callback_query(filters.regex("^add_session$"))
 async def add_session_callback_decorator(client, callback_query):
@@ -171,6 +241,10 @@ async def select_session_callback_decorator(client, callback_query):
 @app.on_callback_query(filters.regex("^assign_task:(.+):(.+)$"))
 async def assign_task_callback_decorator(client, callback_query):
     await assign_task_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex("^remove_task:(.+):(.+)$"))
+async def remove_task_callback_decorator(client, callback_query):
+    await remove_task_callback(client, callback_query)
 
 @app.on_callback_query(filters.regex("^delete_session$"))
 async def delete_session_callback_decorator(client, callback_query):
@@ -210,7 +284,10 @@ async def stop_reaction_task_handler(client, callback_query):
     from bot.handlers import stop_reaction_task_callback
     await stop_reaction_task_callback(client, callback_query)
 
-
+@app.on_callback_query(filters.regex("^stop_monitoring:"))
+async def stop_monitoring_handler(client, callback_query):
+    from bot.handlers import stop_monitoring_callback
+    await stop_monitoring_callback(client, callback_query)
 
 @app.on_callback_query(filters.regex(r"^stop_all_tasks$"))
 async def stop_all_tasks_handler(client, callback_query):
@@ -297,11 +374,7 @@ async def cancel_reaction_handler(client, callback_query):
     from bot.reaction_handlers import cancel_reaction_callback
     await cancel_reaction_callback(client, callback_query)
 
-# Обработчики для публичных групп
-@app.on_callback_query(filters.regex("^public_"))
-async def public_groups_callback_handler(client, callback_query):
-    from bot.public_groups_manager import handle_public_groups_callback
-    await handle_public_groups_callback(client, callback_query)
+# Обработчики для публичных групп теперь обрабатываются в process_callback_query
 
 @app.on_callback_query(filters.regex("^check_tasks_status$"))
 async def check_tasks_status_handler(client, callback_query):
@@ -321,11 +394,7 @@ async def forward_callback_handler(client, callback_query):
 async def reaction_callback_handler_decorator(client, callback_query):
     await reaction_callback_handler(client, callback_query)
 
-# Универсальный обработчик для всех остальных callback_data (должен быть последним)
-@app.on_callback_query()
-async def universal_callback_handler(client, callback_query):
-    logger.info(f"[UNIVERSAL_CALLBACK_HANDLER] Неизвестное действие | user_id={callback_query.from_user.id} | callback_data={callback_query.data}")
-    await callback_query.answer("Неизвестное действие", show_alert=True)
+# Универсальный обработчик теперь реализован через process_callback_query выше
 
 @app.on_message(filters.command("monitorings"))
 async def monitorings_handler(client, message):

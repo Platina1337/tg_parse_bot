@@ -95,19 +95,32 @@ async def start_forwarding_api(user_id: int) -> bool:
     """Запуск пересылки через API"""
     try:
         channel_id = user_states[user_id]['forward_channel_id']
-        target_channel = user_states[user_id]['forward_target_channel']
+        target_channels = user_states[user_id].get('forward_target_channels', [])
+        if not target_channels:
+            return False
+        target_channel_ids = [str(ch['id']) for ch in target_channels]
         forward_settings = user_states[user_id]['forward_settings']
-        # Дефолтная приписка-гиперссылка
-        if not forward_settings.get('footer_text'):
-            forward_settings['footer_text'] = '🌐 <a href="https://t.me/TESAMSH/4026">_TSSH_Fans_</a>\n\n<a href="https://t.me/+ybzXQhwkAio4ZGYy">Приватный канал / Подписаться</a>'
+        # Используем приписку из настроек, если она есть
+        footer_text = forward_settings.get('footer_text', '')
+
+        # Получаем watermark настройки для первого целевого канала
+        watermark_settings = {}
+        user_state = user_states.get(user_id, {})
+        watermark_channels = user_state.get('watermark_channels', {})
+        if target_channel_ids and target_channel_ids[0] in watermark_channels:
+            watermark_settings = watermark_channels[target_channel_ids[0]]
+            logger.info(f"[FORWARD] Найдены watermark настройки для канала {target_channel_ids[0]}: enabled={watermark_settings.get('watermark_enabled')}")
+        else:
+            logger.warning(f"[FORWARD] Watermark настройки для канала {target_channel_ids[0]} не найдены, используем дефолтные")
+
         payload = {
             'user_id': user_id,
             'source_channel_id': channel_id,
-            'target_channel_id': str(target_channel),  # Преобразуем в строку
+            'target_channel_ids': target_channel_ids,  # Список ID каналов
             'parse_mode': forward_settings.get('parse_mode', 'all'),
             'hashtag_filter': forward_settings.get('hashtag_filter'),
             'delay_seconds': forward_settings.get('delay_seconds', 0),
-            'footer_text': forward_settings.get('footer_text', ''),
+            'footer_text': footer_text,
             'text_mode': forward_settings.get('text_mode', 'hashtags_only'),
             'max_posts': forward_settings.get('max_posts'),
             'hide_sender': forward_settings.get('hide_sender', True),
@@ -120,8 +133,22 @@ async def start_forwarding_api(user_id: int) -> bool:
             'footer_link': forward_settings.get('footer_link'),
             'footer_link_text': forward_settings.get('footer_link_text'),
             'footer_full_link': forward_settings.get('footer_full_link', False),
+            # Добавляем поля для реакций
+            'reactions_enabled': forward_settings.get('reactions_enabled', False),
+            'reaction_emojis': forward_settings.get('reaction_emojis', []),
+            # Добавляем поля для watermark (из watermark_channels)
+            'watermark_enabled': watermark_settings.get('watermark_enabled', False),
+            'watermark_mode': watermark_settings.get('watermark_mode', 'all'),
+            'watermark_chance': watermark_settings.get('watermark_chance', 100),
+            'watermark_hashtag': watermark_settings.get('watermark_hashtag'),
+            'watermark_image_path': watermark_settings.get('watermark_image_path'),
+            'watermark_position': watermark_settings.get('watermark_position', 'bottom_right'),
+            'watermark_opacity': watermark_settings.get('watermark_opacity', 128),
+            'watermark_scale': watermark_settings.get('watermark_scale', 0.3),
+            'watermark_text': watermark_settings.get('watermark_text'),
         }
         print(f"[DEBUG][FORWARD] payload для /forwarding/start: {payload}")
+        print(f"[DEBUG][FORWARD] watermark в payload: enabled={payload.get('watermark_enabled')}, mode={payload.get('watermark_mode')}, text='{payload.get('watermark_text')}'")
         async with httpx.AsyncClient() as client:
             resp = await client.post(f"{config.PARSER_SERVICE_URL}/forwarding/start", json=payload)
         print(f"[DEBUG] start_forwarding_api response: {resp.status_code} - {resp.text}")
@@ -134,7 +161,11 @@ async def start_forwarding_parsing_api(user_id: int) -> bool:
     """Запуск парсинга и пересылки через API (гарантированно как через Postman)"""
     try:
         channel_id = user_states[user_id]['forward_channel_id']
-        target_channel = user_states[user_id]['forward_target_channel']
+        target_channels = user_states[user_id].get('forward_target_channels', [])
+        if not target_channels:
+            return False
+        # Передаем все выбранные каналы для пересылки
+        target_channel_ids = [str(ch['id']) for ch in target_channels]
         forward_settings = user_states[user_id]['forward_settings']
         forward_config = dict(forward_settings)
         forward_config.setdefault('forward_mode', 'copy')
@@ -142,9 +173,34 @@ async def start_forwarding_parsing_api(user_id: int) -> bool:
         forward_config.setdefault('parse_direction', forward_settings.get('parse_direction', 'backward'))
         forward_config.setdefault('media_filter', forward_settings.get('media_filter', 'media_only'))
         forward_config.setdefault('range_mode', 'all')
+        forward_config.setdefault('reactions_enabled', forward_settings.get('reactions_enabled', False))
+        forward_config.setdefault('reaction_emojis', forward_settings.get('reaction_emojis', []))
+
+        # Добавляем watermark настройки
+        watermark_settings = {}
+        user_state = user_states.get(user_id, {})
+        watermark_channels = user_state.get('watermark_channels', {})
+
+        if target_channel_ids and target_channel_ids[0] in watermark_channels:
+            watermark_settings = watermark_channels[target_channel_ids[0]]
+        else:
+            # Fallback to old logic or global settings if available
+            watermark_settings = user_state.get('watermark_settings', {})
+
+        forward_config.update({
+            'watermark_enabled': watermark_settings.get('watermark_enabled', False),
+            'watermark_mode': watermark_settings.get('watermark_mode', 'all'),
+            'watermark_chance': watermark_settings.get('watermark_chance', 100),
+            'watermark_hashtag': watermark_settings.get('watermark_hashtag'),
+            'watermark_image_path': watermark_settings.get('watermark_image_path'),
+            'watermark_position': watermark_settings.get('watermark_position', 'bottom_right'),
+            'watermark_opacity': watermark_settings.get('watermark_opacity', 128),
+            'watermark_scale': watermark_settings.get('watermark_scale', 0.3),
+            'watermark_text': watermark_settings.get('watermark_text'),
+        })
         payload = {
             "source_channel": str(channel_id),
-            "target_channel": str(target_channel),
+            "target_channels": target_channel_ids,
             "config": forward_config
         }
         logging.getLogger(__name__).info(f"[BOT][FORWARDING_PARSE] Отправляю запрос: {payload}")
@@ -189,16 +245,33 @@ async def save_forwarding_config_api(user_id: int) -> bool:
         user_state = user_states.get(user_id, {})
         forward_settings = user_state.get('forward_settings', {})
         channel_id = user_state.get('forward_channel_id')
-        target_channel = user_state.get('forward_target_channel')
-        
-        if not channel_id or not target_channel:
+        target_channels = user_state.get('forward_target_channels', [])
+
+        if not channel_id or not target_channels:
             return False
-        
+
+        target_channel_ids = [str(ch['id']) for ch in target_channels]
+
         # Формируем данные согласно схеме ForwardingConfigRequest
+        # Получаем watermark настройки для первого целевого канала
+        watermark_settings = {}
+        watermark_channels = user_state.get('watermark_channels', {})
+        if target_channel_ids and target_channel_ids[0] in watermark_channels:
+            watermark_settings = watermark_channels[target_channel_ids[0]]
+
+        # Проверяем наличие target_channel_ids перед созданием config_data
+        if not target_channel_ids:
+            logger.error(f"[BOT] ❌ target_channel_ids пустой! target_channels: {target_channels}")
+            return False
+
+        logger.info(f"[BOT] 📋 target_channel_ids: {target_channel_ids}")
+        logger.info(f"[BOT] 📋 target_channels: {target_channels}")
+
         config_data = {
             "user_id": user_id,
             "source_channel_id": channel_id,
-            "target_channel_id": str(target_channel),  # Преобразуем в строку
+            "target_channel_ids": target_channel_ids,  # Список ID каналов
+            "target_channel_id": target_channel_ids[0],  # Основной канал (первый из списка)
             "parse_mode": forward_settings.get('parse_mode', 'all'),
             "hashtag_filter": forward_settings.get('hashtag_filter'),
             "delay_seconds": forward_settings.get('delay_seconds', 0),
@@ -214,6 +287,16 @@ async def save_forwarding_config_api(user_id: int) -> bool:
             "range_start_id": forward_settings.get('range_start_id'),
             "range_end_id": forward_settings.get('range_end_id'),
             "paid_content_every": forward_settings.get('paid_content_every'),
+            # --- Watermark поля ---
+            "watermark_enabled": watermark_settings.get('watermark_enabled', False),
+            "watermark_mode": watermark_settings.get('watermark_mode', 'all'),
+            "watermark_chance": watermark_settings.get('watermark_chance', 100),
+            "watermark_hashtag": watermark_settings.get('watermark_hashtag'),
+            "watermark_image_path": watermark_settings.get('watermark_image_path'),
+            "watermark_position": watermark_settings.get('watermark_position', 'bottom_right'),
+            "watermark_opacity": watermark_settings.get('watermark_opacity', 128),
+            "watermark_scale": watermark_settings.get('watermark_scale', 0.3),
+            "watermark_text": watermark_settings.get('watermark_text'),
         }
         
         # Подробное логирование конфигурации
@@ -222,11 +305,12 @@ async def save_forwarding_config_api(user_id: int) -> bool:
         print(f"[BOT] 🔍 Все ключи forward_settings: {list(forward_settings.keys())}")
         print(f"[BOT] 🔍 Все ключи config_data: {list(config_data.keys())}")
         
-        logger.info(f"Saving forwarding config: {config_data}")
-        
+        logger.info(f"[BOT] 💾 Отправка конфигурации на сервер. URL: {config.PARSER_SERVICE_URL}/forwarding/config")
+        logger.info(f"[BOT] 💾 Данные конфигурации: target_channel_id={config_data.get('target_channel_id')}, target_channel_ids={config_data.get('target_channel_ids')}")
+
         async with httpx.AsyncClient() as client:
             response = await client.post(f"{config.PARSER_SERVICE_URL}/forwarding/config", json=config_data)
-            logger.info(f"Forwarding config save response: {response.status_code} - {response.text}")
+            logger.info(f"[BOT] 💾 Ответ сервера: {response.status_code} - {response.text}")
             return response.status_code == 200
     except Exception as e:
         logger.error(f"Error saving forwarding config: {e}")
@@ -285,8 +369,8 @@ def get_publish_stat_text(stats, publish_settings, published_count=None):
 
 
 # --- Асинхронная инициализация БД при старте бота ---
-async def async_init():
-    await db.init()
+# async def async_init():
+#     await db.init()  # Закомментировано: переменная db не определена
 
 async def clear_forwarding_history_api(channel_id: int = None, target_channel: str = None) -> dict:
     """Очистить историю пересланных постов через API"""
@@ -339,8 +423,8 @@ async def get_channel_info(channel_id: str) -> dict:
                 data = response.json()
                 return {
                     "id": channel_id,
-                    "title": data.get("channel_title", f"Канал {channel_id}"),
-                    "username": data.get("channel_username", ""),
+                    "title": data.get("title", f"Канал {channel_id}"),
+                    "username": data.get("username", ""),
                     "members_count": data.get("members_count", "N/A"),
                     "last_message_id": data.get("last_message_id", "N/A"),
                     "parsed_posts": data.get("parsed_posts", "0"),
@@ -363,6 +447,25 @@ async def get_channel_info(channel_id: str) -> dict:
 async def get_target_channel_info(target_channel: str) -> dict:
     """Получить информацию о целевом канале"""
     try:
+        # Пытаемся получить информацию через API парсера
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{config.PARSER_SERVICE_URL}/channel/stats/{target_channel}")
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    "id": target_channel,
+                    "title": data.get("title", f"Канал {target_channel}"),
+                    "username": data.get("username", ""),
+                    "members_count": data.get("members_count", "N/A"),
+                    "last_message_id": data.get("last_message_id", "N/A"),
+                    "parsed_posts": data.get("parsed_posts", "0"),
+                    "description": data.get("description", "")
+                }
+    except Exception as e:
+        logger.error(f"Error getting target channel info: {e}")
+
+    # Если не удалось получить через API, возвращаем базовую информацию
+    try:
         # Для целевого канала пытаемся извлечь информацию из строки
         if target_channel.startswith("-100"):
             return {
@@ -377,8 +480,8 @@ async def get_target_channel_info(target_channel: str) -> dict:
         elif target_channel.startswith("@"):
             return {
                 "id": target_channel,
-                "title": target_channel,
-                "username": target_channel,
+                "title": target_channel[1:],  # убираем @
+                "username": target_channel[1:],
                 "members_count": "N/A",
                 "last_message_id": "N/A",
                 "parsed_posts": "0",
@@ -395,7 +498,7 @@ async def get_target_channel_info(target_channel: str) -> dict:
                 "description": ""
             }
     except Exception as e:
-        logger.error(f"Error getting target channel info: {e}")
+        logger.error(f"Error processing target channel info: {e}")
         return {
             "id": target_channel,
             "title": f"Канал {target_channel}",

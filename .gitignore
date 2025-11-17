@@ -10,6 +10,8 @@ sessions/
 
 # Databases
 *.db
+*.db-wal
+*.db-shm
 
 # Logs
 *.log
@@ -38,3 +40,6 @@ media/*
 Thumbs.db
 
 broadcaster/*
+
+# Build artifacts
+telegram_parse_bot.egg-info/
